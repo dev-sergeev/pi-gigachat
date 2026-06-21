@@ -133,6 +133,35 @@ function createOutput(model: Model<Api>): AssistantMessage {
 }
 
 function resolveAuth(options?: GigaChatStreamOptions): GigaChatAuth {
+	const explicitScope = normalizeScope(
+		options?.scope ?? process.env.GIGACHAT_SCOPE ?? "",
+		GIGACHAT_DEFAULT_SCOPE,
+	);
+
+	// Explicit env vars take priority over stored OAuth credentials.
+	const envAccessToken = process.env.GIGACHAT_ACCESS_TOKEN;
+	if (envAccessToken) {
+		if (isAccessToken(envAccessToken)) {
+			return { kind: "accessToken", accessToken: envAccessToken };
+		}
+
+		return {
+			kind: "credentials",
+			credentials: envAccessToken,
+			scope: explicitScope,
+		};
+	}
+
+	const envCredentials = process.env.GIGACHAT_CREDENTIALS;
+	if (envCredentials) {
+		return {
+			kind: "credentials",
+			credentials: envCredentials,
+			scope: explicitScope,
+		};
+	}
+
+	// Fall back to stored OAuth credentials (via pi's provider apiKey mechanism).
 	const optionApiKey = resolveOptionApiKey(options?.apiKey);
 	if (optionApiKey) {
 		if (isAccessToken(optionApiKey)) {
@@ -142,27 +171,7 @@ function resolveAuth(options?: GigaChatStreamOptions): GigaChatAuth {
 		return {
 			kind: "credentials",
 			credentials: optionApiKey,
-			scope: normalizeScope(
-				options?.scope ?? process.env.GIGACHAT_SCOPE ?? "",
-				GIGACHAT_DEFAULT_SCOPE,
-			),
-		};
-	}
-
-	const envAccessToken = process.env.GIGACHAT_ACCESS_TOKEN;
-	if (envAccessToken) {
-		return { kind: "accessToken", accessToken: envAccessToken };
-	}
-
-	const envCredentials = process.env.GIGACHAT_CREDENTIALS;
-	if (envCredentials) {
-		return {
-			kind: "credentials",
-			credentials: envCredentials,
-			scope: normalizeScope(
-				options?.scope ?? process.env.GIGACHAT_SCOPE ?? "",
-				GIGACHAT_DEFAULT_SCOPE,
-			),
+			scope: explicitScope,
 		};
 	}
 
@@ -490,7 +499,11 @@ function convertFunctionParameters(
 
 	return {
 		type,
-		properties: properties ? convertFunctionProperties(properties) : undefined,
+		properties: properties
+			? convertFunctionProperties(properties)
+			: type === "object"
+				? {}
+				: undefined,
 		required,
 	};
 }
@@ -512,14 +525,17 @@ function convertFunctionProperties(
 			? property.enum.filter((item): item is string => typeof item === "string")
 			: undefined;
 
+		const propertyType = asOptionalString(property.type);
 		result[key] = {
-			type: asOptionalString(property.type),
+			type: propertyType,
 			description: asOptionalString(property.description),
 			items: items ? convertUnknownRecord(items) : undefined,
 			enum: enumValues,
 			properties: nestedProperties
 				? convertFunctionProperties(nestedProperties)
-				: undefined,
+				: propertyType === "object"
+					? {}
+					: undefined,
 		};
 	}
 
