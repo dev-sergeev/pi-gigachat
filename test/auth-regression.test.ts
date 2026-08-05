@@ -61,18 +61,24 @@ describe("GIGACHAT_ACCESS_TOKEN regression", () => {
 		});
 
 		delete process.env.GIGACHAT_CREDENTIALS;
+		process.env.GIGACHAT_USER = "user";
+		process.env.GIGACHAT_PASSWORD = "password";
 		expect(resolveAuth({ apiKey: "saved.access.token" })).toEqual({
 			kind: "accessToken",
 			accessToken: "saved.access.token",
 		});
 
-		process.env.GIGACHAT_USER = "user";
-		process.env.GIGACHAT_PASSWORD = "password";
 		expect(resolveAuth()).toEqual({
 			kind: "password",
 			user: "user",
 			password: "password",
 		});
+	});
+
+	it("reports a clear error when no authentication source is configured", () => {
+		expect(() => resolveAuth()).toThrow(
+			"No GigaChat authentication configured. Run /login gigachat or set GIGACHAT_CREDENTIALS, GIGACHAT_ACCESS_TOKEN, or GIGACHAT_USER/GIGACHAT_PASSWORD.",
+		);
 	});
 
 	it("does not refresh stored Pi OAuth before the stream when env access token exists", async () => {
