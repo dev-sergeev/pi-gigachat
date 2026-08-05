@@ -10,7 +10,7 @@
 		"verbatimModuleSyntax": true,
 		"noEmit": true,
 		"allowSyntheticDefaultImports": true,
-		"rootDir": "./src"
+		"rootDir": "."
 	},
-	"include": ["src/**/*.ts"]
+	"include": ["src/**/*.ts", "test/**/*.ts"]
 }

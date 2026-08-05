@@ -1,4 +1,5 @@
-import type { OAuthCredentials } from "@mariozechner/pi-ai";
+import { Agent } from "node:https";
+import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import GigaChat, { type GigaChatClientConfig } from "gigachat";
 import type {
 	ChatCompletionChunk,
@@ -18,11 +19,68 @@ export const GIGACHAT_DEFAULT_BUSINESS_SCOPE = "GIGACHAT_API_B2B";
 export const GIGACHAT_DEFAULT_AUTH_MODE = "basic";
 export const GIGACHAT_EXPIRY_BUFFER_MS = 60 * 1000;
 const EVENT_STREAM_CONTENT_TYPE = "text/event-stream";
+const TLS_DISABLED_WARNING =
+	"[pi-gigachat] TLS certificate verification is disabled\n";
+let tlsDisabledWarningEmitted = false;
 
 export type GigaChatScope = (typeof GIGACHAT_VALID_SCOPES)[number];
 export type GigaChatAuthMode = "basic" | "token";
 export type GigaChatAccountType = "personal" | "business";
 export type GigaChatBaseUrlChoice = "default" | "custom";
+
+export function resolveVerifySslCertificates(
+	value: string | undefined,
+): boolean {
+	if (value === undefined || value.trim() === "") {
+		return false;
+	}
+
+	switch (value.trim().toLowerCase()) {
+		case "false":
+		case "0":
+		case "no":
+		case "off":
+			return false;
+		case "true":
+		case "1":
+		case "yes":
+		case "on":
+			return true;
+		default:
+			throw new Error(
+				"Invalid GIGACHAT_VERIFY_SSL_CERTS value. Use true/false, 1/0, yes/no, or on/off.",
+			);
+	}
+}
+
+export function resolveEnvironmentAccessToken(): string | undefined {
+	const value = process.env.GIGACHAT_ACCESS_TOKEN?.trim();
+	if (!value) {
+		return undefined;
+	}
+
+	const accessToken = value.replace(/^Bearer(?:\s+|$)/i, "").trim();
+	if (!accessToken) {
+		throw new Error("GIGACHAT_ACCESS_TOKEN must contain an access token");
+	}
+	return accessToken;
+}
+
+export function createGigaChatHttpsAgent(
+	value: string | undefined = process.env.GIGACHAT_VERIFY_SSL_CERTS,
+): Agent {
+	const rejectUnauthorized = resolveVerifySslCertificates(value);
+	if (!rejectUnauthorized && !tlsDisabledWarningEmitted) {
+		process.stderr.write(TLS_DISABLED_WARNING);
+		tlsDisabledWarningEmitted = true;
+	}
+
+	return new Agent({ rejectUnauthorized });
+}
+
+export function resetTlsDisabledWarningForTests(): void {
+	tlsDisabledWarningEmitted = false;
+}
 
 export type GigaChatStoredCredentials = OAuthCredentials & {
 	authMode?: GigaChatAuthMode;
@@ -315,9 +373,13 @@ export function createTokenClient(
 	baseUrl: string,
 ): PiGigaChatClient {
 	const config = {
+		accessToken: undefined,
 		credentials: authorizationKey,
+		user: undefined,
+		password: undefined,
 		scope,
 		baseUrl,
+		httpsAgent: createGigaChatHttpsAgent(),
 	} satisfies GigaChatClientConfig;
 
 	return new PiGigaChatClient(config);
@@ -329,9 +391,12 @@ export function createPasswordClient(
 	baseUrl: string,
 ): PiGigaChatClient {
 	const config = {
+		accessToken: undefined,
+		credentials: undefined,
 		user,
 		password,
 		baseUrl,
+		httpsAgent: createGigaChatHttpsAgent(),
 	} satisfies GigaChatClientConfig;
 
 	return new PiGigaChatClient(config);

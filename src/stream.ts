@@ -10,11 +10,11 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import {
 	calculateCost,
 	createAssistantMessageEventStream,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type { GigaChatClientConfig } from "gigachat";
 import type {
 	ChatCompletionChunk,
@@ -26,17 +26,20 @@ import type {
 } from "gigachat/interfaces";
 import { GIGACHAT_DEFAULT_BASE_URL } from "./models.js";
 import {
+	createGigaChatHttpsAgent,
 	GIGACHAT_DEFAULT_SCOPE,
 	type GigaChatScope,
 	isAccessToken,
+	normalizeBaseUrl,
 	normalizeScope,
 	PiGigaChatClient,
+	resolveEnvironmentAccessToken,
 } from "./shared.js";
 import { transformMessages } from "./transform-messages.js";
 
 const GIGACHAT_DEFAULT_MODEL = "GigaChat";
 
-type GigaChatStreamOptions = SimpleStreamOptions & {
+export type GigaChatStreamOptions = SimpleStreamOptions & {
 	profanityCheck?: boolean;
 	repetitionPenalty?: number;
 	updateInterval?: number;
@@ -47,7 +50,7 @@ type GigaChatStreamOptions = SimpleStreamOptions & {
 	password?: string;
 };
 
-type GigaChatAuth =
+export type GigaChatAuth =
 	| { kind: "accessToken"; accessToken: string }
 	| { kind: "credentials"; credentials: string; scope?: GigaChatScope }
 	| { kind: "password"; user: string; password: string };
@@ -75,9 +78,12 @@ function streamGigaChat(
 
 	(async () => {
 		const output = createOutput(model);
+		let sensitiveAccessToken: string | undefined;
 
 		try {
 			const auth = resolveAuth(options);
+			sensitiveAccessToken =
+				auth.kind === "accessToken" ? auth.accessToken : undefined;
 			const client = createClient(model, auth, options);
 			let payload = buildChatPayload(model, context, options);
 			const nextPayload = await options?.onPayload?.(payload, model);
@@ -98,12 +104,18 @@ function streamGigaChat(
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				throw new Error("An unknown error occurred");
 			}
+			if (output.stopReason === "pending") {
+				throw new Error("GigaChat stream ended without a stop reason");
+			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = await getErrorMessage(error);
+			output.errorMessage = await getErrorMessage(
+				error,
+				sensitiveAccessToken ? [sensitiveAccessToken] : [],
+			);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -127,32 +139,24 @@ function createOutput(model: Model<Api>): AssistantMessage {
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "stop",
+		stopReason: "pending",
 		timestamp: Date.now(),
 	};
 }
 
-function resolveAuth(options?: GigaChatStreamOptions): GigaChatAuth {
+export function resolveAuth(options?: GigaChatStreamOptions): GigaChatAuth {
+	// Explicit env vars take priority over stored OAuth credentials.
+	const envAccessToken = resolveEnvironmentAccessToken();
+	if (envAccessToken) {
+		return { kind: "accessToken", accessToken: envAccessToken };
+	}
+
 	const explicitScope = normalizeScope(
 		options?.scope ?? process.env.GIGACHAT_SCOPE ?? "",
 		GIGACHAT_DEFAULT_SCOPE,
 	);
 
-	// Explicit env vars take priority over stored OAuth credentials.
-	const envAccessToken = process.env.GIGACHAT_ACCESS_TOKEN;
-	if (envAccessToken) {
-		if (isAccessToken(envAccessToken)) {
-			return { kind: "accessToken", accessToken: envAccessToken };
-		}
-
-		return {
-			kind: "credentials",
-			credentials: envAccessToken,
-			scope: explicitScope,
-		};
-	}
-
-	const envCredentials = process.env.GIGACHAT_CREDENTIALS;
+	const envCredentials = process.env.GIGACHAT_CREDENTIALS?.trim();
 	if (envCredentials) {
 		return {
 			kind: "credentials",
@@ -163,14 +167,21 @@ function resolveAuth(options?: GigaChatStreamOptions): GigaChatAuth {
 
 	// Fall back to stored OAuth credentials (via pi's provider apiKey mechanism).
 	const optionApiKey = resolveOptionApiKey(options?.apiKey);
-	if (optionApiKey) {
-		if (isAccessToken(optionApiKey)) {
-			return { kind: "accessToken", accessToken: optionApiKey };
+	const normalizedOption = optionApiKey?.trim();
+	if (normalizedOption) {
+		if (/^Bearer\s+/i.test(normalizedOption)) {
+			return {
+				kind: "accessToken",
+				accessToken: normalizedOption.replace(/^Bearer\s+/i, "").trim(),
+			};
+		}
+		if (isAccessToken(normalizedOption)) {
+			return { kind: "accessToken", accessToken: normalizedOption };
 		}
 
 		return {
 			kind: "credentials",
-			credentials: optionApiKey,
+			credentials: normalizedOption,
 			scope: explicitScope,
 		};
 	}
@@ -187,34 +198,56 @@ function resolveAuth(options?: GigaChatStreamOptions): GigaChatAuth {
 }
 
 function resolveOptionApiKey(value: string | undefined): string | undefined {
-	// pi-ai passes the provider's apiKey setting through as a literal env var
-	// name when the variable is unset. Do not treat that placeholder as a real
-	// credential, otherwise GIGACHAT_USER/GIGACHAT_PASSWORD fallback is skipped.
+	// Pi resolves provider auth before streamSimple. These literal sentinels keep
+	// direct env/password modes available, but are not themselves credentials.
+	if (value === "GIGACHAT_ACCESS_TOKEN") {
+		return process.env.GIGACHAT_ACCESS_TOKEN;
+	}
 	if (value === "GIGACHAT_CREDENTIALS") {
 		return process.env.GIGACHAT_CREDENTIALS;
 	}
 	return value;
 }
 
-function createClient(
+export function resolveBaseUrl(
+	model: Model<Api>,
+	options?: GigaChatStreamOptions,
+): string {
+	const candidates = [
+		options?.baseUrl,
+		process.env.GIGACHAT_BASE_URL,
+		model.baseUrl,
+	];
+	const configured = candidates.find(
+		(value): value is string =>
+			typeof value === "string" && value.trim().length > 0,
+	);
+	return normalizeBaseUrl(configured ?? "", GIGACHAT_DEFAULT_BASE_URL);
+}
+
+export function createClientConfig(
 	model: Model<Api>,
 	auth: GigaChatAuth,
 	options?: GigaChatStreamOptions,
-): PiGigaChatClient {
+): GigaChatClientConfig {
 	const config: GigaChatClientConfig = {
 		model: model.id || GIGACHAT_DEFAULT_MODEL,
-		baseUrl:
-			options?.baseUrl ||
-			process.env.GIGACHAT_BASE_URL ||
-			model.baseUrl ||
-			GIGACHAT_DEFAULT_BASE_URL,
+		baseUrl: resolveBaseUrl(model, options),
 		profanityCheck: options?.profanityCheck,
+		httpsAgent: createGigaChatHttpsAgent(),
 		dangerouslyAllowBrowser: isBrowserRuntime(),
+		// gigachat-js reads auth environment variables into defaults before it
+		// overlays this config. Explicit undefined values neutralize stale modes.
+		accessToken: undefined,
+		credentials: undefined,
+		user: undefined,
+		password: undefined,
 	};
 
 	switch (auth.kind) {
 		case "accessToken":
 			config.accessToken = auth.accessToken;
+			config.authUrl = undefined;
 			break;
 		case "credentials":
 			config.credentials = auth.credentials;
@@ -226,10 +259,18 @@ function createClient(
 			break;
 	}
 
-	return new PiGigaChatClient(config);
+	return config;
 }
 
-function buildChatPayload(
+export function createClient(
+	model: Model<Api>,
+	auth: GigaChatAuth,
+	options?: GigaChatStreamOptions,
+): PiGigaChatClient {
+	return new PiGigaChatClient(createClientConfig(model, auth, options));
+}
+
+export function buildChatPayload(
 	model: Model<Api>,
 	context: Context,
 	options?: GigaChatStreamOptions,
@@ -708,14 +749,17 @@ function sanitizeSurrogates(text: string): string {
 	return text.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
 }
 
-async function getErrorMessage(error: unknown): Promise<string> {
+export async function getErrorMessage(
+	error: unknown,
+	sensitiveValues: string[] = [],
+): Promise<string> {
 	if (
 		error instanceof Error &&
 		error.message &&
 		error.message !== "[object ReadableStream]"
 	) {
 		if (error.message !== "[object Object]") {
-			return error.message;
+			return redactSensitiveValues(error.message, sensitiveValues);
 		}
 	}
 
@@ -725,15 +769,28 @@ async function getErrorMessage(error: unknown): Promise<string> {
 			await readResponseData(asRecord(response)?.data),
 		);
 		if (responseError) {
-			return responseError;
+			return redactSensitiveValues(responseError, sensitiveValues);
 		}
 	}
 
 	if (error instanceof Error) {
-		return error.message;
+		return redactSensitiveValues(error.message, sensitiveValues);
 	}
 
-	return String(error);
+	return redactSensitiveValues(String(error), sensitiveValues);
+}
+
+export function redactSensitiveValues(
+	message: string,
+	sensitiveValues: string[],
+): string {
+	let redacted = message;
+	for (const value of sensitiveValues) {
+		if (value) {
+			redacted = redacted.split(value).join("[REDACTED]");
+		}
+	}
+	return redacted;
 }
 
 function extractResponseErrorMessage(value: unknown): string | undefined {
