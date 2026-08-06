@@ -5,7 +5,7 @@ import type {
 	Model,
 	ToolCall,
 	ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 /**
  * Local copy of pi-ai's message normalizer so the extension can preserve

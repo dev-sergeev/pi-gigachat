@@ -4,8 +4,8 @@ import type {
 	OAuthCredentials,
 	OAuthLoginCallbacks,
 	OAuthPrompt,
-	OAuthProviderInterface,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
+import type { ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { GIGACHAT_DEFAULT_BASE_URL } from "./models.js";
 import {
 	createPasswordClient,
@@ -25,6 +25,7 @@ import {
 	normalizeStoredBaseUrl,
 	normalizeUser,
 	parseExpiresAt,
+	resolveEnvironmentAccessToken,
 	withCertificateHint,
 } from "./shared.js";
 
@@ -267,7 +268,7 @@ async function loginGigaChat(options: {
 	};
 }
 
-export const gigachatOAuthProvider: Omit<OAuthProviderInterface, "id"> = {
+export const gigachatOAuthProvider: NonNullable<ProviderConfig["oauth"]> = {
 	name: "GigaChat",
 
 	async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
@@ -279,6 +280,13 @@ export const gigachatOAuthProvider: Omit<OAuthProviderInterface, "id"> = {
 	},
 
 	async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+		// Pi resolves stored OAuth before invoking streamSimple. Preserve the
+		// stored credential while an explicit environment access token is active:
+		// this prevents a pre-stream OAuth exchange without persisting the token.
+		if (resolveEnvironmentAccessToken()) {
+			return credentials;
+		}
+
 		const gigachatCredentials = credentials as GigaChatStoredCredentials;
 
 		if (
@@ -334,7 +342,8 @@ export const gigachatOAuthProvider: Omit<OAuthProviderInterface, "id"> = {
 	},
 
 	getApiKey(credentials: OAuthCredentials): string {
-		return credentials.access;
+		const envAccessToken = resolveEnvironmentAccessToken();
+		return envAccessToken ?? `Bearer ${credentials.access}`;
 	},
 
 	modifyModels(
