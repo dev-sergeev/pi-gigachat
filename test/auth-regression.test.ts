@@ -103,6 +103,8 @@ describe("GIGACHAT_ACCESS_TOKEN regression", () => {
 			allowModelNetwork: false,
 		});
 		extension({
+			registerFlag: () => {},
+			getFlag: () => undefined,
 			registerProvider: (
 				name: string,
 				config: Parameters<ModelRuntime["registerProvider"]>[1],

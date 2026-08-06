@@ -48,6 +48,99 @@ Opaque tokens without dots are valid.
 tokens are not refreshed automatically. After a token expires, obtain a new
 one, update `GIGACHAT_ACCESS_TOKEN`, and restart Pi.
 
+## Generation parameters
+
+For one-off interactive runs, use the extension's namespaced Pi flags:
+
+```bash
+pi --provider gigachat --model GigaChat \
+  --gigachat-temperature 0.2 \
+  --gigachat-max-tokens 4096 \
+  --gigachat-repetition-penalty 1.1
+```
+
+For persistent shell, container, or service configuration, use environment
+variables:
+
+```bash
+export GIGACHAT_TEMPERATURE=0.2
+export GIGACHAT_MAX_TOKENS=4096
+export GIGACHAT_REPETITION_PENALTY=1.1
+export GIGACHAT_UPDATE_INTERVAL=0.25
+```
+
+Supported scalar controls are:
+
+| GigaChat request field | Pi flag | Environment variable |
+| --- | --- | --- |
+| `temperature` | `--gigachat-temperature` | `GIGACHAT_TEMPERATURE` |
+| `top_p` | `--gigachat-top-p` | `GIGACHAT_TOP_P` |
+| `max_tokens` | `--gigachat-max-tokens` | `GIGACHAT_MAX_TOKENS` |
+| `repetition_penalty` | `--gigachat-repetition-penalty` | `GIGACHAT_REPETITION_PENALTY` |
+| `update_interval` | `--gigachat-update-interval` | `GIGACHAT_UPDATE_INTERVAL` |
+
+`temperature` must be greater than zero. `top_p` must be between zero and one.
+They are alternative sampling strategies: configure one, not both. Token limits
+from flags, environment variables, or `samplingParams` must be positive 32-bit
+integers; `repetition_penalty` must be positive, and `update_interval` must be
+non-negative. Invalid flag, environment, or `samplingParams` configuration fails
+before an API request is sent. For compatibility with Pi, a positive fractional
+`options.maxTokens` value is floored and an invalid one is omitted.
+
+If no sampling control is configured, `temperature`, `top_p`, and
+`repetition_penalty` are omitted so that GigaChat can use its model-dependent
+defaults. `max_tokens` defaults to the Pi model's `maxTokens` metadata (8192 for
+the bundled GigaChat models and 131071 for `glm-5.1`).
+
+The current GigaChat REST API also supports structured output through
+`response_format`. Programmatic callers can use the exported
+`GigaChatStreamOptions` type:
+
+```ts
+import type { GigaChatStreamOptions } from "@dev-sergeev/pi-gigachat";
+
+const options: GigaChatStreamOptions = {
+  responseFormat: {
+    type: "json_schema",
+    schema: {
+      type: "object",
+      properties: { result: { type: "string" } },
+      required: ["result"],
+    },
+    strict: true,
+  },
+};
+```
+
+The extension also understands extension-specific `model.samplingParams` and
+`options.samplingParams` fields using the request-field names `temperature`,
+`top_p`, `max_tokens`, `repetition_penalty`, `update_interval`,
+`profanity_check`, and `response_format`. Flags and environment variables are
+the recommended user-facing configuration. Resolution order, from highest to
+lowest priority, is:
+
+1. `options.samplingParams`
+2. named runtime options such as `temperature`, `topP`, and `maxTokens`
+3. `--gigachat-*` flags
+4. request-scoped `options.env`
+5. `GIGACHAT_*` process environment variables
+6. `model.samplingParams`
+7. `model.maxTokens` for `max_tokens`
+
+A higher-priority `top_p` removes a lower-priority `temperature`, and vice
+versa. The existing `onPayload` hook remains the final trusted override.
+
+The `samplingParams` interface rejects unknown and structural fields, including
+`model`, `messages`, `stream`, `functions`, and `function_call`. Function calls
+continue to use the existing typed `functionCall` option and Pi tool context.
+The extension deliberately does not expose `n`: its streaming consumer handles
+one response choice. `profanity_check` remains available only as a legacy
+programmatic option for compatibility with `gigachat` 0.0.20; it has no CLI
+flag or documented environment variable because it is absent from the current
+REST v1 schema. See the official
+[chat completion reference](https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-chat)
+and [structured output guide](https://developers.sber.ru/docs/ru/gigachat/guides/structured-output).
+
 ## Authentication priority
 
 The extension resolves authentication in this order:
@@ -117,14 +210,22 @@ and every other HTTPS connection in the process.
 ## Models
 
 - `gigachat/GigaChat`
+- `gigachat/glm-5.1`
 - `gigachat/GigaChat-2`
 - `gigachat/GigaChat-2-Pro`
 - `gigachat/GigaChat-2-Max`
 
 For `GigaChat`, the extension carries `contextWindow: 128000` and
 `maxTokens: 8192` as operational metadata inherited from the current extension.
+For `glm-5.1`, it carries `contextWindow: 192000`, `maxTokens: 131071`, and
+`temperature: 0.2` as operational defaults. The public GigaChat model catalog
+does not currently list `glm-5.1`; this is an experimental/custom-route entry
+whose availability must be confirmed for the active token with `GET /v1/models`.
 These values are not presented as official limits for every GigaChat API
-deployment.
+deployment. A route with a smaller server-side output limit may require
+`--gigachat-max-tokens` with a lower value. See the official
+[model selection guide](https://developers.sber.ru/docs/ru/gigachat/guides/selecting-a-model)
+and [`GET /v1/models` reference](https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/get-models).
 
 ## Optional Pi defaults
 

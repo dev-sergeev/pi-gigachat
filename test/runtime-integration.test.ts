@@ -49,6 +49,7 @@ async function close(server: Server): Promise<void> {
 
 async function createRuntime(
 	credentials = new InMemoryCredentialStore(),
+	flags: Readonly<Record<string, string | boolean | undefined>> = {},
 ): Promise<ModelRuntime> {
 	const runtime = await ModelRuntime.create({
 		credentials,
@@ -56,6 +57,8 @@ async function createRuntime(
 		allowModelNetwork: false,
 	});
 	extension({
+		registerFlag: () => {},
+		getFlag: (name: string) => flags[name],
 		registerProvider: (
 			name: string,
 			config: Parameters<ModelRuntime["registerProvider"]>[1],
@@ -65,6 +68,145 @@ async function createRuntime(
 }
 
 describe("Pi runtime integration", () => {
+	it("rejects invalid generation flags before sending a request", async () => {
+		const token = "opaque-access-token-without-dots";
+		let requestCount = 0;
+		const streamRequest = vi.spyOn(PiGigaChatClient.prototype, "streamRobust");
+		const oauthExchange = vi.spyOn(
+			PiGigaChatClient.prototype,
+			"updateTokenQuietly",
+		);
+		const server = createServer((_request, response) => {
+			requestCount += 1;
+			response.writeHead(500).end();
+		});
+
+		try {
+			process.env.GIGACHAT_BASE_URL = await listen(server);
+			process.env.GIGACHAT_ACCESS_TOKEN = token;
+			const runtime = await createRuntime(new InMemoryCredentialStore(), {
+				"gigachat-temperature": "not-a-number",
+			});
+			const model = runtime.getModel("gigachat", "GigaChat");
+			if (!model) throw new Error("GigaChat model was not registered");
+
+			const result = await runtime.completeSimple(model, {
+				messages: [
+					{ role: "user", content: "Return OK", timestamp: Date.now() },
+				],
+			});
+
+			expect(requestCount).toBe(0);
+			expect(streamRequest).not.toHaveBeenCalled();
+			expect(oauthExchange).not.toHaveBeenCalled();
+			expect(result).toMatchObject({
+				stopReason: "error",
+				errorMessage: expect.stringContaining("--gigachat-temperature"),
+			});
+			expect(result.errorMessage).not.toContain(token);
+		} finally {
+			await close(server);
+		}
+	});
+
+	it("forwards extension CLI generation flags through the SDK", async () => {
+		const payloads: Array<Record<string, unknown>> = [];
+		const server = createServer(async (request, response) => {
+			let body = "";
+			for await (const chunk of request) body += chunk.toString();
+			payloads.push(JSON.parse(body) as Record<string, unknown>);
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				[
+					'data: {"choices":[{"delta":{"content":"OK"},"index":0,"finish_reason":null}],"created":0,"model":"GigaChat","object":"chat.completion.chunk"}',
+					'data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"created":0,"model":"GigaChat","object":"chat.completion.chunk"}',
+					"data: [DONE]",
+					"",
+				].join("\n\n"),
+			);
+		});
+
+		try {
+			process.env.GIGACHAT_BASE_URL = await listen(server);
+			process.env.GIGACHAT_ACCESS_TOKEN = "opaque-access-token-without-dots";
+			const runtime = await createRuntime(new InMemoryCredentialStore(), {
+				"gigachat-temperature": "0.2",
+				"gigachat-max-tokens": "4096",
+				"gigachat-repetition-penalty": "1.1",
+				"gigachat-update-interval": "0.25",
+			});
+			const model = runtime.getModel("gigachat", "GigaChat");
+			if (!model) throw new Error("GigaChat model was not registered");
+
+			await runtime.completeSimple(
+				model,
+				{
+					messages: [
+						{ role: "user", content: "Return OK", timestamp: Date.now() },
+					],
+				},
+				{
+					samplingParams: { response_format: { type: "text" } },
+				} as Parameters<ModelRuntime["completeSimple"]>[2],
+			);
+
+			expect(payloads).toEqual([
+				expect.objectContaining({
+					temperature: 0.2,
+					max_tokens: 4096,
+					repetition_penalty: 1.1,
+					update_interval: 0.25,
+					response_format: { type: "text" },
+				}),
+			]);
+		} finally {
+			await close(server);
+		}
+	});
+
+	it("forwards the GLM model id and model generation defaults", async () => {
+		const payloads: Array<Record<string, unknown>> = [];
+		const server = createServer(async (request, response) => {
+			let body = "";
+			for await (const chunk of request) body += chunk.toString();
+			payloads.push(JSON.parse(body) as Record<string, unknown>);
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				[
+					'data: {"choices":[{"delta":{"content":"OK"},"index":0,"finish_reason":null}],"created":0,"model":"glm-5.1","object":"chat.completion.chunk"}',
+					'data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"created":0,"model":"glm-5.1","object":"chat.completion.chunk"}',
+					"data: [DONE]",
+					"",
+				].join("\n\n"),
+			);
+		});
+
+		try {
+			process.env.GIGACHAT_BASE_URL = await listen(server);
+			process.env.GIGACHAT_ACCESS_TOKEN = "opaque-access-token-without-dots";
+			const runtime = await createRuntime();
+			const model = runtime.getModel("gigachat", "glm-5.1");
+			if (!model) throw new Error("glm-5.1 model was not registered");
+
+			await runtime.completeSimple(model, {
+				messages: [
+					{ role: "user", content: "Return OK", timestamp: Date.now() },
+				],
+			});
+
+			expect(payloads).toEqual([
+				expect.objectContaining({
+					model: "glm-5.1",
+					max_tokens: 131071,
+					temperature: 0.2,
+					stream: true,
+				}),
+			]);
+		} finally {
+			await close(server);
+		}
+	});
+
 	it("streams through Pi and the SDK with the exact access token, URL, and selected model", async () => {
 		const requests: Array<{
 			method: string | undefined;

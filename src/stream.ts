@@ -24,6 +24,12 @@ import type {
 	Function as GigaChatFunction,
 	Message as GigaChatMessage,
 } from "gigachat/interfaces";
+import {
+	type GigaChatFlagReader,
+	type GigaChatGenerationOptions,
+	type GigaChatGenerationParams,
+	resolveGigaChatGenerationParams,
+} from "./generation-params.js";
 import { GIGACHAT_DEFAULT_BASE_URL } from "./models.js";
 import {
 	createGigaChatHttpsAgent,
@@ -39,21 +45,21 @@ import { transformMessages } from "./transform-messages.js";
 
 const GIGACHAT_DEFAULT_MODEL = "GigaChat";
 
-export type GigaChatStreamOptions = SimpleStreamOptions & {
-	profanityCheck?: boolean;
-	repetitionPenalty?: number;
-	updateInterval?: number;
-	functionCall?: "auto" | "none" | { name: string };
-	scope?: string;
-	baseUrl?: string;
-	user?: string;
-	password?: string;
-};
+export type GigaChatStreamOptions = SimpleStreamOptions &
+	GigaChatGenerationOptions & {
+		functionCall?: "auto" | "none" | { name: string };
+		scope?: string;
+		baseUrl?: string;
+		user?: string;
+		password?: string;
+	};
 
 export type GigaChatAuth =
 	| { kind: "accessToken"; accessToken: string }
 	| { kind: "credentials"; credentials: string; scope?: GigaChatScope }
 	| { kind: "password"; user: string; password: string };
+
+export type GigaChatChatPayload = GigaChatChat & GigaChatGenerationParams;
 
 type ToolCallBlock = ToolCall & { partialArgs?: string };
 
@@ -69,10 +75,27 @@ export function streamSimpleGigaChat(
 	);
 }
 
+export function createGigaChatStreamSimple(
+	readFlag: GigaChatFlagReader,
+): (
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+) => AssistantMessageEventStream {
+	return (model, context, options) =>
+		streamGigaChat(
+			model,
+			context,
+			options as GigaChatStreamOptions | undefined,
+			readFlag,
+		);
+}
+
 function streamGigaChat(
 	model: Model<Api>,
 	context: Context,
 	options?: GigaChatStreamOptions,
+	readFlag?: GigaChatFlagReader,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -85,7 +108,7 @@ function streamGigaChat(
 			sensitiveAccessToken =
 				auth.kind === "accessToken" ? auth.accessToken : undefined;
 			const client = createClient(model, auth, options);
-			let payload = buildChatPayload(model, context, options);
+			let payload = buildChatPayload(model, context, options, readFlag);
 			const nextPayload = await options?.onPayload?.(payload, model);
 			if (nextPayload !== undefined) {
 				payload = nextPayload as GigaChatChat;
@@ -274,29 +297,17 @@ export function buildChatPayload(
 	model: Model<Api>,
 	context: Context,
 	options?: GigaChatStreamOptions,
-): GigaChatChat {
-	const payload: GigaChatChat = {
+	readFlag?: GigaChatFlagReader,
+): GigaChatChatPayload {
+	const payload: GigaChatChatPayload = {
 		model: model.id,
 		messages: convertMessages(model, context),
 		stream: true,
 	};
-	// Pi does not inject model.maxTokens into custom streamSimple options.
-	const requestedMaxTokens = options?.maxTokens ?? model.maxTokens;
-
-	if (options?.temperature !== undefined)
-		payload.temperature = options.temperature;
-	if (Number.isFinite(requestedMaxTokens)) {
-		const maxTokens = Math.floor(requestedMaxTokens);
-		if (maxTokens > 0) {
-			payload.max_tokens = maxTokens;
-		}
-	}
-	if (options?.profanityCheck !== undefined)
-		payload.profanity_check = options.profanityCheck;
-	if (options?.repetitionPenalty !== undefined)
-		payload.repetition_penalty = options.repetitionPenalty;
-	if (options?.updateInterval !== undefined)
-		payload.update_interval = options.updateInterval;
+	Object.assign(
+		payload,
+		resolveGigaChatGenerationParams(model, options, process.env, readFlag),
+	);
 	if (context.tools?.length) {
 		payload.functions = convertFunctions(context.tools);
 		payload.function_call = options?.functionCall ?? "auto";
