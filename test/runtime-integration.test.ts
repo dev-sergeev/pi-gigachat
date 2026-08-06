@@ -125,6 +125,7 @@ describe("Pi runtime integration", () => {
 					authorization: "Bearer opaque-access-token-without-dots",
 					payload: expect.objectContaining({
 						model: "GigaChat",
+						max_tokens: 8192,
 						stream: true,
 					}),
 				},

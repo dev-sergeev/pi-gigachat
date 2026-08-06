@@ -280,10 +280,17 @@ export function buildChatPayload(
 		messages: convertMessages(model, context),
 		stream: true,
 	};
+	// Pi does not inject model.maxTokens into custom streamSimple options.
+	const requestedMaxTokens = options?.maxTokens ?? model.maxTokens;
 
 	if (options?.temperature !== undefined)
 		payload.temperature = options.temperature;
-	if (options?.maxTokens !== undefined) payload.max_tokens = options.maxTokens;
+	if (Number.isFinite(requestedMaxTokens)) {
+		const maxTokens = Math.floor(requestedMaxTokens);
+		if (maxTokens > 0) {
+			payload.max_tokens = maxTokens;
+		}
+	}
 	if (options?.profanityCheck !== undefined)
 		payload.profanity_check = options.profanityCheck;
 	if (options?.repetitionPenalty !== undefined)

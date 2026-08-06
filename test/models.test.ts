@@ -84,3 +84,33 @@ describe("provider and model registration", () => {
 		);
 	});
 });
+
+describe("chat payload model defaults", () => {
+	it("uses model maxTokens when runtime options omit it", () => {
+		const payload = buildChatPayload(makeModel(), EMPTY_CONTEXT);
+
+		expect(payload.max_tokens).toBe(8192);
+	});
+
+	it("allows runtime maxTokens to override the model default", () => {
+		const payload = buildChatPayload(makeModel(), EMPTY_CONTEXT, {
+			maxTokens: 4096,
+		});
+
+		expect(payload.max_tokens).toBe(4096);
+	});
+
+	it.each([
+		0,
+		-1,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		0.5,
+	])("omits invalid maxTokens value %s", (maxTokens) => {
+		const payload = buildChatPayload(makeModel(), EMPTY_CONTEXT, {
+			maxTokens,
+		});
+
+		expect(payload.max_tokens).toBeUndefined();
+	});
+});
