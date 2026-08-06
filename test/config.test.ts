@@ -12,6 +12,7 @@ import {
 	createClientConfig,
 	type GigaChatAuth,
 	resolveBaseUrl,
+	resolveGigaChatTimeoutSeconds,
 } from "../src/stream.js";
 import {
 	clearGigaChatEnv,
@@ -56,6 +57,53 @@ describe("base URL resolution", () => {
 		expect(
 			resolveBaseUrl(model, { baseUrl: "https://option.example/v1///" }),
 		).toBe("https://option.example/v1");
+	});
+});
+
+describe("transport timeout", () => {
+	it("converts the standard Pi timeout from milliseconds to SDK seconds", () => {
+		expect(resolveGigaChatTimeoutSeconds({ timeoutMs: 300_000 })).toBe(300);
+		expect(
+			createClientConfig(makeModel(), accessAuth, { timeoutMs: 300_000 })
+				.timeout,
+		).toBe(300);
+	});
+
+	it("lets GigaChat-specific configuration override the generic Pi timeout", () => {
+		process.env.GIGACHAT_TIMEOUT = "120";
+
+		expect(resolveGigaChatTimeoutSeconds({ timeoutMs: 300_000 })).toBe(120);
+		expect(
+			resolveGigaChatTimeoutSeconds({
+				timeoutMs: 300_000,
+				env: { GIGACHAT_TIMEOUT: "180" },
+			}),
+		).toBe(180);
+		expect(
+			resolveGigaChatTimeoutSeconds({
+				timeoutSeconds: 240,
+				timeoutMs: 300_000,
+				env: { GIGACHAT_TIMEOUT: "180" },
+			}),
+		).toBe(240);
+	});
+
+	it("accepts zero as an explicit request to disable the SDK timeout", () => {
+		process.env.GIGACHAT_TIMEOUT = "0";
+
+		expect(resolveGigaChatTimeoutSeconds({ timeoutMs: 300_000 })).toBe(0);
+	});
+
+	it.each([
+		"not-a-number",
+		"-1",
+		"2147483.648",
+	])("rejects invalid GIGACHAT_TIMEOUT=%s", (value) => {
+		process.env.GIGACHAT_TIMEOUT = value;
+
+		expect(() => resolveGigaChatTimeoutSeconds()).toThrow(
+			"Invalid GIGACHAT_TIMEOUT value",
+		);
 	});
 });
 

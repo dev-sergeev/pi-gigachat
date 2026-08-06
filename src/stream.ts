@@ -44,6 +44,7 @@ import {
 import { transformMessages } from "./transform-messages.js";
 
 const GIGACHAT_DEFAULT_MODEL = "GigaChat";
+const MAX_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
 
 export type GigaChatStreamOptions = SimpleStreamOptions &
 	GigaChatGenerationOptions & {
@@ -52,6 +53,8 @@ export type GigaChatStreamOptions = SimpleStreamOptions &
 		baseUrl?: string;
 		user?: string;
 		password?: string;
+		/** GigaChat SDK transport timeout in seconds. Zero disables it. */
+		timeoutSeconds?: number;
 	};
 
 export type GigaChatAuth =
@@ -248,11 +251,69 @@ export function resolveBaseUrl(
 	return normalizeBaseUrl(configured ?? "", GIGACHAT_DEFAULT_BASE_URL);
 }
 
+export function resolveGigaChatTimeoutSeconds(
+	options?: GigaChatStreamOptions,
+): number | undefined {
+	const candidates: Array<{
+		value: number | string | undefined;
+		source: string;
+		unit: "milliseconds" | "seconds";
+	}> = [
+		{
+			value: options?.timeoutSeconds,
+			source: "options.timeoutSeconds",
+			unit: "seconds",
+		},
+		{
+			value: options?.env?.GIGACHAT_TIMEOUT,
+			source: "options.env.GIGACHAT_TIMEOUT",
+			unit: "seconds",
+		},
+		{
+			value: process.env.GIGACHAT_TIMEOUT,
+			source: "GIGACHAT_TIMEOUT",
+			unit: "seconds",
+		},
+		{
+			value: options?.timeoutMs,
+			source: "options.timeoutMs",
+			unit: "milliseconds",
+		},
+	];
+	const candidate = candidates.find(
+		({ value }) =>
+			typeof value === "number" ||
+			(typeof value === "string" && value.trim() !== ""),
+	);
+	if (!candidate) return undefined;
+
+	const numericValue = Number(candidate.value);
+	const timeoutMs =
+		candidate.unit === "seconds" ? numericValue * 1000 : numericValue;
+	if (
+		!Number.isFinite(numericValue) ||
+		numericValue < 0 ||
+		!Number.isFinite(timeoutMs) ||
+		timeoutMs > MAX_TRANSPORT_TIMEOUT_MS
+	) {
+		const maximum =
+			candidate.unit === "seconds"
+				? MAX_TRANSPORT_TIMEOUT_MS / 1000
+				: MAX_TRANSPORT_TIMEOUT_MS;
+		throw new Error(
+			`Invalid ${candidate.source} value. Expected a finite number of ${candidate.unit} between 0 and ${maximum}.`,
+		);
+	}
+
+	return candidate.unit === "seconds" ? numericValue : numericValue / 1000;
+}
+
 export function createClientConfig(
 	model: Model<Api>,
 	auth: GigaChatAuth,
 	options?: GigaChatStreamOptions,
 ): GigaChatClientConfig {
+	const timeout = resolveGigaChatTimeoutSeconds(options);
 	const config: GigaChatClientConfig = {
 		model: model.id || GIGACHAT_DEFAULT_MODEL,
 		baseUrl: resolveBaseUrl(model, options),
@@ -266,6 +327,9 @@ export function createClientConfig(
 		user: undefined,
 		password: undefined,
 	};
+	if (timeout !== undefined) {
+		config.timeout = timeout;
+	}
 
 	switch (auth.kind) {
 		case "accessToken":

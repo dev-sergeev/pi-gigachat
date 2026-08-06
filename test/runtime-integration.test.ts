@@ -68,6 +68,53 @@ async function createRuntime(
 }
 
 describe("Pi runtime integration", () => {
+	it("applies Pi timeoutMs to the SDK transport without adding timeout to the API payload", async () => {
+		let payload: Record<string, unknown> | undefined;
+		const server = createServer(async (request, response) => {
+			let body = "";
+			for await (const chunk of request) body += chunk.toString();
+			payload = JSON.parse(body) as Record<string, unknown>;
+
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			if (!response.destroyed) {
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.end(
+					[
+						'data: {"choices":[{"delta":{"content":"OK"},"index":0,"finish_reason":null}],"created":0,"model":"GigaChat","object":"chat.completion.chunk"}',
+						'data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"created":0,"model":"GigaChat","object":"chat.completion.chunk"}',
+						"data: [DONE]",
+						"",
+					].join("\n\n"),
+				);
+			}
+		});
+
+		try {
+			process.env.GIGACHAT_BASE_URL = await listen(server);
+			process.env.GIGACHAT_ACCESS_TOKEN = "opaque-access-token-without-dots";
+			const runtime = await createRuntime();
+			const model = runtime.getModel("gigachat", "GigaChat");
+			if (!model) throw new Error("GigaChat model was not registered");
+
+			const result = await runtime.completeSimple(
+				model,
+				{
+					messages: [
+						{ role: "user", content: "Return OK", timestamp: Date.now() },
+					],
+				},
+				{ timeoutMs: 25 },
+			);
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toMatch(/timeout of 25ms exceeded/i);
+			expect(payload).toBeDefined();
+			expect(payload).not.toHaveProperty("timeout");
+		} finally {
+			await close(server);
+		}
+	});
+
 	it("rejects invalid generation flags before sending a request", async () => {
 		const token = "opaque-access-token-without-dots";
 		let requestCount = 0;
