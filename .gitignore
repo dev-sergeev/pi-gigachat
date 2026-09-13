@@ -1,3 +1,16 @@
-node_modules
-dist
+node_modules/
+/dist/
+
+# Local credentials; keep the shareable configuration template.
 .env
+.env.*
+!.env.example
+
+# Local audit and traffic-inspection tools, not part of the package.
+/audit/
+/scripts/mitmweb_xsrf_cookie.py
+*.mitm
+*.log
+
+# Generated npm archives.
+*.tgz
