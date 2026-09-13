@@ -1,17 +1,20 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { GIGACHAT_DEFAULT_BASE_URL, GIGACHAT_MODELS } from "./models.js";
-import { gigachatOAuthProvider } from "./oauth.js";
+import { createProvider } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { gigachatAuth } from "./auth.js";
+import { GIGACHAT_MODELS } from "./models.js";
 import { streamSimpleGigaChat } from "./stream.js";
 
-const GIGACHAT_API = "gigachat-extension-api";
+export type { GigaChatStreamOptions } from "./stream.js";
+export { streamSimpleGigaChat };
+
+export const gigachatProvider = createProvider({
+	id: "gigachat",
+	name: "GigaChat",
+	auth: gigachatAuth,
+	models: GIGACHAT_MODELS,
+	api: { stream: streamSimpleGigaChat, streamSimple: streamSimpleGigaChat },
+});
 
 export default function (pi: ExtensionAPI) {
-	pi.registerProvider("gigachat", {
-		baseUrl: GIGACHAT_DEFAULT_BASE_URL,
-		apiKey: "GIGACHAT_CREDENTIALS",
-		api: GIGACHAT_API,
-		models: GIGACHAT_MODELS,
-		oauth: gigachatOAuthProvider,
-		streamSimple: streamSimpleGigaChat,
-	});
+	pi.registerProvider(gigachatProvider);
 }

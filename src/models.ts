@@ -1,47 +1,23 @@
-export interface GigaChatModelDefinition {
-	id: string;
-	name: string;
-	reasoning: boolean;
-	input: ("text" | "image")[];
-	cost: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-	};
-	contextWindow: number;
-	maxTokens: number;
-}
+import type { Model } from "@earendil-works/pi-ai";
 
-export const GIGACHAT_DEFAULT_BASE_URL =
-	"https://gigachat.devices.sberbank.ru/api/v1";
+export const GIGACHAT_API = "gigachat-extension-api";
+export const GIGACHAT_DEFAULT_BASE_URL = "https://api.giga.chat/v1";
 
-export const GIGACHAT_MODELS: GigaChatModelDefinition[] = [
-	{
-		id: "GigaChat-2",
-		name: "GigaChat 2 Lite",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 65, output: 65, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128000,
-		maxTokens: 8192,
-	},
-	{
-		id: "GigaChat-2-Pro",
-		name: "GigaChat 2 Pro",
-		reasoning: false,
-		input: ["text", "image"],
-		cost: { input: 500, output: 500, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128000,
-		maxTokens: 8192,
-	},
-	{
-		id: "GigaChat-2-Max",
-		name: "GigaChat 2 Max",
-		reasoning: false,
-		input: ["text", "image"],
-		cost: { input: 650, output: 650, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128000,
-		maxTokens: 8192,
-	},
-];
+export const GIGACHAT_MODELS: Model<typeof GIGACHAT_API>[] = [
+	["GigaChat-2", "GigaChat 2 Lite"],
+	["GigaChat-2-Pro", "GigaChat 2 Pro"],
+	["GigaChat-2-Max", "GigaChat 2 Max"],
+	["GigaChat-3-Ultra", "GigaChat 3 Ultra"],
+].map(([id, name]) => ({
+	id,
+	name,
+	api: GIGACHAT_API,
+	provider: "gigachat",
+	baseUrl: GIGACHAT_DEFAULT_BASE_URL,
+	reasoning: false,
+	input: ["text"],
+	// Unknown USD prices; tariffs vary by account. Zero is not a free-tier claim.
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 128000,
+	maxTokens: 8192,
+}));

@@ -3,8 +3,14 @@
 		"target": "ES2022",
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
-		"lib": ["ES2022", "DOM"],
-		"types": ["node"],
+		"lib": [
+			"ES2024",
+			"DOM",
+			"DOM.Iterable"
+		],
+		"types": [
+			"node"
+		],
 		"strict": true,
 		"skipLibCheck": true,
 		"verbatimModuleSyntax": true,
@@ -12,5 +18,7 @@
 		"allowSyntheticDefaultImports": true,
 		"rootDir": "./src"
 	},
-	"include": ["src/**/*.ts"]
+	"include": [
+		"src/**/*.ts"
+	]
 }
