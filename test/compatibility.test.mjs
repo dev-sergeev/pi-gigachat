@@ -85,6 +85,25 @@ test('an interrupted last tool call gets a synthetic result before resuming', as
   });
 });
 
+for (const orphanFirst of [false, true]) {
+  test(`unmatched tool results survive beside matched results (orphan first: ${orphanFirst})`, async () => {
+    await withServer(async ({ model, requests }) => {
+      const previous = await ask(model);
+      const call = { type: 'toolCall', id: 'current', name: 'read', arguments: {} };
+      previous.content = [call];
+      previous.stopReason = 'toolUse';
+      const matched = toolResult(call, 'matched-result');
+      const orphan = toolResult({ id: 'old-orphan', name: 'bash' }, 'orphan-result');
+      const result = await ask(model, { messages: [user('go'), previous,
+        ...(orphanFirst ? [orphan, matched] : [matched, orphan]), user('continue')] });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+      const messages = requests.at(-1).body.messages;
+      assert.equal(messages.find(m => m.role === 'function').content, JSON.stringify({ result: 'matched-result' }));
+      assert(messages.some(m => m.role === 'user' && m.content === 'Tool result (bash):\norphan-result'));
+    });
+  });
+}
+
 test('tool schemas retain nested requirements, numeric enums and validation constraints', async () => {
   const parameters = { type: 'object', properties: { config: { type: 'object', properties: { mode: { type: 'integer', enum: [1, 2], minimum: 1 } }, required: ['mode'], additionalProperties: false } }, required: ['config'] };
   await withServer(async ({ model, requests }) => {

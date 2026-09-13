@@ -110,6 +110,29 @@ test('environment access token wins over an authorization key and accepts opaque
   });
 });
 
+test('stored OAuth endpoint wins over ambient base URL; explicit request env can override it', async () => {
+  const store = new InMemoryCredentialStore();
+  await store.modify('gigachat', async () => ({ type: 'oauth', access: token, refresh: credentials,
+    expires: Date.now() + 1800000, baseUrl: 'https://saved.example/v1' }));
+  const models = collection({}, store);
+  const model = models.getModel('gigachat', 'GigaChat-3-Ultra');
+  const urls = [];
+  const fetch = async (url) => {
+    urls.push(String(url));
+    return Response.json(completion());
+  };
+  process.env.GIGACHAT_BASE_URL = 'https://ambient.example/v1';
+  try {
+    for (const env of [undefined, { GIGACHAT_BASE_URL: 'https://explicit.example/v1' }]) {
+      const result = await models.completeSimple(model, context, { fetch, env });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+    }
+    assert.deepEqual(urls, ['https://saved.example/v1/chat/completions', 'https://explicit.example/v1/chat/completions']);
+  } finally {
+    delete process.env.GIGACHAT_BASE_URL;
+  }
+});
+
 test('password authentication supports the corporate token response format', async () => {
   await withServer(async ({ baseUrl, model, requests }) => {
     const models = collection({ GIGACHAT_USER: 'test-user', GIGACHAT_PASSWORD: 'test-password', GIGACHAT_BASE_URL: baseUrl });

@@ -127,7 +127,9 @@ export function streamSimpleGigaChat(
 			stream.push({ type: "start", partial: output });
 			await serial(signal, () =>
 				request(
-					`${baseUrl(environment(options).GIGACHAT_BASE_URL || model.baseUrl)}/chat/completions`,
+					// Native auth already applied the saved or ambient endpoint to the
+					// model. Only an explicit request override may replace it here.
+					`${baseUrl(options.env?.GIGACHAT_BASE_URL || model.baseUrl)}/chat/completions`,
 					{
 						method: "POST",
 						body: JSON.stringify(body),

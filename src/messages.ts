@@ -81,6 +81,7 @@ export function convertMessages(
 						functions_state_id: readStateSignature(call.thoughtSignature),
 					});
 					const result = results.get(call.id);
+					results.delete(call.id);
 					messages.push({
 						role: "function",
 						name: call.name,
@@ -89,6 +90,9 @@ export function convertMessages(
 							...(result?.isError || !result ? { isError: true } : {}),
 						}),
 					});
+				}
+				for (const result of results.values()) {
+					messages.push(unmatchedToolResult(result));
 				}
 			} else {
 				const signature = message.content.find(
@@ -110,13 +114,17 @@ export function convertMessages(
 		const toolMessage = message as ToolResultMessage;
 		// A result without a preceding call can occur after a history cut or
 		// importing a session. Preserve it as context without an invalid pair.
-		messages.push({
-			role: "user",
-			content: `Tool result (${toolMessage.toolName}):\n${toolResultText(toolMessage)}`,
-		});
+		messages.push(unmatchedToolResult(toolMessage));
 	}
 
 	return messages;
+}
+
+function unmatchedToolResult(message: ToolResultMessage): GigaChatMessage {
+	return {
+		role: "user",
+		content: `Tool result (${message.toolName}):\n${toolResultText(message)}`,
+	};
 }
 
 function readStateSignature(signature?: string): string | undefined {
