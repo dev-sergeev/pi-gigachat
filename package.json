@@ -1,6 +1,6 @@
 {
-	"name": "@gigachain/pi-gigachat",
-	"version": "0.1.1",
+	"name": "@dev-sergeev/pi-gigachat",
+	"version": "0.2.0",
 	"description": "GigaChat provider extension for pi-coding-agent",
 	"private": false,
 	"type": "module",
@@ -14,11 +14,11 @@
 	],
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/ai-forever/pi-gigachat.git"
+		"url": "git+https://github.com/dev-sergeev/pi-gigachat.git"
 	},
-	"homepage": "https://github.com/ai-forever/pi-gigachat#readme",
+	"homepage": "https://github.com/dev-sergeev/pi-gigachat#readme",
 	"bugs": {
-		"url": "https://github.com/ai-forever/pi-gigachat/issues"
+		"url": "https://github.com/dev-sergeev/pi-gigachat/issues"
 	},
 	"engines": {
 		"node": ">=22.19.0"
@@ -35,24 +35,26 @@
 	},
 	"files": [
 		"dist",
+		"extension.js",
+		"THIRD_PARTY_NOTICES",
 		".env.example",
 		"README.md",
 		"LICENSE"
 	],
 	"scripts": {
-		"build": "rm -rf dist && tsc -p tsconfig.build.json",
+		"build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/build.mjs",
 		"clean": "rm -rf dist",
-		"check": "biome check --write --error-on-warnings src package.json README.md && tsc --noEmit",
-		"test": "npm run build && node --test test/*.test.mjs",
-		"prepare": "npm run build",
-		"prepublishOnly": "npm run build && npm run check"
+		"check": "biome check --error-on-warnings src package.json README.md && tsc --noEmit",
+		"test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
+		"prepublishOnly": "npm run build && npm run check",
+		"prepack": "npm run build"
 	},
 	"publishConfig": {
 		"access": "public"
 	},
 	"pi": {
 		"extensions": [
-			"./dist/index.js"
+			"./extension.js"
 		]
 	},
 	"peerDependencies": {
@@ -65,9 +67,18 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.3.5",
-		"@types/node": "^24.3.0",
-		"typescript": "^5.9.2",
 		"@earendil-works/pi-ai": "0.85.1",
-		"@earendil-works/pi-coding-agent": "0.85.1"
+		"@earendil-works/pi-coding-agent": "0.85.1",
+		"@types/node": "^24.3.0",
+		"esbuild": "0.28.1",
+		"typescript": "^5.9.2"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-ai": {
+			"optional": true
+		},
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
 	}
 }
