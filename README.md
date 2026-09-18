@@ -83,6 +83,7 @@ process; `/reload` alone does not reread it.
 | `GIGACHAT_ACCESS_TOKEN` | Unset | Current bearer token; cannot renew itself |
 | `GIGACHAT_BASE_URL` | `https://api.giga.chat/v1` | API root, including `/v1` |
 | `GIGACHAT_STREAM` | `false` | Exactly `true` for SSE or `false` for a complete JSON response |
+| `GIGACHAT_REASONING_IN_CONTENT` | `false` | Exactly `true` to include saved thinking in outgoing assistant `content`; `false` keeps the normal `reasoning_content` field |
 | `GIGACHAT_EXTRA_BODY` | `{}` | JSON object shallow-merged into every chat request |
 | `GIGACHAT_SYSTEM_PROMPT` | Built-in single-tool instruction | Replaces the default provider block; an empty value disables the block |
 | `GIGACHAT_TIMEOUT` | `300` | HTTP timeout in seconds per attempt, excluding retry waits |
@@ -247,7 +248,7 @@ including replies with empty `content` and a `function_call`. No setting is need
 to preserve reasoning that the endpoint already returns.
 
 Pi displays these blocks and saves them in its session history. `Ctrl+T` toggles
-their visibility without removing them from history. On subsequent requests to
+their visibility without removing them from history. By default, on subsequent requests to
 the same provider/API/model, the adapter restores the complete reasoning text in
 the assistant message's `reasoning_content` field, alongside `content`,
 `function_call` and `functions_state_id`. Whitespace and streamed fragments are
@@ -267,6 +268,49 @@ server generates or map Pi's thinking-level selector to API options. Use
 `GIGACHAT_EXTRA_BODY` for reasoning parameters supported by your endpoint.
 Whether the server uses replayed `reasoning_content` depends on that endpoint's
 input contract; returning the field alone does not establish that support.
+
+#### Optional replay in content
+
+For endpoints that ignore `reasoning_content` on input, explicitly enable:
+
+```bash
+GIGACHAT_REASONING_IN_CONTENT=true pi --provider gigachat --model glm-5.2
+```
+
+This setting defaults to `false`. Unset or `false` preserves the normal behavior
+described above. Only the exact values `true` and `false` are accepted; other
+values fail before a request is sent. Export the variable or reload your `.env`
+when starting Pi, as described in the launch instructions.
+
+When enabled, the adapter prepends saved, non-redacted thinking to each outgoing
+assistant message's `content` in this format:
+
+```text
+<previous_reasoning>
+The original reasoning text, with its whitespace preserved.
+</previous_reasoning>
+
+The original assistant answer, if any.
+```
+
+The separate `reasoning_content` field is omitted in this mode to avoid sending
+the same reasoning twice. Empty reasoning adds no marker. Replies containing
+only reasoning and a tool call also receive this content; `function_call`,
+`functions_state_id`, and the corresponding tool results are preserved. For
+multiple tool calls in imported history, the reasoning is included once, with
+the first call.
+
+This transformation happens only when building requests, including tool
+follow-ups and resumed sessions. Pi still displays and stores native `thinking`
+blocks, so disabling the setting restores the default request format without
+rewriting history. Compaction and model switches still follow Pi's normal rules.
+Explicit overrides of `messages` via extra body settings or payload hooks can
+replace the generated messages.
+
+The endpoint receives reasoning as ordinary assistant text in its context. This
+uses additional input tokens on endpoints that previously ignored the separate
+field; it does not enable a server's native reasoning mode or guarantee better
+answers.
 
 ### Context management
 

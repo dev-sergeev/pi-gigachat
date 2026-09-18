@@ -321,6 +321,7 @@ async function configuration(ctx, credential) {
     "GIGACHAT_MAX_RETRIES",
     "GIGACHAT_RETRY_BASE_DELAY_MS",
     "GIGACHAT_STREAM",
+    "GIGACHAT_REASONING_IN_CONTENT",
     "GIGACHAT_EXTRA_BODY",
     "GIGACHAT_SYSTEM_PROMPT",
     "HTTP_PROXY",
@@ -632,7 +633,7 @@ function transformMessages(messages, model, normalizeToolCallId) {
 
 // src/messages.ts
 var STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
-function convertMessages(model, context, additionalSystemPrompt) {
+function convertMessages(model, context, additionalSystemPrompt, reasoningInContent = false) {
   const messages = [];
   const transformedMessages = transformMessages(context.messages, model);
   const systemPrompt = [context.systemPrompt, additionalSystemPrompt?.trim()].filter(Boolean).join("\n\n");
@@ -662,10 +663,14 @@ function convertMessages(model, context, additionalSystemPrompt) {
       const thinking = message.content.filter(
         (item) => item.type === "thinking" && !item.redacted
       );
-      const reasoning = thinking.length ? {
-        reasoning_content: thinking.map((item) => item.thinking).join("")
-      } : {};
+      const reasoningText = thinking.map((item) => item.thinking).join("");
+      const reasoning = thinking.length && !reasoningInContent ? { reasoning_content: reasoningText } : {};
       const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("");
+      const content = reasoningInContent && reasoningText ? `<previous_reasoning>
+${sanitizeSurrogates(reasoningText)}
+</previous_reasoning>${text ? `
+
+${text}` : ""}` : text;
       const toolCalls = message.content.filter(
         (item) => item.type === "toolCall"
       );
@@ -678,7 +683,7 @@ function convertMessages(model, context, additionalSystemPrompt) {
         for (const [callIndex, call] of toolCalls.entries()) {
           messages.push({
             role: "assistant",
-            content: callIndex === 0 ? text : "",
+            content: callIndex === 0 ? content : "",
             ...callIndex === 0 ? reasoning : {},
             function_call: { name: call.name, arguments: call.arguments },
             functions_state_id: readStateSignature(call.thoughtSignature)
@@ -703,7 +708,7 @@ function convertMessages(model, context, additionalSystemPrompt) {
         );
         messages.push({
           role: "assistant",
-          content: text,
+          content,
           ...reasoning,
           functions_state_id: signature?.type === "text" ? readStateSignature(signature.textSignature) : void 0
         });
@@ -757,6 +762,9 @@ function payload(model, context, options) {
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
     throw new Error("GIGACHAT_STREAM must be true or false");
+  const reasoningInContent = env.GIGACHAT_REASONING_IN_CONTENT ?? "false";
+  if (reasoningInContent !== "true" && reasoningInContent !== "false")
+    throw new Error("GIGACHAT_REASONING_IN_CONTENT must be true or false");
   const additionalSystemPrompt = env.GIGACHAT_SYSTEM_PROMPT ?? DEFAULT_SYSTEM_PROMPT;
   let extra;
   try {
@@ -771,7 +779,12 @@ function payload(model, context, options) {
     throw new Error("GigaChat maxTokens must be positive");
   return {
     model: model.id,
-    messages: convertMessages(model, context, additionalSystemPrompt),
+    messages: convertMessages(
+      model,
+      context,
+      additionalSystemPrompt,
+      reasoningInContent === "true"
+    ),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     function_call: options.toolChoice ?? options.functionCall ?? (context.tools?.length ? "auto" : "none"),
     ...context.tools?.length ? { functions: convertFunctions(context.tools) } : {},

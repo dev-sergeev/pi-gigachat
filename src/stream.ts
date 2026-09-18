@@ -63,6 +63,9 @@ function payload(
 	const mode = env.GIGACHAT_STREAM ?? "false";
 	if (mode !== "true" && mode !== "false")
 		throw new Error("GIGACHAT_STREAM must be true or false");
+	const reasoningInContent = env.GIGACHAT_REASONING_IN_CONTENT ?? "false";
+	if (reasoningInContent !== "true" && reasoningInContent !== "false")
+		throw new Error("GIGACHAT_REASONING_IN_CONTENT must be true or false");
 	const additionalSystemPrompt =
 		env.GIGACHAT_SYSTEM_PROMPT ?? DEFAULT_SYSTEM_PROMPT;
 	let extra: unknown;
@@ -78,7 +81,12 @@ function payload(
 		throw new Error("GigaChat maxTokens must be positive");
 	return {
 		model: model.id,
-		messages: convertMessages(model, context, additionalSystemPrompt),
+		messages: convertMessages(
+			model,
+			context,
+			additionalSystemPrompt,
+			reasoningInContent === "true",
+		),
 		max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
 		function_call:
 			options.toolChoice ??

@@ -23,6 +23,7 @@ export function convertMessages(
 	model: Model<Api>,
 	context: Context,
 	additionalSystemPrompt?: string,
+	reasoningInContent = false,
 ): GigaChatMessage[] {
 	const messages: GigaChatMessage[] = [];
 	const transformedMessages = transformMessages(context.messages, model);
@@ -65,15 +66,21 @@ export function convertMessages(
 				(item): item is ThinkingContent =>
 					item.type === "thinking" && !item.redacted,
 			);
-			const reasoning = thinking.length
-				? {
-						reasoning_content: thinking.map((item) => item.thinking).join(""),
-					}
-				: {};
+			const reasoningText = thinking.map((item) => item.thinking).join("");
+			const reasoning =
+				thinking.length && !reasoningInContent
+					? { reasoning_content: reasoningText }
+					: {};
 			const text = message.content
 				.filter((item) => item.type === "text")
 				.map((item) => sanitizeSurrogates(item.text))
 				.join("");
+			// Only change the outgoing representation; keep Pi's stored thinking
+			// separate so toggling this option never duplicates or loses history.
+			const content =
+				reasoningInContent && reasoningText
+					? `<previous_reasoning>\n${sanitizeSurrogates(reasoningText)}\n</previous_reasoning>${text ? `\n\n${text}` : ""}`
+					: text;
 			const toolCalls = message.content.filter(
 				(item) => item.type === "toolCall",
 			) as ToolCall[];
@@ -89,7 +96,7 @@ export function convertMessages(
 				for (const [callIndex, call] of toolCalls.entries()) {
 					messages.push({
 						role: "assistant",
-						content: callIndex === 0 ? text : "",
+						content: callIndex === 0 ? content : "",
 						...(callIndex === 0 ? reasoning : {}),
 						function_call: { name: call.name, arguments: call.arguments },
 						functions_state_id: readStateSignature(call.thoughtSignature),
@@ -115,7 +122,7 @@ export function convertMessages(
 				);
 				messages.push({
 					role: "assistant",
-					content: text,
+					content,
 					...reasoning,
 					functions_state_id:
 						signature?.type === "text"
