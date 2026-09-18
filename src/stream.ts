@@ -23,6 +23,20 @@ import {
 	STATE_SIGNATURE_PREFIX,
 } from "./messages.js";
 
+const DEFAULT_SYSTEM_PROMPT =
+	"Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.";
+
+function emptyUsage(): AssistantMessage["usage"] {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
 export type GigaChatStreamOptions = SimpleStreamOptions & {
 	stream?: boolean;
 	extraBody?: Record<string, unknown>;
@@ -48,6 +62,8 @@ function payload(
 	const mode = env.GIGACHAT_STREAM ?? "false";
 	if (mode !== "true" && mode !== "false")
 		throw new Error("GIGACHAT_STREAM must be true or false");
+	const additionalSystemPrompt =
+		env.GIGACHAT_SYSTEM_PROMPT ?? DEFAULT_SYSTEM_PROMPT;
 	let extra: unknown;
 	try {
 		extra = JSON.parse(env.GIGACHAT_EXTRA_BODY || "{}");
@@ -61,7 +77,7 @@ function payload(
 		throw new Error("GigaChat maxTokens must be positive");
 	return {
 		model: model.id,
-		messages: convertMessages(model, context, env.GIGACHAT_SYSTEM_PROMPT),
+		messages: convertMessages(model, context, additionalSystemPrompt),
 		max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
 		function_call:
 			options.toolChoice ??
@@ -102,14 +118,7 @@ export function streamSimpleGigaChat(
 		model: model.id,
 		stopReason: "pending",
 		timestamp: Date.now(),
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
+		usage: emptyUsage(),
 	};
 	const signal = options.signal ?? new AbortController().signal;
 	(async () => {
@@ -148,8 +157,12 @@ export function streamSimpleGigaChat(
 							options.headers,
 						),
 					},
-					options,
+					{ ...options, canRetry: () => output.content.length === 0 },
 					async (response) => {
+						// A failed attempt may have emitted only metadata, not content.
+						output.stopReason = "pending";
+						delete output.rawStopReason;
+						output.usage = emptyUsage();
 						const consume = completionConsumer(output, stream, model);
 						if (streaming)
 							await readSSE(response, (chunk) => consume.add(chunk, true));

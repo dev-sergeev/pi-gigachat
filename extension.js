@@ -82,23 +82,86 @@ function serial(signal, work) {
   return raceWithAbortSignal(pending, signal);
 }
 var GigaChatHttpError = class extends Error {
-  constructor(status, body) {
+  constructor(status, body, headers2) {
     super(
       `GigaChat HTTP ${status}${status === 413 ? " context_length_exceeded" : ""}: ${body}`
     );
     this.status = status;
+    this.headers = headers2;
   }
   status;
+  headers;
 };
+var MAX_RETRY_DELAY_MS = 6e5;
+var NETWORK_CODES = /* @__PURE__ */ new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EAI_AGAIN",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET"
+]);
+function transient(error) {
+  if (!(error instanceof Error)) return false;
+  if (error instanceof GigaChatHttpError) {
+    if (/insufficient_quota|quota (?:exceeded|exhausted)|billing/i.test(
+      error.message
+    ))
+      return false;
+    return error.status === 408 || error.status === 429 || error.status >= 500 && error.status < 600;
+  }
+  if (error.name === "TimeoutError") return true;
+  if ("code" in error && NETWORK_CODES.has(String(error.code))) return true;
+  if (error.cause !== void 0) return transient(error.cause);
+  return error instanceof TypeError && error.message === "fetch failed";
+}
+function retryFailure(error, reason) {
+  return new Error(
+    `GigaChat out of budget for automatic retries: ${reason}. Last error: ${error instanceof Error ? error.message : String(error)}`,
+    { cause: error }
+  );
+}
+function serverDelay(error) {
+  if (!(error instanceof GigaChatHttpError)) return 0;
+  const milliseconds = error.headers?.get("retry-after-ms");
+  const value = error.headers?.get("retry-after");
+  const delay = milliseconds ? Number(milliseconds) : value ? /^\d+(?:\.\d+)?$/.test(value.trim()) ? Number(value) * 1e3 : Date.parse(value) - Date.now() : 0;
+  return Number.isFinite(delay) ? Math.max(0, delay) : 0;
+}
+function wait(ms, signal) {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
 async function request(url, init, options, consume, observe) {
   const env = environment(options);
   const timeout = options.timeoutMs ?? Number(env.GIGACHAT_TIMEOUT ?? 300) * 1e3;
   if (!Number.isFinite(timeout) || timeout <= 0)
     throw new Error("GigaChat timeout must be positive");
-  const signal = AbortSignal.any([
-    ...options.signal ? [options.signal] : [],
-    AbortSignal.timeout(Math.ceil(timeout))
-  ]);
+  const maxRetries = options.maxRetries ?? Number(env.GIGACHAT_MAX_RETRIES ?? 10);
+  const baseDelay = Number(env.GIGACHAT_RETRY_BASE_DELAY_MS ?? 1e3);
+  if (!Number.isSafeInteger(maxRetries) || maxRetries < 0)
+    throw new Error("GigaChat maxRetries must be a non-negative safe integer");
+  if (!Number.isSafeInteger(baseDelay) || baseDelay < 0 || baseDelay > MAX_RETRY_DELAY_MS)
+    throw new Error(
+      "GIGACHAT_RETRY_BASE_DELAY_MS must be an integer from 0 to 600000"
+    );
+  const signal = options.signal ?? new AbortController().signal;
   signal.throwIfAborted();
   const proxy = (name) => options.env?.[name.toLowerCase()] ?? options.env?.[name] ?? env[name.toLowerCase()] ?? env[name] ?? "";
   const dispatcher = new EnvHttpProxyAgent({
@@ -106,25 +169,63 @@ async function request(url, init, options, consume, observe) {
     httpsProxy: proxy("HTTPS_PROXY"),
     noProxy: proxy("NO_PROXY")
   });
-  let response;
   try {
     const send = options.fetch ?? fetch;
-    response = await send(url, { ...init, signal, dispatcher });
-    await observe?.(response);
-    if (!response.ok)
-      throw new GigaChatHttpError(response.status, await response.text());
-    return await consume(response);
-  } catch (error) {
-    if (signal.aborted) throw signal.reason;
-    if (error instanceof Error && error.message === "fetch failed" && error.cause instanceof Error)
-      throw new Error(`GigaChat connection failed: ${error.cause.message}`, {
-        cause: error
-      });
-    throw error;
+    for (let retries = 0; ; retries++) {
+      signal.throwIfAborted();
+      const attemptSignal = AbortSignal.any([
+        signal,
+        AbortSignal.timeout(Math.ceil(timeout))
+      ]);
+      let response;
+      let observing = false;
+      let delay = 0;
+      try {
+        response = await send(url, {
+          ...init,
+          signal: attemptSignal,
+          dispatcher
+        });
+        observing = true;
+        await observe?.(response);
+        observing = false;
+        if (!response.ok)
+          throw new GigaChatHttpError(
+            response.status,
+            await response.text(),
+            response.headers
+          );
+        return await consume(response);
+      } catch (caught) {
+        if (signal.aborted) throw signal.reason;
+        const error = attemptSignal.aborted ? attemptSignal.reason : caught;
+        if (maxRetries === 0 || observing || options.canRetry?.() === false || !transient(error)) {
+          if (error instanceof Error && error.message === "fetch failed" && error.cause instanceof Error)
+            throw new Error(
+              `GigaChat connection failed: ${error.cause.message}`,
+              { cause: error }
+            );
+          throw error;
+        }
+        if (retries >= maxRetries)
+          throw retryFailure(error, `${retries} retries exhausted`);
+        delay = Math.max(
+          Math.min(baseDelay * 2 ** Math.min(retries, 30), MAX_RETRY_DELAY_MS),
+          serverDelay(error)
+        );
+        if (delay > MAX_RETRY_DELAY_MS)
+          throw retryFailure(
+            error,
+            "server requested a wait longer than 600 seconds"
+          );
+      } finally {
+        if (response?.body && !response.body.locked)
+          await response.body.cancel().catch(() => {
+          });
+      }
+      await wait(delay, signal);
+    }
   } finally {
-    if (response?.body && !response.body.locked)
-      await response.body.cancel().catch(() => {
-      });
     await dispatcher.close();
   }
 }
@@ -133,11 +234,17 @@ async function request(url, init, options, consume, observe) {
 var GIGACHAT_API = "gigachat-extension-api";
 var GIGACHAT_DEFAULT_BASE_URL = "https://api.giga.chat/v1";
 var GIGACHAT_MODELS = [
-  ["GigaChat-2", "GigaChat 2 Lite"],
-  ["GigaChat-2-Pro", "GigaChat 2 Pro"],
-  ["GigaChat-2-Max", "GigaChat 2 Max"],
-  ["GigaChat-3-Ultra", "GigaChat 3 Ultra"]
-].map(([id, name]) => ({
+  { id: "GigaChat-2", name: "GigaChat 2 Lite" },
+  { id: "GigaChat-2-Pro", name: "GigaChat 2 Pro" },
+  { id: "GigaChat-2-Max", name: "GigaChat 2 Max" },
+  { id: "GigaChat-3-Ultra", name: "GigaChat 3 Ultra" },
+  {
+    id: "glm-5.2",
+    name: "GLM 5.2",
+    contextWindow: 2e5,
+    maxTokens: 64e3
+  }
+].map(({ id, name, contextWindow = 128e3, maxTokens = 8192 }) => ({
   id,
   name,
   api: GIGACHAT_API,
@@ -147,8 +254,8 @@ var GIGACHAT_MODELS = [
   input: ["text"],
   // Unknown USD prices; tariffs vary by account. Zero is not a free-tier claim.
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 128e3,
-  maxTokens: 8192
+  contextWindow,
+  maxTokens
 }));
 
 // src/auth.ts
@@ -211,6 +318,8 @@ async function configuration(ctx, credential) {
     "GIGACHAT_BASE_URL",
     "GIGACHAT_AUTH_URL",
     "GIGACHAT_TIMEOUT",
+    "GIGACHAT_MAX_RETRIES",
+    "GIGACHAT_RETRY_BASE_DELAY_MS",
     "GIGACHAT_STREAM",
     "GIGACHAT_EXTRA_BODY",
     "GIGACHAT_SYSTEM_PROMPT",
@@ -624,11 +733,23 @@ function sanitizeSurrogates(text) {
 }
 
 // src/stream.ts
+var DEFAULT_SYSTEM_PROMPT = "Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.";
+function emptyUsage() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+  };
+}
 function payload(model, context, options) {
   const env = environment(options);
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
     throw new Error("GIGACHAT_STREAM must be true or false");
+  const additionalSystemPrompt = env.GIGACHAT_SYSTEM_PROMPT ?? DEFAULT_SYSTEM_PROMPT;
   let extra;
   try {
     extra = JSON.parse(env.GIGACHAT_EXTRA_BODY || "{}");
@@ -642,7 +763,7 @@ function payload(model, context, options) {
     throw new Error("GigaChat maxTokens must be positive");
   return {
     model: model.id,
-    messages: convertMessages(model, context, env.GIGACHAT_SYSTEM_PROMPT),
+    messages: convertMessages(model, context, additionalSystemPrompt),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     function_call: options.toolChoice ?? options.functionCall ?? (context.tools?.length ? "auto" : "none"),
     ...context.tools?.length ? { functions: convertFunctions(context.tools) } : {},
@@ -672,14 +793,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
     model: model.id,
     stopReason: "pending",
     timestamp: Date.now(),
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-    }
+    usage: emptyUsage()
   };
   const signal = options.signal ?? new AbortController().signal;
   (async () => {
@@ -716,8 +830,11 @@ function streamSimpleGigaChat(model, context, options = {}) {
               options.headers
             )
           },
-          options,
+          { ...options, canRetry: () => output.content.length === 0 },
           async (response) => {
+            output.stopReason = "pending";
+            delete output.rawStopReason;
+            output.usage = emptyUsage();
             const consume = completionConsumer(output, stream, model);
             if (streaming)
               await readSSE(response, (chunk) => consume.add(chunk, true));

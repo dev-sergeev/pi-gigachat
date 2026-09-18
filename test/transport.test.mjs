@@ -8,7 +8,7 @@ for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) del
 test('onResponse observes HTTP errors before their bodies become diagnostics', async () => {
   await withServer(async ({ model }) => {
     let observed;
-    const result = await ask(model, undefined, { onResponse(response) { observed = response; } });
+    const result = await ask(model, undefined, { maxRetries: 0, onResponse(response) { observed = response; } });
     assert.equal(result.stopReason, 'error');
     assert.equal(observed.status, 429);
     assert.equal(observed.headers['retry-after'], '5');

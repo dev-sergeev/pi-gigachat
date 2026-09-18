@@ -96,6 +96,8 @@ async function configuration(ctx: AuthContext, credential?: ApiKeyCredential) {
 		"GIGACHAT_BASE_URL",
 		"GIGACHAT_AUTH_URL",
 		"GIGACHAT_TIMEOUT",
+		"GIGACHAT_MAX_RETRIES",
+		"GIGACHAT_RETRY_BASE_DELAY_MS",
 		"GIGACHAT_STREAM",
 		"GIGACHAT_EXTRA_BODY",
 		"GIGACHAT_SYSTEM_PROMPT",

@@ -7,6 +7,7 @@ import { ask, completion, reply, token, user, withServer } from './helpers.mjs';
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
 const extra = 'Правила провайдера 🙂:\nОтмечай предположения.\n\nБлок кода:\nСохраняй буквальное \\n.';
 const respond = (req, res) => reply(req, res, completion());
+const singleToolInstruction = 'Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.';
 
 for (const streaming of [false, true]) test(`provider instructions append to one system message without accumulating or mutating context (stream=${streaming})`, async () => {
   await withServer(async ({ model, requests }) => {
@@ -33,11 +34,11 @@ test('extra instructions create a system message when pi supplies none', async (
   });
 });
 
-test('unset, empty and whitespace-only settings leave the original message list unchanged', async () => {
+test('empty and whitespace-only settings disable the default block and leave pi messages unchanged', async () => {
   await withServer(async ({ model, requests }) => {
-    for (const value of [undefined, '', ' \n\t ']) {
+    for (const value of ['', ' \n\t ']) {
       for (const systemPrompt of [undefined, '  Original pi prompt.\n']) {
-        await ask(model, { systemPrompt, messages: [user('Hello')] }, { env: value === undefined ? {} : { GIGACHAT_SYSTEM_PROMPT: value } });
+        await ask(model, { systemPrompt, messages: [user('Hello')] }, { env: { GIGACHAT_SYSTEM_PROMPT: value } });
         assert.deepEqual(requests.at(-1).body.messages, [...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []), { role: 'user', content: 'Hello' }]);
       }
     }
@@ -65,5 +66,37 @@ test('native auth context forwards provider instructions to the adapter', async 
     const result = await models.completeSimple(model, { systemPrompt: 'Original pi prompt.', messages: [user('Hello')] });
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.equal(requests[0].body.messages[0].content, 'Original pi prompt.\n\n' + extra);
+  });
+});
+
+for (const streaming of [false, true]) test(`default single-tool instruction comes last once per request without changing context (stream=${streaming})`, async () => {
+  await withServer(async ({ model, requests }) => {
+    const context = Object.freeze({ systemPrompt: 'Original pi prompt.', messages: Object.freeze([Object.freeze(user('Hello'))]) });
+    const snapshot = structuredClone(context);
+    for (let i = 0; i < 2; i++) {
+      const result = await ask(model, context, { env: { GIGACHAT_STREAM: String(streaming) } });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+    }
+    for (const { body } of requests) {
+      assert.deepEqual(body.messages, [{ role: 'system', content: 'Original pi prompt.\n\n' + singleToolInstruction }, { role: 'user', content: 'Hello' }]);
+      assert.equal(body.stream, streaming);
+      assert.equal(body.parallel_tool_calls, undefined);
+    }
+    assert.deepEqual(context, snapshot);
+  }, respond);
+});
+
+test('unset instructions use the default; custom text replaces it and empty text disables it', async () => {
+  await withServer(async ({ model, requests }) => {
+    await ask(model);
+    await ask(model, undefined, { env: { GIGACHAT_SYSTEM_PROMPT: extra } });
+    await ask(model, undefined, { env: { GIGACHAT_SYSTEM_PROMPT: '' } });
+    await ask(model);
+    assert.deepEqual(requests.map(r => r.body.messages), [
+      [{ role: 'system', content: singleToolInstruction }, { role: 'user', content: 'Hi' }],
+      [{ role: 'system', content: extra }, { role: 'user', content: 'Hi' }],
+      [{ role: 'user', content: 'Hi' }],
+      [{ role: 'system', content: singleToolInstruction }, { role: 'user', content: 'Hi' }],
+    ]);
   });
 });

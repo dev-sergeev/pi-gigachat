@@ -35,7 +35,7 @@ export async function withServer(run, respond = (_request, res) => json(res, com
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
-  const model = { ...GIGACHAT_MODELS.at(-1), provider: 'gigachat', api: 'gigachat-extension-api', baseUrl };
+  const model = { ...GIGACHAT_MODELS.find(model => model.id === 'GigaChat-3-Ultra'), provider: 'gigachat', api: 'gigachat-extension-api', baseUrl };
   try { return await run({ model, requests, baseUrl }); }
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 }

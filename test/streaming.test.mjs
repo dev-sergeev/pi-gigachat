@@ -105,7 +105,8 @@ test('additional JSON parameters override defaults without replacing unrelated f
     for (const [key, value] of Object.entries(extra)) if (key !== 'stream') assert.deepEqual(body[key], value);
     assert.equal(body.stream, false);
     assert.equal(body.model, model.id);
-    assert.deepEqual(body.messages, [{ role: 'user', content: 'Hello' }]);
+    assert.equal(body.messages[0].role, 'system');
+    assert.deepEqual(body.messages.slice(1), [{ role: 'user', content: 'Hello' }]);
   });
 });
 

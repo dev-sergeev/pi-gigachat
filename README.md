@@ -5,8 +5,10 @@ Node.js **22.19 or later**. Uses `createProvider()` and
 `pi.registerProvider(provider)`, with pi's native authentication and session
 lifecycle. The legacy provider API and `@mariozechner/pi-*` packages are no longer used.
 
-Includes `GigaChat-2` (Lite), `GigaChat-2-Pro`, `GigaChat-2-Max`, and
-`GigaChat-3-Ultra`, text conversations, pi tools, and JSON or SSE responses.
+Includes `GigaChat-2` (Lite), `GigaChat-2-Pro`, `GigaChat-2-Max`,
+`GigaChat-3-Ultra`, and `glm-5.2`, text conversations, pi tools, and JSON or SSE responses.
+GLM 5.2 requires a GigaChat-compatible endpoint that exposes the `glm-5.2` model ID;
+registering it does not make it available on every GigaChat account or endpoint.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
@@ -82,8 +84,10 @@ process; `/reload` alone does not reread it.
 | `GIGACHAT_BASE_URL` | `https://api.giga.chat/v1` | API root, including `/v1` |
 | `GIGACHAT_STREAM` | `false` | Exactly `true` for SSE or `false` for a complete JSON response |
 | `GIGACHAT_EXTRA_BODY` | `{}` | JSON object shallow-merged into every chat request |
-| `GIGACHAT_SYSTEM_PROMPT` | Empty | Provider instructions appended to pi's system prompt |
-| `GIGACHAT_TIMEOUT` | `300` | HTTP timeout in seconds |
+| `GIGACHAT_SYSTEM_PROMPT` | Built-in single-tool instruction | Replaces the default provider block; an empty value disables the block |
+| `GIGACHAT_TIMEOUT` | `300` | HTTP timeout in seconds per attempt, excluding retry waits |
+| `GIGACHAT_MAX_RETRIES` | `10` | Retries after the initial HTTP attempt; `0` disables provider retries |
+| `GIGACHAT_RETRY_BASE_DELAY_MS` | `1000` | Initial retry wait in milliseconds; doubles up to 600,000 ms |
 | `GIGACHAT_CREDENTIALS` | Unset | Authorization key for automatic token exchange |
 | `GIGACHAT_SCOPE` | `GIGACHAT_API_PERS` | `GIGACHAT_API_PERS`, `GIGACHAT_API_B2B`, or `GIGACHAT_API_CORP` |
 | `GIGACHAT_AUTH_URL` | `https://ngw.devices.sberbank.ru:9443/api/v2/oauth` | Token exchange endpoint |
@@ -105,9 +109,56 @@ Malformed JSON or a non-object value fails before a chat request is sent.
 JSON or payload hooks, so the request format always matches its response parser.
 Sampling settings are otherwise left to the model unless explicitly supplied.
 
+### Retries
+
+The provider retries transient HTTP 408/429/5xx responses, per-attempt timeouts
+and temporary connection failures. By default, it makes **up to 10 retries after
+the first attempt**: at most 11 HTTP attempts for one request. This also applies
+to token exchange and refresh. Authentication/parameter errors, HTTP 413 context
+overflow, known quota exhaustion, certificate errors and malformed responses
+are returned immediately for the caller to handle.
+
+Retry waits use `min(baseDelayMs * 2^retryIndex, 600000)`, with a zero-based retry
+index. The default waits are **1, 2, 4, 8, 16, 32, 64, 128, 256, 512 seconds**.
+If more retries are configured, subsequent waits remain at most **10 minutes**.
+The ten default waits total 17 minutes 3 seconds, excluding request time.
+`GIGACHAT_TIMEOUT` starts afresh for each HTTP attempt; it does not expire during
+backoff. Cancellation interrupts both the active request and its retry wait.
+
+`Retry-After` (seconds or HTTP date) and `retry-after-ms` may extend a wait up to
+the same ten-minute ceiling. A longer server-requested wait fails immediately
+instead of retrying earlier than the server allows. Responses are released
+before waiting, and `onResponse` observes every HTTP attempt.
+
+After any text or tool output has been emitted, the provider does not replay the
+response; Pi can still apply its normal turn-level recovery. Retry exhaustion
+is marked as a terminal retry-budget error, preserving the last failure. This
+prevents Pi 0.85's outer retry loop from starting another full provider budget.
+The extension does not change Pi's global retry settings or other providers.
+
+Set `GIGACHAT_MAX_RETRIES=0` to disable provider retries. In programmatic use,
+`options.maxRetries` overrides that environment setting for chat; OAuth uses the
+environment settings. Pi can pass the chat override through
+`retry.provider.maxRetries` in its settings. Provider-scoped environment values
+override process variables. Retry counts must be non-negative safe integers;
+the base delay must be an integer from 0 to 600000 ms (0 permits immediate retries).
+
 ### Provider-specific system instructions
 
-Use `GIGACHAT_SYSTEM_PROMPT` to add instruction blocks for this provider:
+By default, the adapter appends this English instruction after pi's original
+system prompt, separated by a blank line, within the same first `system` message:
+
+> Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.
+
+`GIGACHAT_SYSTEM_PROMPT` controls this entire provider block:
+
+| Value | Behavior |
+| --- | --- |
+| Unset | Append the built-in single-tool instruction |
+| Custom text | Append that text instead of the built-in instruction |
+| Empty or whitespace-only | Append nothing |
+
+For example, this **replaces** the default single-tool instruction:
 
 ```dotenv
 GIGACHAT_SYSTEM_PROMPT='Правила для ответов:
@@ -118,12 +169,14 @@ GIGACHAT_SYSTEM_PROMPT='Правила для ответов:
 - Сохраняй стиль существующего проекта.'
 ```
 
-The adapter appends this text after pi's original system prompt, separated by a
-blank line, within the same first `system` message. It applies to all GigaChat
-requests, including tool follow-ups and compaction; other providers are unaffected.
+Pi's original system prompt is preserved. The selected provider block applies to
+all requests through this provider, including tool follow-ups and compaction;
+other providers are unaffected.
 The original context is not mutated, so the block is added once per request.
-If there is no original system prompt, the extra text becomes the system message.
-An unset, empty or whitespace-only value adds nothing. Outer whitespace is trimmed;
+If there is no original system prompt, the block becomes the system message.
+To retain the single-tool instruction with custom rules, include it in the custom
+value explicitly. `.env.example` contains the complete default text.
+Outer whitespace is trimmed;
 internal line breaks are preserved. Use actual line breaks inside the quotes,
 as above; literal `\n` sequences are not decoded.
 
@@ -131,6 +184,15 @@ Provider-scoped `env.GIGACHAT_SYSTEM_PROMPT` overrides the process environment;
 an explicit empty string disables the extra prompt for that request. As with pi's
 original messages, a `messages` override in `GIGACHAT_EXTRA_BODY` or a payload hook
 can replace the generated message list. Reload `.env` and restart pi after changes.
+
+The default block is a model instruction; it does not add an API parameter or a
+runtime guarantee of model compliance.
+
+For GLM 5.2 on a compatible endpoint:
+
+```bash
+pi --provider gigachat --model glm-5.2
+```
 
 ## Authentication and renewal
 
@@ -191,9 +253,15 @@ HTTP 413 is marked as context overflow so pi can compact and retry. Requests in
 one adapter instance are serialized for the personal account concurrency limit;
 separate processes still share the account's limits.
 
-All registered models advertise text input and a 128,000-token context. The
-configured output budget is 8,192 tokens; pi's `maxTokens` is capped at that
-value. An explicit `max_tokens` in the extra JSON overrides that cap, subject to
+All registered models advertise text input. Configured token budgets are:
+
+| Models | Context window | Maximum generated tokens |
+| --- | --- | --- |
+| GigaChat 2 Lite / Pro / Max, GigaChat 3 Ultra | 128,000 | 8,192 |
+| GLM 5.2 | 200,000 | 64,000 |
+
+Pi's `maxTokens` is capped at the selected model's configured output budget.
+An explicit `max_tokens` in the extra JSON overrides that cap, subject to
 the API's limits. pi rejects truncated summaries, but model-generated summaries
 can still omit details. Images in history become omission markers; media upload,
 API v2, embeddings and batch processing are not implemented. Cost metadata is
@@ -229,7 +297,8 @@ low-level export. Its `GigaChatStreamOptions` also supports `stream`, `extraBody
 Body precedence is generated fields → model/request `samplingParams` → environment
 JSON → `extraBody` → `onPayload`. `options.stream` overrides `GIGACHAT_STREAM`.
 Custom `fetch`, headers (including null removals), `onResponse`, `timeoutMs`, and
-provider-scoped `env` are supported. Retry policy belongs to pi.
+provider-scoped `env` are supported. `maxRetries` overrides the provider's HTTP
+retry count; Pi retains its separate turn-level recovery policy as described above.
 
 ## Development
 

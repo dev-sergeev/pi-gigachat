@@ -19,7 +19,7 @@ test('documented GigaChat 413 is recognized by pi as context overflow', async ()
 for (const [status, message] of [[422, 'Invalid params: system message must be the first message'], [429, 'Too many requests']]) {
   test(`HTTP ${status} preserves diagnostics and does not trigger compaction`, async () => {
     await withServer(async ({ model }) => {
-      const result = await ask(model);
+      const result = await ask(model, undefined, { maxRetries: 0 });
       assert.equal(result.stopReason, 'error');
       assert(result.errorMessage.includes(message), result.errorMessage);
       assert.equal(isContextOverflow(result, model.contextWindow), false);
@@ -33,7 +33,7 @@ test('Unicode survives system prompt, history, tool arguments and tool results',
     const call = first.content.find(b => b.type === 'toolCall');
     await ask(model, { systemPrompt: '🙂𐐀', messages: [user('👋'), first, toolResult(call, '🚀'), user('𐐀')] });
     const messages = requests.at(-1).body.messages;
-    assert.equal(messages[0].content, '🙂𐐀');
+    assert(messages[0].content.startsWith('🙂𐐀\n\n'));
     assert.equal(messages[1].content, '👋');
     assert.equal(messages[2].content, '🙂');
     assert.equal(messages[2].function_call.arguments.path, '🚀');
@@ -48,7 +48,7 @@ test('function state survives session serialization and tool call ids are unique
     const restored = JSON.parse(JSON.stringify(first));
     const call = restored.content.find(b => b.type === 'toolCall');
     const second = await ask(model, { messages: [user('read'), restored, toolResult(call, 'contents')] });
-    assert.equal(requests[1].body.messages[1].functions_state_id, 'state-fixture');
+    assert.equal(requests[1].body.messages.find(m => m.role === 'assistant').functions_state_id, 'state-fixture');
     assert.notEqual(second.content.find(b => b.type === 'toolCall').id, call.id);
   }, (_req, res) => json(res, completion({ role: 'assistant', content: '', functions_state_id: 'state-fixture', function_call: { name: 'read', arguments: { path: 'a' } } }, 'function_call')));
 });
@@ -57,7 +57,7 @@ test('text-only replies also preserve function state for subsequent turns', asyn
   await withServer(async ({ model, requests }) => {
     const first = await ask(model);
     await ask(model, { messages: [user('hello'), JSON.parse(JSON.stringify(first)), user('next')] });
-    assert.equal(requests[1].body.messages[1].functions_state_id, 'text-state');
+    assert.equal(requests[1].body.messages.find(m => m.role === 'assistant').functions_state_id, 'text-state');
   }, (_req, res) => json(res, completion({ role: 'assistant', content: 'OK', functions_state_id: 'text-state' })));
 });
 
@@ -68,7 +68,7 @@ test('parallel tool history from another provider is replayed as complete sequen
     Object.assign(previous, { provider: 'foreign', model: 'other', content: calls, stopReason: 'toolUse' });
     await ask(model, { messages: [user('go'), previous, toolResult(calls[1], 'second'), toolResult(calls[0], 'first'), user('continue')] });
     const messages = requests.at(-1).body.messages;
-    assert.deepEqual(messages.map(m => m.role), ['user', 'assistant', 'function', 'assistant', 'function', 'user']);
+    assert.deepEqual(messages.map(m => m.role), ['system', 'user', 'assistant', 'function', 'assistant', 'function', 'user']);
     assert.deepEqual(messages.filter(m => m.function_call).map(m => m.function_call.name), ['read', 'bash']);
     assert.deepEqual(messages.filter(m => m.role === 'function').map(m => JSON.parse(m.content).result), ['first', 'second']);
   });
@@ -121,6 +121,24 @@ test('default output budget follows the model; explicit budgets are bounded by i
   });
 });
 
+test('GLM 5.2 uses a 64,000-token output budget while GigaChat budgets are unchanged', async () => {
+  const glm = GIGACHAT_MODELS.find(model => model.id === 'glm-5.2');
+  assert(glm);
+  assert.equal(glm.contextWindow, 200000);
+  for (const model of GIGACHAT_MODELS.filter(model => model.id.startsWith('GigaChat-'))) {
+    assert.equal(model.contextWindow, 128000);
+    assert.equal(model.maxTokens, 8192);
+  }
+  await withServer(async ({ baseUrl, requests }) => {
+    const model = { ...glm, baseUrl };
+    await ask(model);
+    await ask(model, undefined, { maxTokens: 32000 });
+    await ask(model, undefined, { maxTokens: 100000 });
+    assert(requests.every(r => r.body.model === 'glm-5.2'));
+    assert.deepEqual(requests.map(r => r.body.max_tokens), [64000, 32000, 64000]);
+  });
+});
+
 test('all advertised models reflect the implemented text-only transport', () => {
   assert(GIGACHAT_MODELS.every(model => !model.input.includes('image')));
 });
@@ -128,8 +146,9 @@ test('all advertised models reflect the implemented text-only transport', () => 
 test('unsupported images in history become visible placeholders rather than disappearing', async () => {
   await withServer(async ({ model, requests }) => {
     await ask(model, { messages: [user([{ type: 'image', data: 'AA==', mimeType: 'image/png' }])] });
-    assert.equal(requests[0].body.messages.length, 1);
-    assert.match(requests[0].body.messages[0].content, /image omitted/i);
+    const userMessages = requests[0].body.messages.filter(m => m.role === 'user');
+    assert.equal(userMessages.length, 1);
+    assert.match(userMessages[0].content, /image omitted/i);
   });
 });
 
@@ -152,7 +171,7 @@ test('provider env overrides, custom headers and response hook reach the HTTP bo
 
 test('explicit request timeout is honored while waiting for a non-streaming completion', async () => {
   await withServer(async ({ model }) => {
-    const result = await ask(model, undefined, { timeoutMs: 25 });
+    const result = await ask(model, undefined, { timeoutMs: 25, maxRetries: 0 });
     assert.equal(result.stopReason, 'error');
     assert.match(result.errorMessage, /timeout/i);
   }, async (_req, res) => { await new Promise(resolve => setTimeout(resolve, 150)); json(res, completion()); });
