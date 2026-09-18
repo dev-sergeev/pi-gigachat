@@ -145,8 +145,8 @@ test('server waits above ten minutes fail without retrying early', async () => {
   assert.equal(calls, 1);
 });
 
-for (const partial of [{ content: 'partial answer' }, { function_call: { name: 'read', arguments: '{' } }]) {
-  test(`broken SSE never replays emitted ${partial.content ? 'text' : 'tool'} output`, async () => {
+for (const partial of [{ content: 'partial answer' }, { reasoning_content: 'partial thought' }, { function_call: { name: 'read', arguments: '{' } }]) {
+  test(`broken SSE never replays emitted ${partial.content ? 'text' : partial.reasoning_content ? 'thinking' : 'tool'} output`, async () => {
     await withServer(async ({ model }) => {
       let calls = 0;
       const result = await ask(model, undefined, { env: { ...fast, GIGACHAT_STREAM: 'true' }, fetch: async () => {

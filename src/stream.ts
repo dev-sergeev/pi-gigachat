@@ -7,6 +7,7 @@ import type {
 	Model,
 	SimpleStreamOptions,
 	TextContent,
+	ThinkingContent,
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import {
@@ -215,10 +216,23 @@ function completionConsumer(
 	model: Model<Api>,
 ) {
 	let text: TextContent | undefined;
+	let thinking: ThinkingContent | undefined;
 	let tool: ToolCall | undefined;
 	let argumentsJson = "";
 	let signature: string | undefined;
 	let textClosed = false;
+	let thinkingClosed = false;
+	const closeThinking = () => {
+		if (thinking && !thinkingClosed) {
+			stream.push({
+				type: "thinking_end",
+				contentIndex: output.content.indexOf(thinking),
+				content: thinking.thinking,
+				partial: output,
+			});
+			thinkingClosed = true;
+		}
+	};
 	const closeText = () => {
 		if (text && !textClosed) {
 			stream.push({
@@ -230,10 +244,37 @@ function completionConsumer(
 			textClosed = true;
 		}
 	};
+	const addThinking = (delta: string) => {
+		closeText();
+		if (!thinking || thinkingClosed) {
+			thinking = {
+				type: "thinking",
+				thinking: "",
+				// Pi preserves signed blocks even when they contain only whitespace.
+				thinkingSignature: "reasoning_content",
+			};
+			thinkingClosed = false;
+			output.content.push(thinking);
+			stream.push({
+				type: "thinking_start",
+				contentIndex: output.content.indexOf(thinking),
+				partial: output,
+			});
+		}
+		thinking.thinking += delta;
+		stream.push({
+			type: "thinking_delta",
+			contentIndex: output.content.indexOf(thinking),
+			delta,
+			partial: output,
+		});
+	};
 	const addText = (delta: string) => {
-		if (textClosed) throw new Error("GigaChat sent text after a function call");
-		if (!text) {
+		if (tool) throw new Error("GigaChat sent text after a function call");
+		closeThinking();
+		if (!text || textClosed) {
 			text = { type: "text", text: "" };
+			textClosed = false;
 			output.content.push(text);
 			stream.push({
 				type: "text_start",
@@ -275,13 +316,21 @@ function completionConsumer(
 			if (message.role === "function_in_progress") return;
 			if (message.content != null && typeof message.content !== "string")
 				throw new Error("Invalid GigaChat content");
+			if (
+				message.reasoning_content != null &&
+				typeof message.reasoning_content !== "string"
+			)
+				throw new Error("Invalid GigaChat reasoning_content");
 			if (typeof message.functions_state_id === "string")
 				signature = STATE_SIGNATURE_PREFIX + message.functions_state_id;
+			if (message.reasoning_content)
+				addThinking(message.reasoning_content as string);
 			if (message.content) addText(message.content as string);
 			if (message.function_call != null) {
 				const call = message.function_call;
 				if (!object(call)) throw new Error("Invalid GigaChat function_call");
 				if (!tool) {
+					closeThinking();
 					closeText();
 					tool = {
 						type: "toolCall",
@@ -341,6 +390,7 @@ function completionConsumer(
 				throw new Error("Invalid GigaChat completion: missing function_call");
 			if (signature && !tool && !text) addText("");
 			if (text && signature) text.textSignature = signature;
+			closeThinking();
 			closeText();
 			if (tool) {
 				const args: unknown = JSON.parse(argumentsJson || "{}");

@@ -92,9 +92,9 @@ process; `/reload` alone does not reread it.
 | `GIGACHAT_SCOPE` | `GIGACHAT_API_PERS` | `GIGACHAT_API_PERS`, `GIGACHAT_API_B2B`, or `GIGACHAT_API_CORP` |
 | `GIGACHAT_AUTH_URL` | `https://ngw.devices.sberbank.ru:9443/api/v2/oauth` | Token exchange endpoint |
 
-With `stream=false`, pi receives its text/tool events when the complete JSON
-response arrives. With `stream=true`, text appears incrementally. Both modes
-support tools, usage accounting, cancellation, and compaction.
+With `stream=false`, pi receives its text, thinking and tool events when the complete
+JSON response arrives. With `stream=true`, text and thinking appear incrementally.
+Both modes support tools, usage accounting, cancellation, and compaction.
 
 `GIGACHAT_EXTRA_BODY` overrides corresponding fields in the generated request.
 For example, `{"max_tokens":4096,"temperature":0.2,"top_p":0.8}` changes those
@@ -130,7 +130,7 @@ the same ten-minute ceiling. A longer server-requested wait fails immediately
 instead of retrying earlier than the server allows. Responses are released
 before waiting, and `onResponse` observes every HTTP attempt.
 
-After any text or tool output has been emitted, the provider does not replay the
+After any text, thinking or tool output has been emitted, the provider does not replay the
 response; Pi can still apply its normal turn-level recovery. Retry exhaustion
 is marked as a terminal retry-budget error, preserving the last failure. This
 prevents Pi 0.85's outer retry loop from starting another full provider budget.
@@ -237,6 +237,38 @@ enabled. Optional `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables route bo
 OAuth and chat traffic, including SSE. Include the proxy CA in the trusted bundle if it intercepts TLS.
 
 ## Context and tools
+
+### Reasoning history
+
+When an endpoint returns `message.reasoning_content` (JSON) or
+`delta.reasoning_content` (SSE), the adapter stores it in native Pi `thinking`
+blocks. This works for GLM 5.2 and other models using this response format,
+including replies with empty `content` and a `function_call`. No setting is needed
+to preserve reasoning that the endpoint already returns.
+
+Pi displays these blocks and saves them in its session history. `Ctrl+T` toggles
+their visibility without removing them from history. On subsequent requests to
+the same provider/API/model, the adapter restores the complete reasoning text in
+the assistant message's `reasoning_content` field, alongside `content`,
+`function_call` and `functions_state_id`. Whitespace and streamed fragments are
+preserved without adding separators. Tool follow-ups and resumed sessions use
+the same path. Responses labeled `glm-5.2:latest` keep the selected `glm-5.2`
+session identity, so that alias does not interrupt replay.
+
+History follows Pi's normal rules: aborted/failed assistant turns are excluded
+from requests, while model switches convert non-redacted thinking into ordinary
+assistant text and strip model-specific state. Redacted blocks are not sent as
+plaintext reasoning. Compaction can include thinking in its summary input and
+replace older active context with a summary; the original session entries remain
+on disk. Older reasoning discarded by earlier adapter versions cannot be recovered.
+
+This feature preserves returned reasoning; it does not configure how much the
+server generates or map Pi's thinking-level selector to API options. Use
+`GIGACHAT_EXTRA_BODY` for reasoning parameters supported by your endpoint.
+Whether the server uses replayed `reasoning_content` depends on that endpoint's
+input contract; returning the field alone does not establish that support.
+
+### Context management
 
 Compaction uses pi's original implementation: `/compact`, automatic compaction,
 branch summaries, and resuming saved sessions all use this provider. Function

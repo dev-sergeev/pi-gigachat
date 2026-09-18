@@ -2,6 +2,7 @@ import type {
 	Api,
 	Context,
 	Model,
+	ThinkingContent,
 	Tool,
 	ToolCall,
 	ToolResultMessage,
@@ -12,6 +13,7 @@ export const STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
 interface GigaChatMessage {
 	role: "system" | "user" | "assistant" | "function";
 	content: string;
+	reasoning_content?: string;
 	name?: string;
 	functions_state_id?: string;
 	function_call?: { name: string; arguments: Record<string, unknown> };
@@ -57,6 +59,17 @@ export function convertMessages(
 		}
 
 		if (message.role === "assistant") {
+			// Pi retains thinking blocks for the same provider/API/model and
+			// normalizes foreign-model thinking into text before this point.
+			const thinking = message.content.filter(
+				(item): item is ThinkingContent =>
+					item.type === "thinking" && !item.redacted,
+			);
+			const reasoning = thinking.length
+				? {
+						reasoning_content: thinking.map((item) => item.thinking).join(""),
+					}
+				: {};
 			const text = message.content
 				.filter((item) => item.type === "text")
 				.map((item) => sanitizeSurrogates(item.text))
@@ -77,6 +90,7 @@ export function convertMessages(
 					messages.push({
 						role: "assistant",
 						content: callIndex === 0 ? text : "",
+						...(callIndex === 0 ? reasoning : {}),
 						function_call: { name: call.name, arguments: call.arguments },
 						functions_state_id: readStateSignature(call.thoughtSignature),
 					});
@@ -102,6 +116,7 @@ export function convertMessages(
 				messages.push({
 					role: "assistant",
 					content: text,
+					...reasoning,
 					functions_state_id:
 						signature?.type === "text"
 							? readStateSignature(signature.textSignature)

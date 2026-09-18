@@ -1,6 +1,6 @@
 {
 	"name": "@dev-sergeev/pi-gigachat",
-	"version": "0.3.1",
+	"version": "0.3.2",
 	"description": "GigaChat provider extension for pi-coding-agent",
 	"private": false,
 	"type": "module",
