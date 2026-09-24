@@ -5,6 +5,7 @@ import type {
 	AssistantMessageEventStream,
 	Context,
 	Model,
+	ModelThinkingLevel,
 	SimpleStreamOptions,
 	TextContent,
 	ThinkingContent,
@@ -12,6 +13,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import {
 	calculateCost,
+	clampThinkingLevel,
 	createAssistantMessageEventStream,
 	parseStreamingJson,
 } from "@earendil-works/pi-ai";
@@ -38,7 +40,8 @@ function emptyUsage(): AssistantMessage["usage"] {
 	};
 }
 
-export type GigaChatStreamOptions = SimpleStreamOptions & {
+export type GigaChatStreamOptions = Omit<SimpleStreamOptions, "reasoning"> & {
+	reasoning?: ModelThinkingLevel;
 	stream?: boolean;
 	extraBody?: Record<string, unknown>;
 	topP?: number;
@@ -79,6 +82,8 @@ function payload(
 	const maxTokens = options.maxTokens ?? model.maxTokens;
 	if (!Number.isFinite(maxTokens) || maxTokens < 1)
 		throw new Error("GigaChat maxTokens must be positive");
+	// Pi represents its off selection by omitting options.reasoning.
+	const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
 	return {
 		model: model.id,
 		messages: convertMessages(
@@ -100,6 +105,12 @@ function payload(
 		response_format: options.responseFormat,
 		profanity_check: options.profanityCheck,
 		repetition_penalty: options.repetitionPenalty,
+		...(model.reasoning
+			? {
+					reasoning_effort:
+						model.thinkingLevelMap?.[thinkingLevel] ?? thinkingLevel,
+				}
+			: {}),
 		...model.samplingParams,
 		...options.samplingParams,
 		...extra,

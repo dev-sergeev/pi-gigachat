@@ -233,6 +233,15 @@ async function request(url, init, options, consume, observe) {
 // src/models.ts
 var GIGACHAT_API = "gigachat-extension-api";
 var GIGACHAT_DEFAULT_BASE_URL = "https://api.giga.chat/v1";
+var thinkingLevelMap = {
+  off: "off",
+  minimal: null,
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: null,
+  max: null
+};
 var GIGACHAT_MODELS = [
   { id: "GigaChat-2", name: "GigaChat 2 Lite" },
   { id: "GigaChat-2-Pro", name: "GigaChat 2 Pro" },
@@ -241,22 +250,39 @@ var GIGACHAT_MODELS = [
   {
     id: "glm-5.2",
     name: "GLM 5.2",
+    reasoning: true,
     contextWindow: 2e5,
     maxTokens: 64e3
+  },
+  {
+    id: "Qwen3.5-397b",
+    name: "Qwen 3.5 397B",
+    reasoning: true,
+    contextWindow: 262144,
+    maxTokens: 32768
   }
-].map(({ id, name, contextWindow = 128e3, maxTokens = 8192 }) => ({
-  id,
-  name,
-  api: GIGACHAT_API,
-  provider: "gigachat",
-  baseUrl: GIGACHAT_DEFAULT_BASE_URL,
-  reasoning: false,
-  input: ["text"],
-  // Unknown USD prices; tariffs vary by account. Zero is not a free-tier claim.
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow,
-  maxTokens
-}));
+].map(
+  ({
+    id,
+    name,
+    reasoning = false,
+    contextWindow = 128e3,
+    maxTokens = 8192
+  }) => ({
+    id,
+    name,
+    api: GIGACHAT_API,
+    provider: "gigachat",
+    baseUrl: GIGACHAT_DEFAULT_BASE_URL,
+    reasoning,
+    ...reasoning ? { thinkingLevelMap: { ...thinkingLevelMap } } : {},
+    input: ["text"],
+    // Unknown USD prices; tariffs vary by account. Zero is not a free-tier claim.
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    maxTokens
+  })
+);
 
 // src/auth.ts
 var scopes = ["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"];
@@ -471,6 +497,7 @@ var gigachatAuth = {
 import { randomUUID as randomUUID2 } from "node:crypto";
 import {
   calculateCost,
+  clampThinkingLevel,
   createAssistantMessageEventStream,
   parseStreamingJson
 } from "@earendil-works/pi-ai";
@@ -777,6 +804,7 @@ function payload(model, context, options) {
   const maxTokens = options.maxTokens ?? model.maxTokens;
   if (!Number.isFinite(maxTokens) || maxTokens < 1)
     throw new Error("GigaChat maxTokens must be positive");
+  const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
   return {
     model: model.id,
     messages: convertMessages(
@@ -793,6 +821,9 @@ function payload(model, context, options) {
     response_format: options.responseFormat,
     profanity_check: options.profanityCheck,
     repetition_penalty: options.repetitionPenalty,
+    ...model.reasoning ? {
+      reasoning_effort: model.thinkingLevelMap?.[thinkingLevel] ?? thinkingLevel
+    } : {},
     ...model.samplingParams,
     ...options.samplingParams,
     ...extra,

@@ -6,9 +6,10 @@ Node.js **22.19 or later**. Uses `createProvider()` and
 lifecycle. The legacy provider API and `@mariozechner/pi-*` packages are no longer used.
 
 Includes `GigaChat-2` (Lite), `GigaChat-2-Pro`, `GigaChat-2-Max`,
-`GigaChat-3-Ultra`, and `glm-5.2`, text conversations, pi tools, and JSON or SSE responses.
-GLM 5.2 requires a GigaChat-compatible endpoint that exposes the `glm-5.2` model ID;
-registering it does not make it available on every GigaChat account or endpoint.
+`GigaChat-3-Ultra`, `glm-5.2`, and `Qwen3.5-397b`, text conversations, pi tools,
+and JSON or SSE responses. GLM and Qwen require a GigaChat-compatible endpoint
+that exposes these exact model IDs; registering them does not make them available
+on every GigaChat account or endpoint.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
@@ -239,6 +240,30 @@ OAuth and chat traffic, including SSE. Include the proxy CA in the trusted bundl
 
 ## Context and tools
 
+### Reasoning levels
+
+`glm-5.2` and `Qwen3.5-397b` support Pi's `off`, `low`, `medium`, and `high`
+thinking levels. Choose a level in Pi or set it when starting a session:
+
+```bash
+pi --provider gigachat --model glm-5.2 --thinking high
+pi --provider gigachat --model Qwen3.5-397b --thinking medium
+```
+
+The adapter sends the selected level unchanged in the top-level
+`reasoning_effort` field: `off`, `low`, `medium`, or `high`. This requires a gateway
+that implements this request field for these models; direct model APIs can use
+different controls. The GigaChat models do not receive this field automatically.
+
+In programmatic `completeSimple` calls, pass `reasoning: "low"`, `"medium"`, or
+`"high"`; omit it for `off`. The low-level `streamSimpleGigaChat` also accepts
+`reasoning: "off"`. Unsupported Pi levels are clamped: `minimal` becomes `low`,
+and `xhigh`/`max` become `high`. Explicit `samplingParams`, `GIGACHAT_EXTRA_BODY`,
+`extraBody`, or `onPayload` overrides take precedence over the generated field.
+
+The selected level controls new generation. Returned thinking still follows the
+history rules below, including when an endpoint returns it with thinking off.
+
 ### Reasoning history
 
 When an endpoint returns `message.reasoning_content` (JSON) or
@@ -263,9 +288,8 @@ plaintext reasoning. Compaction can include thinking in its summary input and
 replace older active context with a summary; the original session entries remain
 on disk. Older reasoning discarded by earlier adapter versions cannot be recovered.
 
-This feature preserves returned reasoning; it does not configure how much the
-server generates or map Pi's thinking-level selector to API options. Use
-`GIGACHAT_EXTRA_BODY` for reasoning parameters supported by your endpoint.
+Preserving reasoning history is independent of the generation level above. Use
+`GIGACHAT_EXTRA_BODY` for additional reasoning parameters supported by your endpoint.
 Whether the server uses replayed `reasoning_content` depends on that endpoint's
 input contract; returning the field alone does not establish that support.
 
@@ -335,6 +359,11 @@ All registered models advertise text input. Configured token budgets are:
 | --- | --- | --- |
 | GigaChat 2 Lite / Pro / Max, GigaChat 3 Ultra | 128,000 | 8,192 |
 | GLM 5.2 | 200,000 | 64,000 |
+| Qwen 3.5 397B | 262,144 | 32,768 |
+
+Qwen's configured context and default output budget follow its
+[model card](https://huggingface.co/Qwen/Qwen3.5-397B-A17B#best-practices);
+your gateway may impose lower limits.
 
 Pi's `maxTokens` is capped at the selected model's configured output budget.
 An explicit `max_tokens` in the extra JSON overrides that cap, subject to
