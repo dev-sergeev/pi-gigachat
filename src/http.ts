@@ -48,7 +48,7 @@ export function serial<T>(
 export class GigaChatHttpError extends Error {
 	constructor(
 		readonly status: number,
-		body: string,
+		readonly body: string,
 		readonly headers?: Headers,
 	) {
 		super(
@@ -81,6 +81,14 @@ function transient(error: unknown): boolean {
 			)
 		)
 			return false;
+		if (error.status === 422) {
+			try {
+				const body: unknown = JSON.parse(error.body);
+				return object(body) && body.error === "EventException";
+			} catch {
+				return false;
+			}
+		}
 		return (
 			error.status === 408 ||
 			error.status === 429 ||

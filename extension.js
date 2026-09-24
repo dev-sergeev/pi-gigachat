@@ -87,9 +87,11 @@ var GigaChatHttpError = class extends Error {
       `GigaChat HTTP ${status}${status === 413 ? " context_length_exceeded" : ""}: ${body}`
     );
     this.status = status;
+    this.body = body;
     this.headers = headers2;
   }
   status;
+  body;
   headers;
 };
 var MAX_RETRY_DELAY_MS = 6e5;
@@ -113,6 +115,14 @@ function transient(error) {
       error.message
     ))
       return false;
+    if (error.status === 422) {
+      try {
+        const body = JSON.parse(error.body);
+        return object(body) && body.error === "EventException";
+      } catch {
+        return false;
+      }
+    }
     return error.status === 408 || error.status === 429 || error.status >= 500 && error.status < 600;
   }
   if (error.name === "TimeoutError") return true;

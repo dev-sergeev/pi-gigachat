@@ -11,8 +11,10 @@ const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImm
 const fast = { GIGACHAT_RETRY_BASE_DELAY_MS: '0' };
 const consume = response => response.json();
 const networkError = () => new TypeError('fetch failed', { cause: Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }) });
+const eventException = { error: 'EventException', statusCode: 422, timestamp: '2026-09-22T07:43:33.084Z' };
 
-for (const extended of [false, true]) test(`exponential waits and bounded request count use virtual time (extended=${extended})`, async t => {
+for (const status of [503, 422])
+for (const extended of [false, true]) test(`exponential waits and bounded request count use virtual time (status=${status}, extended=${extended})`, async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let calls = 0;
   const pending = request('https://example.invalid', { method: 'POST', body: 'same request' }, {
@@ -20,7 +22,7 @@ for (const extended of [false, true]) test(`exponential waits and bounded reques
     fetch: async (_url, init) => {
       calls++;
       assert.equal(init.body, 'same request');
-      return Response.json({ message: 'temporary failure' }, { status: 503 });
+      return Response.json(status === 422 ? eventException : { message: 'temporary failure' }, { status });
     },
   }, consume).catch(error => error);
   await flush();
@@ -37,14 +39,14 @@ for (const extended of [false, true]) test(`exponential waits and bounded reques
   const error = await pending;
   assert(error instanceof Error);
   assert.match(error.message, new RegExp(`${delays.length} retries exhausted`));
-  assert.match(error.message, /503.*temporary failure/);
+  assert.match(error.message, status === 422 ? /422.*EventException/ : /503.*temporary failure/);
   assert.equal(isRetryableAssistantError({ stopReason: 'error', errorMessage: error.message }), false);
   t.mock.timers.tick(3600000);
   await flush();
   assert.equal(calls, delays.length + 1);
 });
 
-for (const streaming of [false, true]) for (const status of [408, 429, 500, 503]) {
+for (const streaming of [false, true]) for (const status of [408, 422, 429, 500, 503]) {
   test(`HTTP ${status} recovers before JSON/SSE tool output (stream=${streaming})`, async () => {
     await withServer(async ({ model, requests }) => {
       const observed = [];
@@ -54,7 +56,7 @@ for (const streaming of [false, true]) for (const status of [408, 429, 500, 503]
       assert.equal(result.content.filter(c => c.type === 'toolCall').length, 1);
       assert.deepEqual(requests.map(r => r.body), Array(3).fill(requests[0].body));
     }, (req, res, requests) => requests.length < 3
-      ? json(res, { message: 'temporary failure' }, status)
+      ? json(res, status === 422 ? eventException : { message: 'temporary failure' }, status)
       : reply(req, res, completion({ role: 'assistant', content: '', function_call: { name: 'read', arguments: { path: 'fixture.txt' } } }, 'function_call')));
   });
 }
@@ -67,10 +69,26 @@ test('permanent HTTP failures, quota exhaustion and disabled retries return afte
       assert.equal(requests.length, 1);
     }, (_req, res) => json(res, { message: status === 429 ? 'insufficient_quota' : 'invalid request' }, status));
   }
-  await withServer(async ({ model, requests }) => {
+  for (const status of [503, 422]) await withServer(async ({ model, requests }) => {
     await ask(model, undefined, { maxRetries: 0, env: { ...fast, GIGACHAT_MAX_RETRIES: '10' } });
     assert.equal(requests.length, 1, 'explicit maxRetries must win over env');
-  }, (_req, res) => json(res, { message: 'busy' }, 503));
+  }, (_req, res) => json(res, status === 422 ? eventException : { message: 'busy' }, status));
+});
+
+test('422 retries require an exact top-level EventException error and preserve other diagnostics', async () => {
+  for (const body of [
+    '{"error":"ValidationException","message":"Invalid params"}',
+    '{"message":"EventException"}', '{"error":"EventExceptionOther"}',
+    '{"error":{"type":"EventException"}}', '[{"error":"EventException"}]',
+    'null', '"EventException"', '{"error":"EventException"',
+    JSON.stringify({ ...eventException, message: 'insufficient_quota' }),
+  ]) {
+    let calls = 0;
+    await assert.rejects(request('https://example.invalid', {}, { maxRetries: 2, env: fast,
+      fetch: async () => { calls++; return new Response(body, { status: 422 }); },
+    }, consume), error => error.message === `GigaChat HTTP 422: ${body}`);
+    assert.equal(calls, 1, body);
+  }
 });
 
 test('network resets recover, but certificate errors and response-hook failures do not retry', async () => {
@@ -215,7 +233,8 @@ test('invalid retry settings fail before HTTP', async () => {
   });
 });
 
-for (const recover of [false, true]) test(`native Pi retries within the provider without multiplying its budget (recover=${recover})`, { timeout: 30000 }, async () => {
+for (const status of [503, 422])
+for (const recover of [false, true]) test(`native Pi retries within the provider without multiplying its budget (status=${status}, recover=${recover})`, { timeout: 30000 }, async () => {
   await withServer(async ({ baseUrl, requests }) => {
     await withPi(baseUrl, async pi => {
       await pi.prompt('Say OK.');
@@ -225,7 +244,7 @@ for (const recover of [false, true]) test(`native Pi retries within the provider
       assert.equal(requests.length, recover ? 3 : 11);
       assert(!pi.events.some(e => e.type === 'auto_retry_start'), 'Pi restarted an exhausted provider budget');
     }, { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } }, { env: fast });
-  }, (_req, res, requests) => recover && requests.length > 2 ? json(res, completion()) : json(res, { message: 'temporary service failure' }, 503));
+  }, (_req, res, requests) => recover && requests.length > 2 ? json(res, completion()) : json(res, status === 422 ? eventException : { message: 'temporary service failure' }, status));
 });
 
 test('native Pi abort stops a provider backoff immediately', { timeout: 30000 }, async () => {
