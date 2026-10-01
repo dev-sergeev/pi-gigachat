@@ -1,6 +1,7 @@
 import { createProvider } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { gigachatAuth } from "./auth.js";
+import { registerDefaultModel } from "./default-model.js";
 import { GIGACHAT_MODELS } from "./models.js";
 import { streamSimpleGigaChat } from "./stream.js";
 
@@ -17,4 +18,5 @@ export const gigachatProvider = createProvider({
 
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider(gigachatProvider);
+	registerDefaultModel(pi);
 }

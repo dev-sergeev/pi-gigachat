@@ -115,7 +115,7 @@ test('stored OAuth endpoint wins over ambient base URL; explicit request env can
   await store.modify('gigachat', async () => ({ type: 'oauth', access: token, refresh: credentials,
     expires: Date.now() + 1800000, baseUrl: 'https://saved.example/v1' }));
   const models = collection({}, store);
-  const model = models.getModel('gigachat', 'GigaChat-3-Ultra');
+  const model = models.getModel('gigachat', 'Qwen3.5-397b');
   const urls = [];
   const fetch = async (url) => {
     urls.push(String(url));

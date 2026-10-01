@@ -5,8 +5,8 @@ Node.js **22.19 or later**. Uses `createProvider()` and
 `pi.registerProvider(provider)`, with pi's native authentication and session
 lifecycle. The legacy provider API and `@mariozechner/pi-*` packages are no longer used.
 
-Includes `GigaChat-2` (Lite), `GigaChat-2-Pro`, `GigaChat-2-Max`,
-`GigaChat-3-Ultra`, `glm-5.2`, and `Qwen3.5-397b`, text conversations, pi tools,
+Includes only `glm-5.2` (GLM 5.2) and `Qwen3.5-397b` (Qwen 3.5 397B),
+text conversations, pi tools,
 and JSON or SSE responses. GLM and Qwen require a GigaChat-compatible endpoint
 that exposes these exact model IDs; registering them does not make them available
 on every GigaChat account or endpoint.
@@ -18,11 +18,27 @@ under its original MIT license.
 With Pi 0.85.1 installed:
 
 ```bash
-pi install git:github.com/dev-sergeev/pi-gigachat
-pi --provider gigachat --model GigaChat-3-Ultra
+pi install npm:@dev-sergeev/pi-gigachat@0.4.0
+pi
 ```
 
-Use `/login gigachat` to configure authentication, then select a GigaChat model
+You can also install from Git with `pi install git:github.com/dev-sergeev/pi-gigachat`.
+The installation script **overwrites** Pi's saved `defaultProvider` and
+`defaultModel` with `gigachat` and `Qwen3.5-397b`, even if another default was
+previously configured. Other settings are preserved. It writes to
+`$PI_CODING_AGENT_DIR/settings.json`, or `~/.pi/agent/settings.json` when unset.
+Project settings and explicit CLI model flags retain Pi's normal precedence.
+If the package manager blocks lifecycle scripts (including npm 12 by default),
+or you install a local path with `pi install .`, the extension applies the same
+default once on first activation of this version. A new session without explicit
+model flags switches to Qwen immediately; explicit model flags, project defaults,
+and resumed sessions keep their selection. Authentication is still required.
+After installation you can choose GLM with `/model`; subsequent launches do not
+force Qwen again. Reinstalling with lifecycle scripts enabled resets the default.
+To apply the default before starting Pi when scripts were blocked, run
+`node scripts/postinstall.mjs` from the installed package directory.
+
+Use `/login gigachat` to configure authentication, then select GLM or Qwen
 with `/model`. Restart an existing Pi session or use `/reload` after installation.
 
 Pi loads the prebuilt `extension.js` and supplies its own `@earendil-works`
@@ -69,7 +85,7 @@ Launch from this checkout with Bash/Zsh:
   set -a
   . ./.env
   set +a
-  ./node_modules/.bin/pi --provider gigachat --model GigaChat-3-Ultra
+  ./node_modules/.bin/pi --provider gigachat --model Qwen3.5-397b
 )
 ```
 
@@ -255,7 +271,7 @@ pi --provider gigachat --model Qwen3.5-397b --thinking medium
 The adapter sends the selected level unchanged in the top-level
 `reasoning_effort` field: `off`, `low`, `medium`, or `high`. This requires a gateway
 that implements this request field for these models; direct model APIs can use
-different controls. The GigaChat models do not receive this field automatically.
+different controls.
 
 In programmatic `completeSimple` calls, pass `reasoning: "low"`, `"medium"`, or
 `"high"`; omit it for `off`. The low-level `streamSimpleGigaChat` also accepts
@@ -359,7 +375,6 @@ All registered models advertise text input. Configured token budgets are:
 
 | Models | Context window | Maximum generated tokens |
 | --- | --- | --- |
-| GigaChat 2 Lite / Pro / Max, GigaChat 3 Ultra | 128,000 | 8,192 |
 | GLM 5.2 | 200,000 | 64,000 |
 | Qwen 3.5 397B | 262,144 | 32,768 |
 
@@ -386,7 +401,7 @@ import { gigachatProvider } from "@dev-sergeev/pi-gigachat";
 
 const models = createModels();
 models.setProvider(gigachatProvider);
-const model = models.getModel("gigachat", "GigaChat-3-Ultra")!;
+const model = models.getModel("gigachat", "Qwen3.5-397b")!;
 const answer = await models.completeSimple(model, {
   messages: [{ role: "user", content: "Привет!", timestamp: Date.now() }],
 }, {

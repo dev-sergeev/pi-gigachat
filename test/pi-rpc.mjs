@@ -22,7 +22,7 @@ export async function until(predicate, label, timeout = 15000) {
 }
 
 export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
-  const modelId = runtime.model ?? 'GigaChat-3-Ultra';
+  const modelId = runtime.model ?? 'Qwen3.5-397b';
   const dir = await mkdtemp(join(tmpdir(), 'pi-gigachat-test-'));
   const agentDir = join(dir, 'agent');
   const sessionFile = join(dir, 'session.jsonl');
@@ -37,8 +37,8 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
     const pending = new Map();
     let counter = 0;
     let stderr = '';
-    const child = spawn(process.execPath, [cliPath, '--mode', 'rpc', '--session', sessionFile,
-      '--provider', 'gigachat', '--model', modelId, ...(runtime.tools ? ['--tools', runtime.tools] : ['--no-tools']), '--no-skills', '--no-prompt-templates'], {
+    const child = spawn(process.execPath, [cliPath, '--mode', 'rpc', ...(runtime.sessionFlags === false ? [] : ['--session', sessionFile]),
+      ...(runtime.modelFlags === false ? [] : ['--provider', 'gigachat', '--model', modelId]), ...(runtime.tools ? ['--tools', runtime.tools] : ['--no-tools']), '--no-skills', '--no-prompt-templates'], {
       cwd: dir, env: { ...cleanEnv(), PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1',
         GIGACHAT_ACCESS_TOKEN: token, GIGACHAT_BASE_URL: baseUrl, ...runtime.env }, stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -66,7 +66,7 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
       return response;
     };
     current = {
-      events, command, sessionFile,
+      events, command, sessionFile, agentDir,
       async entries() { return (await readFile(sessionFile, 'utf8')).trim().split('\n').map(JSON.parse); },
       async prompt(message) {
         const startIndex = events.length;
@@ -84,7 +84,7 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
       },
     };
     const response = await command('get_state');
-    if (!response.success || response.data.model?.id !== modelId) throw new Error('Provider did not load');
+    if (!response.success || response.data.model?.id !== (runtime.expectedModel ?? modelId)) throw new Error('Provider did not load');
     return current;
   }
   try { await run(await start(), async () => { await current.stop(); return start(); }); }

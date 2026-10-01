@@ -253,10 +253,6 @@ var thinkingLevelMap = {
   max: null
 };
 var GIGACHAT_MODELS = [
-  { id: "GigaChat-2", name: "GigaChat 2 Lite" },
-  { id: "GigaChat-2-Pro", name: "GigaChat 2 Pro" },
-  { id: "GigaChat-2-Max", name: "GigaChat 2 Max" },
-  { id: "GigaChat-3-Ultra", name: "GigaChat 3 Ultra" },
   {
     id: "glm-5.2",
     name: "GLM 5.2",
@@ -502,6 +498,38 @@ var gigachatAuth = {
     }
   }
 };
+
+// src/default-model.ts
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+var installationVersion = "0.4.0";
+function registerDefaultModel(pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const { getAgentDir, SettingsManager } = await import("@earendil-works/pi-coding-agent");
+    const agentDir = getAgentDir();
+    const marker = join(agentDir, ".pi-gigachat-default-model");
+    if (existsSync(marker) && readFileSync(marker, "utf8").trim() === installationVersion) {
+      return;
+    }
+    const settings = SettingsManager.create(ctx.cwd, agentDir);
+    settings.setDefaultModelAndProvider("gigachat", "Qwen3.5-397b");
+    await settings.flush();
+    const errors = settings.drainErrors();
+    if (errors.length) throw errors[0].error;
+    const explicitSelection = process.argv.some(
+      (arg) => /^(--model|--provider|--session|--resume|--continue|-c|-r)(=|$)/.test(
+        arg
+      )
+    );
+    const projectDefault = settings.getProjectSettings().defaultModel;
+    if (!explicitSelection && !projectDefault) {
+      const model = ctx.modelRegistry.find("gigachat", "Qwen3.5-397b");
+      if (model) await pi.setModel(model);
+    }
+    writeFileSync(marker, `${installationVersion}
+`, { mode: 384 });
+  });
+}
 
 // src/stream.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -1153,6 +1181,7 @@ var gigachatProvider = createProvider({
 });
 function index_default(pi) {
   pi.registerProvider(gigachatProvider);
+  registerDefaultModel(pi);
 }
 export {
   index_default as default,

@@ -14,10 +14,6 @@ const thinkingLevelMap: ThinkingLevelMap = {
 };
 
 export const GIGACHAT_MODELS: Model<typeof GIGACHAT_API>[] = [
-	{ id: "GigaChat-2", name: "GigaChat 2 Lite" },
-	{ id: "GigaChat-2-Pro", name: "GigaChat 2 Pro" },
-	{ id: "GigaChat-2-Max", name: "GigaChat 2 Max" },
-	{ id: "GigaChat-3-Ultra", name: "GigaChat 3 Ultra" },
 	{
 		id: "glm-5.2",
 		name: "GLM 5.2",

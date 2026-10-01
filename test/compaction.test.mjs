@@ -38,7 +38,7 @@ modeTest('real pi compacts, includes its prior summary on recompaction, and resu
       assert(requests.at(-1).body.messages.some(m => m.content?.includes(summary)));
       const summaries = requests.filter(isSummary);
       assert(summaries.length >= 2);
-      assert(summaries.every(r => r.body.stream === streaming && !r.body.functions && r.body.max_tokens <= 8192));
+      assert(summaries.every(r => r.body.stream === streaming && !r.body.functions && r.body.max_tokens <= 32768));
       assert(requests.every(r => r.body.stream === streaming && r.headers.authorization === `Bearer ${token}`));
     });
   }, respond);
@@ -81,8 +81,8 @@ for (const cached of [false, true]) modeTest(`real pi uses full context usage to
     if (highUsage && !isSummary(req)) {
       highUsage = false;
       reply(req, res, completion({ role: 'assistant', content: 'High usage.' }, 'stop', cached
-        ? { prompt_tokens: 5000, precached_prompt_tokens: 110000, completion_tokens: 20, total_tokens: 5020 }
-        : { prompt_tokens: 115000, completion_tokens: 20, total_tokens: 115020 }));
+        ? { prompt_tokens: 5000, precached_prompt_tokens: 245000, completion_tokens: 20, total_tokens: 5020 }
+        : { prompt_tokens: 250000, completion_tokens: 20, total_tokens: 250020 }));
     } else respond(req, res);
   });
 });

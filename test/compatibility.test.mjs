@@ -121,14 +121,10 @@ test('default output budget follows the model; explicit budgets are bounded by i
   });
 });
 
-test('GLM 5.2 uses a 64,000-token output budget while GigaChat budgets are unchanged', async () => {
+test('GLM 5.2 uses a 64,000-token output budget', async () => {
   const glm = GIGACHAT_MODELS.find(model => model.id === 'glm-5.2');
   assert(glm);
   assert.equal(glm.contextWindow, 200000);
-  for (const model of GIGACHAT_MODELS.filter(model => model.id.startsWith('GigaChat-'))) {
-    assert.equal(model.contextWindow, 128000);
-    assert.equal(model.maxTokens, 8192);
-  }
   await withServer(async ({ baseUrl, requests }) => {
     const model = { ...glm, baseUrl };
     await ask(model);

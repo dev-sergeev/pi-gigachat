@@ -11,7 +11,7 @@ for (const key of Object.keys(process.env)) {
 const token = 'test.synthetic.token';
 const completion = (message = { role:'assistant', content:'Привет! 👋' }, reason = 'stop') => ({
   choices:[{index:0, message, finish_reason:reason}],
-  created:1, model:'GigaChat-3-Ultra', object:'chat.completion',
+  created:1, model:'Qwen3.5-397b', object:'chat.completion',
   usage:{prompt_tokens:12, completion_tokens:4, total_tokens:16},
 });
 function json(res, body, status = 200) {
@@ -32,7 +32,7 @@ async function withServer(run, respond = (_request,res) => json(res,completion()
   });
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
-  const model = {...GIGACHAT_MODELS.find(model => model.id === 'GigaChat-3-Ultra'),provider:'gigachat',api:'gigachat-extension-api',baseUrl};
+  const model = {...GIGACHAT_MODELS.find(model => model.id === 'Qwen3.5-397b'),provider:'gigachat',api:'gigachat-extension-api',baseUrl};
   try { await run({model,requests,baseUrl}); }
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 }

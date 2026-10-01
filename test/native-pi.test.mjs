@@ -10,12 +10,12 @@ const singleToolInstruction = 'Call at most one tool per assistant message. Do n
 
 test('extension registers a native Provider object using the one-argument API', () => {
   let args;
-  extension({ registerProvider(...values) { args = values; } });
+  extension({ registerProvider(...values) { args = values; }, on() {} });
   assert.equal(args.length, 1);
   assert.equal(args[0], gigachatProvider);
   assert.equal(typeof args[0].auth.oauth.toAuth, 'function');
   assert.equal(typeof args[0].stream, 'function');
-  assert(args[0].getModels().some(model => model.id === 'GigaChat-3-Ultra'));
+  assert.deepEqual(args[0].getModels().map(model => model.id).sort(), ['Qwen3.5-397b', 'glm-5.2']);
 });
 
 for (const providerPrompt of [undefined, 'GIGA_PROVIDER_RULES\nСохраняй точные идентификаторы.'])

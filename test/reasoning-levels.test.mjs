@@ -10,7 +10,7 @@ for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) del
 const levels = ['off', 'low', 'medium', 'high'];
 const models = ['glm-5.2', 'Qwen3.5-397b'].map(id => GIGACHAT_MODELS.find(model => model.id === id));
 
-test('GLM and Qwen expose exactly the requested thinking levels; GigaChat remains off-only', () => {
+test('GLM and Qwen expose exactly the requested thinking levels', () => {
   for (const model of models) {
     assert(model);
     assert.equal(model.reasoning, true);
@@ -18,9 +18,6 @@ test('GLM and Qwen expose exactly the requested thinking levels; GigaChat remain
   }
   assert.equal(models[1].contextWindow, 262144);
   assert.equal(models[1].maxTokens, 32768);
-  for (const model of GIGACHAT_MODELS.filter(model => model.id.startsWith('GigaChat-'))) {
-    assert.deepEqual(getSupportedThinkingLevels(model), ['off']);
-  }
 });
 
 for (const selected of models)
@@ -69,9 +66,9 @@ test('reasoning supports gateway mappings and explicit payload overrides', async
   });
 });
 
-test('ordinary GigaChat requests do not acquire reasoning fields', async () => {
+test('custom non-reasoning models do not acquire reasoning fields', async () => {
   await withServer(async ({ model, requests }) => {
-    await ask(model, undefined, { reasoning: 'high' });
+    await ask({ ...model, reasoning: false, thinkingLevelMap: undefined }, undefined, { reasoning: 'high' });
     assert(!Object.hasOwn(requests[0].body, 'reasoning_effort'));
   });
 });
