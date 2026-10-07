@@ -14,12 +14,19 @@ models from each server's catalog.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Release 0.5.0
+
+- Added the `/gigachat` wizard for independent server connections and model discovery.
+- Connection management includes authentication, model selection, and saved defaults.
+- Supports private connection selections without overwriting them during default-model initialization.
+- Still targets Pi 0.85.1; the documented Pi 1.0.1 and official SDK migrations are not implemented in this release.
+
 ## Install in Pi
 
 With Pi 0.85.1 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.4.0
+pi install npm:@dev-sergeev/pi-gigachat@0.5.0
 pi
 ```
 

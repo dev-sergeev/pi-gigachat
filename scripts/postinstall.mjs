@@ -27,7 +27,7 @@ const temporaryPath = `${settingsPath}.${randomUUID()}.tmp`;
 try {
   writeFileSync(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, { mode, flag: 'wx' });
   renameSync(temporaryPath, settingsPath);
-  writeFileSync(join(agentDir, '.pi-gigachat-default-model'), '0.4.0\n', { mode: 0o600 });
+  writeFileSync(join(agentDir, '.pi-gigachat-default-model'), '0.5.0\n', { mode: 0o600 });
 } finally {
   rmSync(temporaryPath, { force: true });
 }

@@ -6,7 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { GIGACHAT_API } from "./models.js";
 
-const installationVersion = "0.4.0";
+const installationVersion = "0.5.0";
 
 export function registerDefaultModel(
 	pi: ExtensionAPI,

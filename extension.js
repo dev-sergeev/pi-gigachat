@@ -2570,7 +2570,7 @@ import { createProvider as createProvider2 } from "@earendil-works/pi-ai";
 init_models();
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-var installationVersion = "0.4.0";
+var installationVersion = "0.5.0";
 function registerDefaultModel(pi, canInitialize) {
   pi.on("session_start", async (_event, ctx) => {
     if (!canInitialize(ctx)) return;
