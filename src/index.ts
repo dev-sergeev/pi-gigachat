@@ -16,7 +16,10 @@ export const gigachatProvider = createProvider({
 	api: { stream: streamSimpleGigaChat, streamSimple: streamSimpleGigaChat },
 });
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
 	pi.registerProvider(gigachatProvider);
-	registerDefaultModel(pi);
+	// Pi UI peers are absent when this package is used only as a pi-ai library.
+	const { registerGigaChatCommand } = await import("./gigachat-ui.js");
+	const canInitializeLegacyDefault = await registerGigaChatCommand(pi);
+	registerDefaultModel(pi, canInitializeLegacyDefault);
 }

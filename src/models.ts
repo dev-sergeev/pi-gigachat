@@ -13,6 +13,13 @@ const thinkingLevelMap: ThinkingLevelMap = {
 	max: null,
 };
 
+export const GIGACHAT_CONNECTION_DEFAULTS = {
+	contextWindow: 200000,
+	maxTokens: 64000,
+	reasoning: true,
+	thinkingLevelMap,
+};
+
 export const GIGACHAT_MODELS: Model<typeof GIGACHAT_API>[] = [
 	{
 		id: "glm-5.2",

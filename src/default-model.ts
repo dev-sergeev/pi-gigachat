@@ -1,11 +1,23 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { GIGACHAT_API } from "./models.js";
 
 const installationVersion = "0.4.0";
 
-export function registerDefaultModel(pi: ExtensionAPI): void {
+export function registerDefaultModel(
+	pi: ExtensionAPI,
+	canInitialize: (ctx: ExtensionContext) => boolean,
+): void {
 	pi.on("session_start", async (_event, ctx) => {
+		if (!canInitialize(ctx)) return;
+		if (ctx.model?.api === GIGACHAT_API && ctx.model.provider !== "gigachat") {
+			return;
+		}
+		// The Pi host is optional for programmatic pi-ai consumers.
 		const { getAgentDir, SettingsManager } = await import(
 			"@earendil-works/pi-coding-agent"
 		);
