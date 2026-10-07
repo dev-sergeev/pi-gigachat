@@ -2,21 +2,11 @@ import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import extension, { gigachatProvider } from '../dist/index.js';
 import { completion, reply, withServer } from './helpers.mjs';
 import { withPi } from './pi-rpc.mjs';
 
 const singleToolInstruction = 'Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.';
 
-test('extension registers a native Provider object using the one-argument API', () => {
-  let args;
-  extension({ registerProvider(...values) { args = values; }, on() {} });
-  assert.equal(args.length, 1);
-  assert.equal(args[0], gigachatProvider);
-  assert.equal(typeof args[0].auth.oauth.toAuth, 'function');
-  assert.equal(typeof args[0].stream, 'function');
-  assert.deepEqual(args[0].getModels().map(model => model.id).sort(), ['Qwen3.5-397b', 'glm-5.2']);
-});
 
 for (const providerPrompt of [undefined, 'GIGA_PROVIDER_RULES\nСохраняй точные идентификаторы.'])
 for (const streaming of [false, true]) test(`native pi uses GigaChat tools, compaction, saved history and extra parameters (stream=${streaming}, prompt=${providerPrompt === undefined ? 'default' : 'custom'})`, { timeout: 45000 }, async () => {

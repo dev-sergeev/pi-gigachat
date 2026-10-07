@@ -27,10 +27,11 @@ export function baseUrl(value = GIGACHAT_DEFAULT_BASE_URL): string {
 	return url.href.replace(/\/+$/, "");
 }
 
-async function exchange(
+export async function exchange(
 	stored: Credentials,
 	signal: AbortSignal,
 	env: ProviderEnv = {},
+	options: { tokenUrl?: string; maxRetries?: number } = {},
 ): Promise<Credentials> {
 	const config = environment({ env });
 	const passwordAuth = stored.authMode === "basic";
@@ -47,7 +48,7 @@ async function exchange(
 	const data = await request(
 		passwordAuth
 			? `${baseUrl(stored.baseUrl)}/token`
-			: config.GIGACHAT_AUTH_URL || authUrl,
+			: (options.tokenUrl ?? (config.GIGACHAT_AUTH_URL || authUrl)),
 		{
 			method: "POST",
 			headers: {
@@ -59,7 +60,7 @@ async function exchange(
 			},
 			body: passwordAuth ? "" : new URLSearchParams({ scope }).toString(),
 		},
-		{ signal, env },
+		{ signal, env, maxRetries: options.maxRetries },
 		(response) => response.json(),
 	);
 	if (!object(data)) throw new Error("Invalid GigaChat token response");
