@@ -14,3 +14,7 @@ node_modules/
 
 # Generated npm archives.
 *.tgz
+
+# macOS metadata and local Git worktrees.
+.DS_Store
+/.worktrees/
