@@ -153,6 +153,7 @@ export function streamSimpleGigaChat(
 			}
 			// This switch controls both the wire format and its parser.
 			body.stream = streaming;
+			let recoveryAdded = false;
 			stream.push({ type: "start", partial: output });
 			await serial(signal, () =>
 				request(
@@ -177,7 +178,22 @@ export function streamSimpleGigaChat(
 							options.headers,
 						),
 					},
-					{ ...options, canRetry: () => output.content.length === 0 },
+					{
+						...options,
+						canRetry: () => output.content.length === 0,
+						recover422: (init) => {
+							if (recoveryAdded) return init;
+							const recoveredBody = {
+								...body,
+								messages: [
+									...(body.messages as unknown[]),
+									{ role: "user", content: DEFAULT_SYSTEM_PROMPT },
+								],
+							};
+							recoveryAdded = true;
+							return { ...init, body: JSON.stringify(recoveredBody) };
+						},
+					},
 					async (response) => {
 						// A failed attempt may have emitted only metadata, not content.
 						output.stopReason = "pending";
