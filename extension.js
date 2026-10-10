@@ -14,7 +14,7 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// ../../node_modules/@earendil-works/pi-ai/dist/utils/abort.js
+// node_modules/@earendil-works/pi-ai/dist/utils/abort.js
 function abortReason(signal) {
   if (signal.reason !== void 0)
     return signal.reason;
@@ -57,7 +57,7 @@ function raceWithAbortSignal(operation, signal) {
   });
 }
 var init_abort = __esm({
-  "../../node_modules/@earendil-works/pi-ai/dist/utils/abort.js"() {
+  "node_modules/@earendil-works/pi-ai/dist/utils/abort.js"() {
   }
 });
 
@@ -541,7 +541,7 @@ var init_auth = __esm({
   }
 });
 
-// ../../node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
+// node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
 function replaceImagesWithPlaceholder(content, placeholder) {
   const result = [];
   let previousWasPlaceholder = false;
@@ -695,7 +695,7 @@ function transformMessages(messages, model, normalizeToolCallId) {
 }
 var NON_VISION_USER_IMAGE_PLACEHOLDER, NON_VISION_TOOL_IMAGE_PLACEHOLDER;
 var init_transform_messages = __esm({
-  "../../node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js"() {
+  "node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js"() {
     NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
     NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
   }
@@ -1262,6 +1262,8 @@ function validConnection(value) {
   for (const model of value.models) {
     if (!object(model) || !nonempty(model.id) || ids.has(model.id) || !nonempty(model.name) || typeof model.reasoning !== "boolean" || !Number.isSafeInteger(model.contextWindow) || Number(model.contextWindow) < 1 || !Number.isSafeInteger(model.maxTokens) || Number(model.maxTokens) < 1)
       return false;
+    if (model.temperature !== void 0 && (typeof model.temperature !== "number" || !Number.isFinite(model.temperature) || model.temperature < 0))
+      return false;
     if (model.thinkingLevelMap !== void 0 && (!object(model.thinkingLevelMap) || !Object.entries(model.thinkingLevelMap).every(
       ([level, target]) => [
         "off",
@@ -1433,6 +1435,7 @@ function createConnectionProvider(connection, store, loginCredential) {
     if (!current || model.provider !== saved.id) throw stale();
     return streamSimpleGigaChat(current, context, {
       ...options,
+      temperature: options.temperature ?? current.temperature,
       // These legacy overrides must not redirect a connection or its selected Model ID.
       env: {
         ...options.env,
@@ -2382,12 +2385,18 @@ async function registerGigaChatCommand(pi) {
     let values = {
       context: String(model.contextWindow),
       output: String(model.maxTokens),
+      temperature: model.temperature === void 0 ? "" : String(model.temperature),
       reasoning: model.reasoning ? "\u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F" : "\u041D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F"
     };
     for (; ; ) {
       const entered = await showForm(ctx, `\u041F\u0430\u0440\u0430\u043C\u0435\u0442\u0440\u044B \xB7 ${model.id}`, [
         { id: "context", label: "\u041B\u0438\u043C\u0438\u0442 \u043A\u043E\u043D\u0442\u0435\u043A\u0441\u0442\u0430", value: values.context },
         { id: "output", label: "\u041B\u0438\u043C\u0438\u0442 \u043E\u0442\u0432\u0435\u0442\u0430", value: values.output },
+        {
+          id: "temperature",
+          label: "\u0422\u0435\u043C\u043F\u0435\u0440\u0430\u0442\u0443\u0440\u0430 (\u043F\u0443\u0441\u0442\u043E \u2014 \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E)",
+          value: values.temperature
+        },
         {
           id: "reasoning",
           label: "Reasoning",
@@ -2399,6 +2408,7 @@ async function registerGigaChatCommand(pi) {
       values = {
         context: entered.context,
         output: entered.output,
+        temperature: entered.temperature,
         reasoning: entered.reasoning
       };
       const contextWindow = Number(values.context);
@@ -2410,11 +2420,20 @@ async function registerGigaChatCommand(pi) {
         );
         continue;
       }
+      const temperature = values.temperature.trim() === "" ? void 0 : Number(values.temperature);
+      if (temperature !== void 0 && (!Number.isFinite(temperature) || temperature < 0)) {
+        ctx.ui.notify(
+          "\u0422\u0435\u043C\u043F\u0435\u0440\u0430\u0442\u0443\u0440\u0430 \u0434\u043E\u043B\u0436\u043D\u0430 \u0431\u044B\u0442\u044C \u043A\u043E\u043D\u0435\u0447\u043D\u044B\u043C \u0447\u0438\u0441\u043B\u043E\u043C \u043D\u0435 \u043C\u0435\u043D\u044C\u0448\u0435 0.",
+          "error"
+        );
+        continue;
+      }
       const reasoning = values.reasoning === "\u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F";
       const edited = {
         ...model,
         contextWindow,
         maxTokens,
+        temperature,
         reasoning,
         thinkingLevelMap: reasoning ? model.thinkingLevelMap ?? GIGACHAT_CONNECTION_DEFAULTS.thinkingLevelMap : void 0
       };
