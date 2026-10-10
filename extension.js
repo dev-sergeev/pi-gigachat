@@ -14,7 +14,7 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// node_modules/@earendil-works/pi-ai/dist/utils/abort.js
+// ../../node_modules/@earendil-works/pi-ai/dist/utils/abort.js
 function abortReason(signal) {
   if (signal.reason !== void 0)
     return signal.reason;
@@ -57,7 +57,7 @@ function raceWithAbortSignal(operation, signal) {
   });
 }
 var init_abort = __esm({
-  "node_modules/@earendil-works/pi-ai/dist/utils/abort.js"() {
+  "../../node_modules/@earendil-works/pi-ai/dist/utils/abort.js"() {
   }
 });
 
@@ -165,6 +165,7 @@ async function request(url, init, options, consume, observe) {
   });
   try {
     const send = options.fetch ?? fetch;
+    let currentInit = init;
     for (let retries = 0; ; retries++) {
       signal.throwIfAborted();
       const attemptSignal = AbortSignal.any([
@@ -176,7 +177,7 @@ async function request(url, init, options, consume, observe) {
       let delay = 0;
       try {
         response = await send(url, {
-          ...init,
+          ...currentInit,
           signal: attemptSignal,
           dispatcher
         });
@@ -193,7 +194,8 @@ async function request(url, init, options, consume, observe) {
       } catch (caught) {
         if (signal.aborted) throw signal.reason;
         const error = attemptSignal.aborted ? attemptSignal.reason : caught;
-        if (maxRetries === 0 || observing || options.canRetry?.() === false || !transient(error)) {
+        const recover422 = error instanceof GigaChatHttpError && error.status === 422 ? options.recover422 : void 0;
+        if (maxRetries === 0 || observing || options.canRetry?.() === false || !recover422 && !transient(error)) {
           if (error instanceof Error && error.message === "fetch failed" && error.cause instanceof Error)
             throw new Error(
               `GigaChat connection failed: ${error.cause.message}`,
@@ -212,6 +214,7 @@ async function request(url, init, options, consume, observe) {
             error,
             "server requested a wait longer than 600 seconds"
           );
+        if (recover422) currentInit = recover422(currentInit);
       } finally {
         if (response?.body && !response.body.locked)
           await response.body.cancel().catch(() => {
@@ -538,7 +541,7 @@ var init_auth = __esm({
   }
 });
 
-// node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
+// ../../node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
 function replaceImagesWithPlaceholder(content, placeholder) {
   const result = [];
   let previousWasPlaceholder = false;
@@ -692,7 +695,7 @@ function transformMessages(messages, model, normalizeToolCallId) {
 }
 var NON_VISION_USER_IMAGE_PLACEHOLDER, NON_VISION_TOOL_IMAGE_PLACEHOLDER;
 var init_transform_messages = __esm({
-  "node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js"() {
+  "../../node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js"() {
     NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
     NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
   }
@@ -913,6 +916,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
         body = modified;
       }
       body.stream = streaming;
+      let recoveryAdded = false;
       stream.push({ type: "start", partial: output });
       await serial(
         signal,
@@ -936,7 +940,22 @@ function streamSimpleGigaChat(model, context, options = {}) {
               options.headers
             )
           },
-          { ...options, canRetry: () => output.content.length === 0 },
+          {
+            ...options,
+            canRetry: () => output.content.length === 0,
+            recover422: (init) => {
+              if (recoveryAdded) return init;
+              const recoveredBody = {
+                ...body,
+                messages: [
+                  ...body.messages,
+                  { role: "user", content: DEFAULT_SYSTEM_PROMPT }
+                ]
+              };
+              recoveryAdded = true;
+              return { ...init, body: JSON.stringify(recoveredBody) };
+            }
+          },
           async (response) => {
             output.stopReason = "pending";
             delete output.rawStopReason;

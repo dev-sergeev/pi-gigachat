@@ -12,6 +12,98 @@ const fast = { GIGACHAT_RETRY_BASE_DELAY_MS: '0' };
 const consume = response => response.json();
 const networkError = () => new TypeError('fetch failed', { cause: Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }) });
 const eventException = { error: 'EventException', statusCode: 422, timestamp: '2026-09-22T07:43:33.084Z' };
+const recoveryInstruction = 'Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.';
+const recoveryMessage = { role: 'user', content: recoveryInstruction };
+
+for (const streaming of [false, true]) test(`422 recovery is request-local across mixed failures (stream=${streaming})`, async () => {
+  const context = { messages: [user('Run the tool'), {
+    role: 'assistant', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: { path: 'fixture.txt' } }],
+    api: 'gigachat-extension-api', provider: 'gigachat', model: 'Qwen3.5-397b', stopReason: 'toolUse', timestamp: 0,
+  }, { role: 'toolResult', toolCallId: 'call-1', toolName: 'read', content: [{ type: 'text', text: 'file contents' }], isError: false, timestamp: 0 }] };
+  const original = structuredClone(context);
+  await withServer(async ({ model, requests }) => {
+    const options = { maxRetries: 4, env: { ...fast, GIGACHAT_STREAM: String(streaming) } };
+    const result = await ask(model, context, options);
+    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.equal(result.content[0].text, 'OK');
+    const initial = requests[0].body;
+    const recovered = { ...initial, messages: [...initial.messages, recoveryMessage] };
+    assert.deepEqual(requests.map(r => r.body), [initial, initial, recovered, recovered, recovered]);
+    assert.deepEqual(context, original);
+    context.messages.push(result, user('Continue'));
+    const next = await ask(model, context, options);
+    assert.equal(next.stopReason, 'stop', next.errorMessage);
+    assert.deepEqual(requests.at(-1).body.messages.filter(m => m.role === 'user'), [
+      { role: 'user', content: 'Run the tool' }, { role: 'user', content: 'Continue' },
+    ]);
+  }, (req, res, requests) => {
+    const status = [503, 422, 429, 422][requests.length - 1];
+    if (status) json(res, { message: 'invalid request' }, status);
+    else reply(req, res, completion());
+  });
+});
+
+test('all generation 422 bodies recover, including quota diagnostics and malformed JSON', async () => {
+  for (const body of ['{"error":"ValidationException"}', '{"message":"insufficient_quota"}', 'not JSON', 'null']) {
+    await withServer(async ({ model, requests }) => {
+      const result = await ask(model, undefined, { maxRetries: 1, env: fast });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+      assert.deepEqual(requests[1].body.messages.at(-1), recoveryMessage);
+    }, (req, res, requests) => {
+      if (requests.length === 1) { res.writeHead(422); res.end(body); }
+      else reply(req, res, completion());
+    });
+  }
+});
+
+test('422 recovery exhausts the shared budget without leaking into the next generation', async () => {
+  await withServer(async ({ model, requests }) => {
+    const context = { messages: [user('Hi')] };
+    const result = await ask(model, context, { maxRetries: 2, env: fast });
+    assert.equal(result.stopReason, 'error');
+    assert.match(result.errorMessage, /2 retries exhausted.*422.*invalid request/);
+    assert.deepEqual(requests.map(r => r.body.messages.filter(m => m.content === recoveryInstruction && m.role === 'user')), [[], [], [recoveryMessage]]);
+    const next = await ask(model, context, { maxRetries: 0, env: fast });
+    assert.equal(next.stopReason, 'stop', next.errorMessage);
+    assert.deepEqual(requests.at(-1).body.messages, requests[0].body.messages);
+  }, (req, res, requests) => {
+    const status = [503, 422, 422][requests.length - 1];
+    if (status) json(res, { message: 'invalid request' }, status);
+    else reply(req, res, completion());
+  });
+});
+
+test('cancelled 422 recovery does not affect a subsequent generation', async () => {
+  await withServer(async ({ model, requests }) => {
+    const controller = new AbortController();
+    const context = { messages: [user('Hi')] };
+    const result = await ask(model, context, {
+      signal: controller.signal, maxRetries: 2, env: fast,
+      onResponse: () => { if (requests.length === 2) controller.abort(); },
+    });
+    assert.equal(result.stopReason, 'aborted');
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[1].body.messages.at(-1), recoveryMessage);
+    const next = await ask(model, context, { maxRetries: 0, env: fast });
+    assert.equal(next.stopReason, 'stop', next.errorMessage);
+    assert.deepEqual(requests.at(-1).body.messages, requests[0].body.messages);
+  }, (req, res, requests) => requests.length <= 2
+    ? json(res, eventException, 422) : reply(req, res, completion()));
+});
+
+test('422 recovery remains temporary with a reusable onPayload override and custom system prompt', async () => {
+  await withServer(async ({ model, requests }) => {
+    const override = { model: model.id, messages: [{ role: 'user', content: 'Custom request' }], stream: false };
+    const options = { maxRetries: 1, env: { ...fast, GIGACHAT_SYSTEM_PROMPT: '' }, onPayload: () => override };
+    const result = await ask(model, undefined, options);
+    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.deepEqual(requests[1].body.messages, [...override.messages, recoveryMessage]);
+    const next = await ask(model, undefined, options);
+    assert.equal(next.stopReason, 'stop', next.errorMessage);
+    assert.deepEqual(requests.at(-1).body.messages, [{ role: 'user', content: 'Custom request' }]);
+  }, (req, res, requests) => requests.length === 1
+    ? json(res, eventException, 422) : reply(req, res, completion()));
+});
 
 for (const status of [503, 422])
 for (const extended of [false, true]) test(`exponential waits and bounded request count use virtual time (status=${status}, extended=${extended})`, async t => {
@@ -54,7 +146,6 @@ for (const streaming of [false, true]) for (const status of [408, 422, 429, 500,
       assert.equal(result.stopReason, 'toolUse', result.errorMessage);
       assert.deepEqual(observed, [status, status, 200]);
       assert.equal(result.content.filter(c => c.type === 'toolCall').length, 1);
-      assert.deepEqual(requests.map(r => r.body), Array(3).fill(requests[0].body));
     }, (req, res, requests) => requests.length < 3
       ? json(res, status === 422 ? eventException : { message: 'temporary failure' }, status)
       : reply(req, res, completion({ role: 'assistant', content: '', function_call: { name: 'read', arguments: { path: 'fixture.txt' } } }, 'function_call')));
@@ -62,7 +153,7 @@ for (const streaming of [false, true]) for (const status of [408, 422, 429, 500,
 }
 
 test('permanent HTTP failures, quota exhaustion and disabled retries return after one request', async () => {
-  for (const status of [400, 401, 402, 403, 404, 413, 422, 429]) {
+  for (const status of [400, 401, 402, 403, 404, 413, 429]) {
     await withServer(async ({ model, requests }) => {
       const result = await ask(model, undefined, { env: fast });
       assert.equal(result.stopReason, 'error');
@@ -75,7 +166,7 @@ test('permanent HTTP failures, quota exhaustion and disabled retries return afte
   }, (_req, res) => json(res, status === 422 ? eventException : { message: 'busy' }, status));
 });
 
-test('422 retries require an exact top-level EventException error and preserve other diagnostics', async () => {
+test('non-generation 422 handling still requires EventException and preserves other diagnostics', async () => {
   for (const body of [
     '{"error":"ValidationException","message":"Invalid params"}',
     '{"message":"EventException"}', '{"error":"EventExceptionOther"}',

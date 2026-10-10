@@ -149,6 +149,7 @@ export async function request<T>(
 		"signal" | "timeoutMs" | "env" | "fetch" | "maxRetries"
 	> & {
 		canRetry?: () => boolean;
+		recover422?: (init: RequestInit) => RequestInit;
 	},
 	consume: (response: Response) => Promise<T>,
 	observe?: (response: Response) => void | Promise<void>,
@@ -186,6 +187,7 @@ export async function request<T>(
 	});
 	try {
 		const send = options.fetch ?? (fetch as unknown as typeof globalThis.fetch);
+		let currentInit = init;
 		for (let retries = 0; ; retries++) {
 			signal.throwIfAborted();
 			const attemptSignal = AbortSignal.any([
@@ -197,7 +199,7 @@ export async function request<T>(
 			let delay = 0;
 			try {
 				response = await send(url, {
-					...init,
+					...currentInit,
 					signal: attemptSignal,
 					dispatcher,
 				} as RequestInit);
@@ -214,11 +216,15 @@ export async function request<T>(
 			} catch (caught) {
 				if (signal.aborted) throw signal.reason;
 				const error = attemptSignal.aborted ? attemptSignal.reason : caught;
+				const recover422 =
+					error instanceof GigaChatHttpError && error.status === 422
+						? options.recover422
+						: undefined;
 				if (
 					maxRetries === 0 ||
 					observing ||
 					options.canRetry?.() === false ||
-					!transient(error)
+					(!recover422 && !transient(error))
 				) {
 					if (
 						error instanceof Error &&
@@ -242,6 +248,7 @@ export async function request<T>(
 						error,
 						"server requested a wait longer than 600 seconds",
 					);
+				if (recover422) currentInit = recover422(currentInit);
 			} finally {
 				// Release each attempt's body before waiting or reusing the connection.
 				if (response?.body && !response.body.locked)

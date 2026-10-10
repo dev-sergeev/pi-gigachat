@@ -139,14 +139,28 @@ Sampling settings are otherwise left to the model unless explicitly supplied.
 
 ### Retries
 
-The provider retries transient HTTP 408/429/5xx responses, HTTP 422 responses
-whose JSON body has a top-level `"error": "EventException"`, per-attempt timeouts
-and temporary connection failures. Other HTTP 422 responses are not retried.
+The provider retries transient HTTP 408/429/5xx responses, per-attempt timeouts
+and temporary connection failures. For chat generation, **every HTTP 422 response**
+is retried regardless of its body, including parameter and quota diagnostics.
+For other API requests, HTTP 422 is retried only when its JSON body has a
+top-level `"error": "EventException"` and does not indicate quota exhaustion.
 By default, it makes **up to 10 retries after the first attempt**: at most 11 HTTP
 attempts for one request. This also applies to token exchange and refresh.
-Authentication/parameter errors, HTTP 413 context overflow, known quota exhaustion,
-certificate errors and malformed responses are returned immediately for the caller
-to handle.
+Other authentication/parameter errors, HTTP 413 context overflow, known quota
+exhaustion outside chat HTTP 422, certificate errors and malformed successful
+responses are returned immediately for the caller to handle.
+
+After the first chat HTTP 422 with a retry available, the adapter appends one
+temporary final `user` message:
+
+> Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.
+
+This message remains in subsequent attempts of that generation without duplication,
+including attempts after other transient failures. All errors share the existing
+retry budget and backoff; adding the instruction does not reset either.
+The message is never saved in Pi's conversation history and is absent from the next
+generation after success, exhaustion or cancellation. Existing system instructions
+and a custom `GIGACHAT_SYSTEM_PROMPT` are unchanged.
 
 Retry waits use `min(baseDelayMs * 2^retryIndex, 600000)`, with a zero-based retry
 index. The default waits are **1, 2, 4, 8, 16, 32, 64, 128, 256, 512 seconds**.
