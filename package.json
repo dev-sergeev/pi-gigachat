@@ -1,6 +1,6 @@
 {
 	"name": "@dev-sergeev/pi-gigachat",
-	"version": "0.5.0",
+	"version": "0.5.1",
 	"description": "GLM 5.2 and Qwen 3.5 provider for pi-coding-agent via a GigaChat-compatible API",
 	"private": false,
 	"type": "module",

@@ -14,9 +14,10 @@ models from each server's catalog.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
-## Unreleased
+## Release 0.5.1
 
 - Added per-model temperature settings to `/gigachat`, persisted with each server connection and sent with generation requests.
+- Added recovery after HTTP 422 during generation with a temporary single-tool instruction scoped to retries of that generation; Pi history and subsequent generations remain unchanged.
 
 ## Release 0.5.0
 
@@ -30,7 +31,7 @@ under its original MIT license.
 With Pi 0.85.1 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.5.0
+pi install npm:@dev-sergeev/pi-gigachat@0.5.1
 pi
 ```
 
