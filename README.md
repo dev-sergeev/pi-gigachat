@@ -14,6 +14,10 @@ models from each server's catalog.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Unreleased
+
+- Added per-model temperature settings to `/gigachat`, persisted with each server connection and sent with generation requests.
+
 ## Release 0.5.0
 
 - Added the `/gigachat` wizard for independent server connections and model discovery.
@@ -277,7 +281,12 @@ Valid catalog context/output/reasoning metadata is used when available. Missing
 metadata defaults to **200,000 context tokens**, **64,000 output tokens**, and
 reasoning levels **off / low / medium / high**. Under `/gigachat` →
 **Управление подключениями** → **Параметры моделей**, edit the context/output
-budgets or disable reasoning support for servers that do not accept it. Use Pi's
+budgets, set **Температура**, or disable reasoning support for servers that do not
+accept it. Temperature accepts finite numbers greater than or equal to zero,
+including `0`. Leave the field empty to omit `temperature` and use the server's
+default. The saved value applies to generation requests, including tool follow-ups
+and summaries; an explicit programmatic `temperature` overrides this default.
+Existing connections without a temperature retain their previous behavior. Use Pi's
 normal thinking controls to choose a supported reasoning level. Model pricing is
 not inferred from the catalog; zero-valued Pi cost estimates are not a free-tier
 claim.

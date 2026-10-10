@@ -9,6 +9,7 @@ export interface ConnectionModel {
 	name: string;
 	contextWindow: number;
 	maxTokens: number;
+	temperature?: number;
 	reasoning: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 }

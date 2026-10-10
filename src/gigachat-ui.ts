@@ -468,12 +468,19 @@ export async function registerGigaChatCommand(
 		let values = {
 			context: String(model.contextWindow),
 			output: String(model.maxTokens),
+			temperature:
+				model.temperature === undefined ? "" : String(model.temperature),
 			reasoning: model.reasoning ? "Поддерживается" : "Не поддерживается",
 		};
 		for (;;) {
 			const entered = await showForm(ctx, `Параметры · ${model.id}`, [
 				{ id: "context", label: "Лимит контекста", value: values.context },
 				{ id: "output", label: "Лимит ответа", value: values.output },
+				{
+					id: "temperature",
+					label: "Температура (пусто — по умолчанию)",
+					value: values.temperature,
+				},
 				{
 					id: "reasoning",
 					label: "Reasoning",
@@ -485,6 +492,7 @@ export async function registerGigaChatCommand(
 			values = {
 				context: entered.context,
 				output: entered.output,
+				temperature: entered.temperature,
 				reasoning: entered.reasoning,
 			};
 			const contextWindow = Number(values.context);
@@ -501,11 +509,26 @@ export async function registerGigaChatCommand(
 				);
 				continue;
 			}
+			const temperature =
+				values.temperature.trim() === ""
+					? undefined
+					: Number(values.temperature);
+			if (
+				temperature !== undefined &&
+				(!Number.isFinite(temperature) || temperature < 0)
+			) {
+				ctx.ui.notify(
+					"Температура должна быть конечным числом не меньше 0.",
+					"error",
+				);
+				continue;
+			}
 			const reasoning = values.reasoning === "Поддерживается";
 			const edited: ConnectionModel = {
 				...model,
 				contextWindow,
 				maxTokens,
+				temperature,
 				reasoning,
 				thinkingLevelMap: reasoning
 					? (model.thinkingLevelMap ??

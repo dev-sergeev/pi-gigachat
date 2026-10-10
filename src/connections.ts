@@ -16,7 +16,11 @@ import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
 import { baseUrl, exchange } from "./auth.js";
-import type { Connection, ConnectionCredential } from "./connection-types.js";
+import type {
+	Connection,
+	ConnectionCredential,
+	ConnectionModel,
+} from "./connection-types.js";
 import { GigaChatHttpError, object } from "./http.js";
 import { GIGACHAT_API } from "./models.js";
 import { streamSimpleGigaChat } from "./stream.js";
@@ -107,6 +111,13 @@ function validConnection(value: unknown): value is Connection {
 			Number(model.contextWindow) < 1 ||
 			!Number.isSafeInteger(model.maxTokens) ||
 			Number(model.maxTokens) < 1
+		)
+			return false;
+		if (
+			model.temperature !== undefined &&
+			(typeof model.temperature !== "number" ||
+				!Number.isFinite(model.temperature) ||
+				model.temperature < 0)
 		)
 			return false;
 		if (
@@ -267,16 +278,17 @@ export function createConnectionProvider(
 	const saved = structuredClone(connection);
 	const endpoint = baseUrl(saved.baseUrl);
 	if (loginCredential) currentCredential(loginCredential, saved);
-	const models: Model<typeof GIGACHAT_API>[] = saved.models.map((model) => ({
-		...model,
-		name: `${model.name} — ${saved.name}`,
-		api: GIGACHAT_API,
-		provider: saved.id,
-		baseUrl: endpoint,
-		input: ["text"],
-		// Unknown USD prices; zero is not a free-tier claim.
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	}));
+	const models: (Model<typeof GIGACHAT_API> & ConnectionModel)[] =
+		saved.models.map((model) => ({
+			...model,
+			name: `${model.name} — ${saved.name}`,
+			api: GIGACHAT_API,
+			provider: saved.id,
+			baseUrl: endpoint,
+			input: ["text"],
+			// Unknown USD prices; zero is not a free-tier claim.
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		}));
 	const selected = new Map(models.map((model) => [model.id, model]));
 	const auth: ProviderAuth = {};
 	if (saved.authorization.type === "token") {
@@ -353,6 +365,7 @@ export function createConnectionProvider(
 		if (!current || model.provider !== saved.id) throw stale();
 		return streamSimpleGigaChat(current, context, {
 			...options,
+			temperature: options.temperature ?? current.temperature,
 			// These legacy overrides must not redirect a connection or its selected Model ID.
 			env: {
 				...options.env,
