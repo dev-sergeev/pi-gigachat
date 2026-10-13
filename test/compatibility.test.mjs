@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { isContextOverflow } from '@earendil-works/pi-ai';
-import { ask, completion, json, testModel, user, withServer } from './helpers.mjs';
+import { ask, completion, json, reply, testModel, user, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
 const toolResult = (call, text) => ({ role: 'toolResult', toolCallId: call.id, toolName: call.name, content: [{ type: 'text', text }], isError: false, timestamp: 0 });
@@ -41,24 +41,60 @@ test('Unicode survives system prompt, history, tool arguments and tool results',
   }, (_req, res) => json(res, completion({ role: 'assistant', content: '🙂', function_call: { name: 'read', arguments: { path: '🚀' } } }, 'function_call')));
 });
 
-test('function state survives session serialization and tool call ids are unique', async () => {
+test('restored tool calls omit function state and keep unique call ids', async () => {
   await withServer(async ({ model, requests }) => {
     const first = await ask(model);
     const restored = JSON.parse(JSON.stringify(first));
     const call = restored.content.find(b => b.type === 'toolCall');
     const second = await ask(model, { messages: [user('read'), restored, toolResult(call, 'contents')] });
-    assert.equal(requests[1].body.messages.find(m => m.role === 'assistant').functions_state_id, 'state-fixture');
+    assert(!Object.hasOwn(requests[1].body.messages.find(m => m.role === 'assistant'), 'functions_state_id'));
     assert.notEqual(second.content.find(b => b.type === 'toolCall').id, call.id);
   }, (_req, res) => json(res, completion({ role: 'assistant', content: '', functions_state_id: 'state-fixture', function_call: { name: 'read', arguments: { path: 'a' } } }, 'function_call')));
 });
 
-test('text-only replies also preserve function state for subsequent turns', async () => {
+test('text-only replies omit function state on subsequent turns without changing saved history', async () => {
   await withServer(async ({ model, requests }) => {
     const first = await ask(model);
-    await ask(model, { messages: [user('hello'), JSON.parse(JSON.stringify(first)), user('next')] });
-    assert.equal(requests[1].body.messages.find(m => m.role === 'assistant').functions_state_id, 'text-state');
+    const restored = JSON.parse(JSON.stringify(first));
+    const original = structuredClone(restored);
+    await ask(model, { messages: [user('hello'), restored, user('next')] });
+    assert.deepEqual(requests[1].body.messages.find(m => m.role === 'assistant'), { role: 'assistant', content: 'OK' });
+    assert.deepEqual(restored, original);
   }, (_req, res) => json(res, completion({ role: 'assistant', content: 'OK', functions_state_id: 'text-state' })));
 });
+
+for (const streaming of [false, true]) {
+  test(`outgoing messages omit function state without changing tool arguments or caller data (stream=${streaming})`, async () => {
+    await withServer(async ({ model, requests }) => {
+      const messages = [
+        { role: 'user', content: 'Continue', functions_state_id: null },
+        { role: 'assistant', content: '', reasoning_content: 'The', functions_state_id: 'old-state',
+          function_call: { name: 'bash', arguments: { command: 'head -50', functions_state_id: 'tool-input' } } },
+        { role: 'function', name: 'bash', content: '{"result":"contents"}', functions_state_id: '' },
+        { role: 'assistant', content: 'Done', functions_state_id: 'text-state' },
+      ];
+      const original = structuredClone(messages);
+      const result = await ask(model, undefined, {
+        env: { GIGACHAT_STREAM: String(streaming) },
+        onPayload: body => ({ ...body, messages }),
+      });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+      assert.deepEqual(requests[0].body.messages, [
+        { role: 'user', content: 'Continue' },
+        { role: 'assistant', content: '', reasoning_content: 'The',
+          function_call: { name: 'bash', arguments: { command: 'head -50', functions_state_id: 'tool-input' } } },
+        { role: 'function', name: 'bash', content: '{"result":"contents"}' },
+        { role: 'assistant', content: 'Done' },
+      ]);
+      assert.deepEqual(messages, original);
+    }, (req, res) => {
+      if (req.body.messages.some(message => Object.hasOwn(message, 'functions_state_id'))) {
+        return json(res, { message: 'functions_state_id is not accepted' }, 400);
+      }
+      reply(req, res, completion());
+    });
+  });
+}
 
 test('parallel tool history from another provider is replayed as complete sequential pairs', async () => {
   await withServer(async ({ model, requests }) => {

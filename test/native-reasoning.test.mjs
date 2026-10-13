@@ -25,7 +25,7 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       assert(pi.events.some(e => e.type === 'tool_execution_end' && !e.isError));
       const followup = requests[1].body.messages.find(m => m.role === 'assistant');
       assert.equal(followup.reasoning_content, reasoningInContent ? undefined : toolThought);
-      assert.equal(followup.functions_state_id, 'native-reasoning-state');
+      assert(!Object.hasOwn(followup, 'functions_state_id'));
       assert.equal(followup.content, reasoningInContent ? `<previous_reasoning>\n${toolThought}\n</previous_reasoning>` : '');
       const messages = (await pi.command('get_messages')).data.messages;
       const assistants = messages.filter(m => m.role === 'assistant');
@@ -50,7 +50,7 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
         assert.equal(replayed[0].content, `<previous_reasoning>\n${toolThought}\n</previous_reasoning>`);
         assert.equal(replayed[1].content, `<previous_reasoning>\n${answerThought}\n</previous_reasoning>\n\nThe file contains NATIVE_REASONING_FIXTURE_742.`);
       } else assert.deepEqual(replayed.map(m => m.reasoning_content), [toolThought, answerThought]);
-      assert.equal(replayed[0].functions_state_id, 'native-reasoning-state');
+      assert(replayed.every(m => !Object.hasOwn(m, 'functions_state_id')));
       for (let i = 0; i < 3; i++) await pi.prompt(`Keep the file fact ${i}. ${'conversation '.repeat(200)}`);
       const compacted = await pi.command('compact');
       assert.equal(compacted.success, true, compacted.error);

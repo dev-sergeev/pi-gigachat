@@ -49,7 +49,7 @@ for (const streaming of [false, true]) test(`reasoning survives a tool response,
     const messages = requests[1].body.messages;
     const replay = messages.find(message => message.role === 'assistant');
     assert.deepEqual(replay, { role: 'assistant', content: '', reasoning_content: reasoning,
-      function_call: { name: 'bash', arguments: { command: 'cd /home ' } }, functions_state_id: state });
+      function_call: { name: 'bash', arguments: { command: 'cd /home ' } } });
     assert.equal(messages[messages.indexOf(replay) + 1].role, 'function');
   }, (req, res, requests) => reply(req, res, requests.length === 1 ? fixture : completion()));
 });
@@ -92,16 +92,16 @@ test('redacted and failed reasoning is not replayed as plaintext reasoning_conte
 });
 
 for (const streaming of [false, true]) {
-  test(`reasoning-only length responses remain visible and replayable with function state (stream=${streaming})`, async () => {
-    await withServer(async ({ model }) => {
+  test(`reasoning-only length responses remain visible and replay without function state (stream=${streaming})`, async () => {
+    await withServer(async ({ model, requests }) => {
       const { result, events } = await collect(model, undefined, { stream: streaming });
       assert.equal(result.stopReason, 'length', result.errorMessage);
       assert.equal(result.content[0].thinking, 'Still thinking.');
       assert.equal(events.filter(e => e.type === 'thinking_end').length, 1);
-      const [message] = convertMessages(model, { messages: [JSON.parse(JSON.stringify(result))] });
-      assert.equal(message.reasoning_content, 'Still thinking.');
-      assert.equal(message.functions_state_id, state);
-      assert.equal(message.content, '');
+      const next = await collect(model, { messages: [JSON.parse(JSON.stringify(result)), user('Continue')] }, { stream: streaming });
+      assert.equal(next.result.stopReason, 'length', next.result.errorMessage);
+      assert.deepEqual(requests[1].body.messages.find(m => m.role === 'assistant'),
+        { role: 'assistant', reasoning_content: 'Still thinking.', content: '' });
     }, (req, res) => reply(req, res, completion({ role: 'assistant', content: '', reasoning_content: 'Still thinking.', functions_state_id: state }, 'length')));
   });
 

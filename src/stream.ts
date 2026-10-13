@@ -153,6 +153,22 @@ export function streamSimpleGigaChat(
 			}
 			// This switch controls both the wire format and its parser.
 			body.stream = streaming;
+			// Sanitize the final messages, including payload overrides, without
+			// mutating caller-owned history or nested function arguments.
+			if (Array.isArray(body.messages)) {
+				const messages = body.messages;
+				let cleaned = messages;
+				for (let i = 0; i < messages.length; i++) {
+					const message = messages[i];
+					if (object(message) && Object.hasOwn(message, "functions_state_id")) {
+						if (cleaned === messages) cleaned = messages.slice();
+						const copy = { ...message };
+						delete copy.functions_state_id;
+						cleaned[i] = copy;
+					}
+				}
+				body.messages = cleaned;
+			}
 			let recoveryAdded = false;
 			stream.push({ type: "start", partial: output });
 			await serial(signal, () =>

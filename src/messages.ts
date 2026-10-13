@@ -15,7 +15,6 @@ interface GigaChatMessage {
 	content: string;
 	reasoning_content?: string;
 	name?: string;
-	functions_state_id?: string;
 	function_call?: { name: string; arguments: Record<string, unknown> };
 }
 
@@ -99,7 +98,6 @@ export function convertMessages(
 						content: callIndex === 0 ? content : "",
 						...(callIndex === 0 ? reasoning : {}),
 						function_call: { name: call.name, arguments: call.arguments },
-						functions_state_id: readStateSignature(call.thoughtSignature),
 					});
 					const result = results.get(call.id);
 					results.delete(call.id);
@@ -116,18 +114,10 @@ export function convertMessages(
 					messages.push(unmatchedToolResult(result));
 				}
 			} else {
-				const signature = message.content.find(
-					(block) =>
-						block.type === "text" && readStateSignature(block.textSignature),
-				);
 				messages.push({
 					role: "assistant",
 					content,
 					...reasoning,
-					functions_state_id:
-						signature?.type === "text"
-							? readStateSignature(signature.textSignature)
-							: undefined,
 				});
 			}
 			continue;
@@ -147,12 +137,6 @@ function unmatchedToolResult(message: ToolResultMessage): GigaChatMessage {
 		role: "user",
 		content: `Tool result (${message.toolName}):\n${toolResultText(message)}`,
 	};
-}
-
-function readStateSignature(signature?: string): string | undefined {
-	return signature?.startsWith(STATE_SIGNATURE_PREFIX)
-		? signature.slice(STATE_SIGNATURE_PREFIX.length)
-		: undefined;
 }
 
 function toolResultText(message: ToolResultMessage): string {

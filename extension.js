@@ -717,8 +717,7 @@ ${text}` : ""}` : text;
             role: "assistant",
             content: callIndex === 0 ? content : "",
             ...callIndex === 0 ? reasoning : {},
-            function_call: { name: call.name, arguments: call.arguments },
-            functions_state_id: readStateSignature(call.thoughtSignature)
+            function_call: { name: call.name, arguments: call.arguments }
           });
           const result = results.get(call.id);
           results.delete(call.id);
@@ -735,14 +734,10 @@ ${text}` : ""}` : text;
           messages.push(unmatchedToolResult(result));
         }
       } else {
-        const signature = message.content.find(
-          (block) => block.type === "text" && readStateSignature(block.textSignature)
-        );
         messages.push({
           role: "assistant",
           content,
-          ...reasoning,
-          functions_state_id: signature?.type === "text" ? readStateSignature(signature.textSignature) : void 0
+          ...reasoning
         });
       }
       continue;
@@ -758,9 +753,6 @@ function unmatchedToolResult(message) {
     content: `Tool result (${message.toolName}):
 ${toolResultText(message)}`
   };
-}
-function readStateSignature(signature) {
-  return signature?.startsWith(STATE_SIGNATURE_PREFIX) ? signature.slice(STATE_SIGNATURE_PREFIX.length) : void 0;
 }
 function toolResultText(message) {
   const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n") || "(no content)";
@@ -879,6 +871,20 @@ function streamSimpleGigaChat(model, context, options = {}) {
         body = modified;
       }
       body.stream = streaming;
+      if (Array.isArray(body.messages)) {
+        const messages = body.messages;
+        let cleaned = messages;
+        for (let i = 0; i < messages.length; i++) {
+          const message = messages[i];
+          if (object(message) && Object.hasOwn(message, "functions_state_id")) {
+            if (cleaned === messages) cleaned = messages.slice();
+            const copy = { ...message };
+            delete copy.functions_state_id;
+            cleaned[i] = copy;
+          }
+        }
+        body.messages = cleaned;
+      }
       let recoveryAdded = false;
       stream.push({ type: "start", partial: output });
       await serial(

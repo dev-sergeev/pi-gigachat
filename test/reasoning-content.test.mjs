@@ -26,7 +26,7 @@ for (const streaming of [false, true]) for (const enabled of [undefined, 'false'
         assert.equal(result.stopReason, 'stop', result.errorMessage);
         const replay = requests.at(-1).body.messages.find(m => m.role === 'assistant');
         assert.deepEqual(replay, { role: 'assistant', content: enabled === 'true' ? `${wrapped}\n\n${answer}` : answer,
-          ...(enabled === 'true' ? {} : { reasoning_content: thought }), functions_state_id: 'text-state' });
+          ...(enabled === 'true' ? {} : { reasoning_content: thought }) });
         assert.deepEqual(context, original, 'wire transformation must not modify stored thinking or answer');
       }
       assert.deepEqual(requests[0].body, requests[1].body, 'repeated sends must not accumulate wrappers');
@@ -38,7 +38,7 @@ for (const streaming of [false, true]) for (const enabled of [undefined, 'false'
   });
 }
 
-test('content fallback retains tool pairs and function state without repeating reasoning for multiple calls', async () => {
+test('content fallback retains tool pairs without function state or repeated reasoning for multiple calls', async () => {
   await withServer(async ({ model, requests }) => {
     const calls = ['read', 'bash'].map((name, index) => ({ type: 'toolCall', id: `call-${index}`, name,
       arguments: { value: index }, thoughtSignature: `gigachat:functions_state_id:state-${index}` }));
@@ -54,7 +54,7 @@ test('content fallback retains tool pairs and function state without repeating r
     assert(!messages.some(m => Object.hasOwn(m, 'reasoning_content')));
     for (const index of [0, 1]) {
       assert.deepEqual(messages[index * 2].function_call, { name: calls[index].name, arguments: calls[index].arguments });
-      assert.equal(messages[index * 2].functions_state_id, `state-${index}`);
+      assert(!Object.hasOwn(messages[index * 2], 'functions_state_id'));
       assert.equal(JSON.parse(messages[index * 2 + 1].content).result, 'Fixture');
     }
   });

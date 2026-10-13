@@ -393,10 +393,16 @@ Pi displays these blocks and saves them in its session history. `Ctrl+T` toggles
 their visibility without removing them from history. By default, on subsequent requests to
 the same provider/API/model, the adapter restores the complete reasoning text in
 the assistant message's `reasoning_content` field, alongside `content`,
-`function_call` and `functions_state_id`. Whitespace and streamed fragments are
+`function_call`. Whitespace and streamed fragments are
 preserved without adding separators. Tool follow-ups and resumed sessions use
 the same path. Responses labeled `glm-5.2:latest` keep the selected `glm-5.2`
 session identity, so that alias does not interrupt replay.
+
+For all connections and models, the adapter removes `functions_state_id` from
+every message in the final outgoing `messages` array, including payload
+overrides. This avoids API errors when replaying function state. Stored Pi
+history and response parsing are unchanged; nested function arguments are not
+modified.
 
 History follows Pi's normal rules: aborted/failed assistant turns are excluded
 from requests, while model switches convert non-redacted thinking into ordinary
@@ -436,10 +442,9 @@ The original assistant answer, if any.
 
 The separate `reasoning_content` field is omitted in this mode to avoid sending
 the same reasoning twice. Empty reasoning adds no marker. Replies containing
-only reasoning and a tool call also receive this content; `function_call`,
-`functions_state_id`, and the corresponding tool results are preserved. For
-multiple tool calls in imported history, the reasoning is included once, with
-the first call.
+only reasoning and a tool call also receive this content; `function_call`
+and the corresponding tool results are preserved. For multiple tool calls in
+imported history, the reasoning is included once, with the first call.
 
 This transformation happens only when building requests, including tool
 follow-ups and resumed sessions. Pi still displays and stores native `thinking`
