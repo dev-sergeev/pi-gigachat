@@ -18,7 +18,7 @@ const recoveryMessage = { role: 'user', content: recoveryInstruction };
 for (const streaming of [false, true]) test(`422 recovery is request-local across mixed failures (stream=${streaming})`, async () => {
   const context = { messages: [user('Run the tool'), {
     role: 'assistant', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: { path: 'fixture.txt' } }],
-    api: 'gigachat-extension-api', provider: 'gigachat', model: 'Qwen3.5-397b', stopReason: 'toolUse', timestamp: 0,
+    api: 'gigachat-extension-api', provider: 'gigachat', model: 'test-model', stopReason: 'toolUse', timestamp: 0,
   }, { role: 'toolResult', toolCallId: 'call-1', toolName: 'read', content: [{ type: 'text', text: 'file contents' }], isError: false, timestamp: 0 }] };
   const original = structuredClone(context);
   await withServer(async ({ model, requests }) => {
@@ -298,7 +298,7 @@ test('OAuth and chat retries receive scoped environment settings', async () => {
   await withServer(async ({ model, baseUrl, requests }) => {
     const env = { GIGACHAT_CREDENTIALS: 'synthetic.retry.credentials', GIGACHAT_AUTH_URL: baseUrl + '/oauth', GIGACHAT_MAX_RETRIES: '1', ...fast };
     const models = createModels({ authContext: { env: async name => env[name], fileExists: async () => false } });
-    models.setProvider(gigachatProvider);
+    models.setProvider({ ...gigachatProvider, getModels: () => [model] });
     const result = await models.completeSimple(model, { messages: [user('Hi')] });
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.equal(requests.filter(r => r.url.endsWith('/oauth')).length, 2);

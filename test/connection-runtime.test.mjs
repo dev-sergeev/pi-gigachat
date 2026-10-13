@@ -7,8 +7,8 @@ import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { ConnectionStore, prepareConnectionCredential } from '../dist/connections.js';
-import { cleanEnv, completion, reply, withServer } from './helpers.mjs';
-import { cliPath, until } from './pi-rpc.mjs';
+import { cleanEnv, completion, reply, testModel, withServer } from './helpers.mjs';
+import { cliPath, until, writeModelFixture } from './pi-rpc.mjs';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const modelId = 'saved-private-model';
@@ -50,6 +50,7 @@ async function withSavedPi(defaultConnection, records, run, runtime = {}) {
   let current;
   try {
     await mkdir(agentDir);
+    const fixturePath = runtime.fixtureModels?.length ? await writeModelFixture(agentDir, runtime.fixtureModels) : undefined;
     await writeFile(join(agentDir, 'settings.json'), JSON.stringify({
       packages: [repo],
       defaultProvider: defaultConnection.id,
@@ -58,6 +59,7 @@ async function withSavedPi(defaultConnection, records, run, runtime = {}) {
       compaction: { enabled: false },
       ...runtime.settings,
     }));
+    const initialSettings = await readFile(join(agentDir, 'settings.json'), 'utf8');
     for (const [entry, secret] of records) await saveConnection(authPath, entry, secret);
 
     async function start() {
@@ -67,6 +69,7 @@ async function withSavedPi(defaultConnection, records, run, runtime = {}) {
       let stderr = '';
       let closed = false;
       const child = spawn(process.execPath, [cliPath, '--mode', 'rpc', '--session', sessionFile,
+        ...(fixturePath ? ['--extension', fixturePath] : []),
         '--no-tools', '--no-skills', '--no-prompt-templates'], {
         cwd: dir,
         env: { ...cleanEnv(), HOME: dir, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', ...runtime.env },
@@ -105,7 +108,7 @@ async function withSavedPi(defaultConnection, records, run, runtime = {}) {
         } finally { pending.delete(id); }
       };
       current = {
-        events, agentDir,
+        events, agentDir, initialSettings,
         command,
         async prompt(message) {
           const offset = events.length;
@@ -160,6 +163,10 @@ async function assertSelected(pi, entry) {
   assert.equal(state.data.model.baseUrl, entry.baseUrl);
   assert.equal(state.data.model.contextWindow, entry.models[0].contextWindow);
   assert.equal(state.data.model.maxTokens, entry.models[0].maxTokens);
+  assert.equal(state.data.model.reasoning, entry.models[0].reasoning);
+  assert.equal(state.data.model.temperature, entry.models[0].temperature);
+  assert.equal(await readFile(join(pi.agentDir, 'settings.json'), 'utf8'), pi.initialSettings,
+    'Restoring or selecting a saved connection must preserve Pi settings');
 }
 
 async function assertSuccessfulPrompt(pi, entry, text) {
@@ -187,11 +194,14 @@ test('native CLI restores a configured private default and resumes an RPC-select
   await withServer(async ({ baseUrl, requests }) => {
     const configured = connection('configured-default', baseUrl);
     const selected = connection('session-selected', baseUrl);
+    configured.models[0].temperature = 0.27;
+    selected.models[0].temperature = 0.41;
     await withSavedPi(configured, [[configured, '!configured-literal-token'], [selected, '$selected-literal-token']], async (pi, restart) => {
       await assertSelected(pi, configured);
       assertGenerationsOnly(requests, []);
       await assertSuccessfulPrompt(pi, configured, 'Use the configured private default.');
       assertGenerationsOnly(requests, ['!configured-literal-token']);
+      assert.equal(requests[0].body.temperature, 0.27);
 
       const changed = await pi.command('set_model', { provider: selected.id, modelId });
       assert.equal(changed.success, true, changed.error);
@@ -210,6 +220,7 @@ test('native CLI restores a configured private default and resumes an RPC-select
       assert(messages.data.messages.some(message => message.role === 'user' && message.content.some(block => block.type === 'text' && block.text.includes('PRIVATE-RESUME-42'))));
       await assertSuccessfulPrompt(pi, selected, 'Continue the resumed private conversation.');
       assertGenerationsOnly(requests, ['!configured-literal-token', '$selected-literal-token', '$selected-literal-token']);
+      assert.deepEqual(requests.map(request => request.body.temperature), [0.27, 0.41, 0.41]);
       assert(requests.at(-1).body.messages.some(message => message.role === 'user' && message.content.includes('PRIVATE-RESUME-42')));
     });
   }, respond);
@@ -252,10 +263,10 @@ test('an open native Pi refuses a changed saved connection before HTTP and resta
   }, respond), respond);
 });
 
-test('resuming a real legacy GigaChat session does not switch to a newly saved private global default', { timeout: 60000 }, async () => {
+test('resuming a consumer-configured GigaChat session does not switch to a newly saved private global default', { timeout: 60000 }, async () => {
   await withServer(async legacyServer => withServer(async privateServer => {
     const saved = connection('not-the-resumed-session', privateServer.baseUrl);
-    const legacyModel = 'Qwen3.5-397b';
+    const legacyModel = 'consumer-resumed-model';
     const legacyToken = 'legacy-resumed-token';
     await withSavedPi(saved, [[saved, 'unused-private-default-token']], async (pi, restart) => {
       let state = await pi.command('get_state');
@@ -289,6 +300,7 @@ test('resuming a real legacy GigaChat session does not switch to a newly saved p
       assert(legacyServer.requests.at(-1).body.messages.some(message => message.role === 'user' && message.content.includes('LEGACY-RESUME-42')));
     }, {
       settings: { defaultProvider: 'gigachat', defaultModel: legacyModel },
+      fixtureModels: [testModel({ id: legacyModel, baseUrl: legacyServer.baseUrl, maxTokens: 32768 })],
       env: { GIGACHAT_BASE_URL: legacyServer.baseUrl, GIGACHAT_ACCESS_TOKEN: legacyToken },
     });
   }, respond), respond);
@@ -299,7 +311,7 @@ test('restarting a deleted private session refuses prompts and compaction until 
     const saved = connection('deleted-before-restart', privateServer.baseUrl);
     const privateToken = 'deleted-session-token';
     const fallbackToken = 'explicitly-selected-legacy-token';
-    const legacyModel = 'Qwen3.5-397b';
+    const legacyModel = 'consumer-fallback-model';
     await withSavedPi(saved, [[saved, privateToken]], async (pi, restart, authPath) => {
       await assertSelected(pi, saved);
       await assertSuccessfulPrompt(pi, saved, 'Remember the first real history turn. ' + 'history '.repeat(512));
@@ -346,6 +358,10 @@ test('restarting a deleted private session refuses prompts and compaction until 
       assertGenerationsOnly(fallbackServer.requests, [fallbackToken], 32768, legacyModel);
     }, {
       settings: { compaction: { enabled: false, reserveTokens: 16384, keepRecentTokens: 256 } },
+      fixtureModels: [
+        testModel({ id: 'aaa-consumer-initial-model', baseUrl: fallbackServer.baseUrl, maxTokens: 32768 }),
+        testModel({ id: legacyModel, baseUrl: fallbackServer.baseUrl, maxTokens: 32768 }),
+      ],
       env: { GIGACHAT_BASE_URL: fallbackServer.baseUrl, GIGACHAT_ACCESS_TOKEN: fallbackToken },
     });
   }, respond), respond);

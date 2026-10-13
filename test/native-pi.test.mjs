@@ -46,18 +46,3 @@ for (const streaming of [false, true]) test(`native pi uses GigaChat tools, comp
     } else reply(req, res, completion({ role: 'assistant', content: summarizing ? summary : 'Remembered GIGA-NATIVE-42.' }));
   });
 });
-
-test('native pi selects GLM 5.2 with its context and output budgets', { timeout: 30000 }, async () => {
-  await withServer(async ({ baseUrl, requests }) => {
-    await withPi(baseUrl, async pi => {
-      const state = await pi.command('get_state');
-      assert.equal(state.data.model.id, 'glm-5.2');
-      assert.equal(state.data.model.contextWindow, 200000);
-      assert.equal(state.data.model.maxTokens, 64000);
-      await pi.prompt('Say hello.');
-      assert.equal(requests[0].body.model, 'glm-5.2');
-      assert.equal(requests[0].body.max_tokens, 64000);
-      assert(requests[0].body.messages[0].content.endsWith(singleToolInstruction));
-    }, {}, { model: 'glm-5.2' });
-  });
-});

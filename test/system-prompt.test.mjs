@@ -62,7 +62,7 @@ test('native auth context forwards provider instructions to the adapter', async 
   await withServer(async ({ model, requests }) => {
     const env = { GIGACHAT_ACCESS_TOKEN: token, GIGACHAT_SYSTEM_PROMPT: extra };
     const models = createModels({ authContext: { env: async name => env[name], fileExists: async () => false } });
-    models.setProvider(gigachatProvider);
+    models.setProvider({ ...gigachatProvider, getModels: () => [model] });
     const result = await models.completeSimple(model, { systemPrompt: 'Original pi prompt.', messages: [user('Hello')] });
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.equal(requests[0].body.messages[0].content, 'Original pi prompt.\n\n' + extra);

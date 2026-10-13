@@ -1,23 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
-import { GIGACHAT_MODELS } from '../dist/models.js';
-import { ask, completion, reply, user, withServer } from './helpers.mjs';
+import { ask, completion, reply, testModel, user, withServer } from './helpers.mjs';
 import { withPi } from './pi-rpc.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
 
 const levels = ['off', 'low', 'medium', 'high'];
-const models = ['glm-5.2', 'Qwen3.5-397b'].map(id => GIGACHAT_MODELS.find(model => model.id === id));
+const models = [testModel({ id: 'test-reasoning-model' })];
 
-test('GLM and Qwen expose exactly the requested thinking levels', () => {
+test('consumer-configured reasoning models expose exactly the requested thinking levels', () => {
   for (const model of models) {
-    assert(model);
-    assert.equal(model.reasoning, true);
     assert.deepEqual(getSupportedThinkingLevels(model), levels);
   }
-  assert.equal(models[1].contextWindow, 262144);
-  assert.equal(models[1].maxTokens, 32768);
 });
 
 for (const selected of models)

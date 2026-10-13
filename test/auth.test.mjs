@@ -2,17 +2,29 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createModels, InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { gigachatProvider } from '../dist/index.js';
-import { completion, json, token, user, withServer } from './helpers.mjs';
+import { completion, json, testModel, token, user, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
 const credentials = Buffer.from('synthetic:credentials').toString('base64');
 const tokenResponse = () => ({ access_token: token, expires_at: Date.now() + 1800000 });
 function collection(env = {}, store = new InMemoryCredentialStore()) {
   const models = createModels({ credentials: store, authContext: { env: async name => env[name], fileExists: async () => false } });
-  models.setProvider(gigachatProvider);
+  models.setProvider({ ...gigachatProvider, getModels: () => [testModel()] });
   return models;
 }
 const context = { messages: [user('Hello')] };
+
+test('programmatic consumers explicitly register their own model catalog', () => {
+  const models = createModels();
+  models.setProvider(gigachatProvider);
+  assert.equal(models.getModel('gigachat', 'test-model'), undefined);
+  const consumer = testModel({ id: 'consumer-owned-model', name: 'Consumer-owned model', maxTokens: 2048 });
+  models.setProvider({ ...gigachatProvider, getModels: () => [consumer] });
+  const registered = models.getModel('gigachat', consumer.id);
+  assert.equal(registered.id, consumer.id);
+  assert.equal(registered.name, consumer.name);
+  assert.equal(registered.maxTokens, consumer.maxTokens);
+});
 
 test('native OAuth login persists a canonical credential and keeps a custom endpoint on refresh', async () => {
   await withServer(async ({ baseUrl, model, requests }) => {
@@ -115,7 +127,7 @@ test('stored OAuth endpoint wins over ambient base URL; explicit request env can
   await store.modify('gigachat', async () => ({ type: 'oauth', access: token, refresh: credentials,
     expires: Date.now() + 1800000, baseUrl: 'https://saved.example/v1' }));
   const models = collection({}, store);
-  const model = models.getModel('gigachat', 'Qwen3.5-397b');
+  const model = models.getModel('gigachat', testModel().id);
   const urls = [];
   const fetch = async (url) => {
     urls.push(String(url));

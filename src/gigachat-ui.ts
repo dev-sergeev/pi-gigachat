@@ -36,9 +36,7 @@ const defaultTokenUrl = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
 
 class FormError extends Error {}
 
-export async function registerGigaChatCommand(
-	pi: ExtensionAPI,
-): Promise<(ctx: ExtensionContext) => boolean> {
+export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 	const store = new ConnectionStore();
 	const registered = new Map<string, string>();
 	let records: ConnectionCredential[] = [];
@@ -686,11 +684,4 @@ export async function registerGigaChatCommand(
 			}
 		},
 	});
-	// The legacy initializer must not overwrite a saved or unresolved private selection.
-	return (ctx) => {
-		if (unavailableSelection) return false;
-		return !SettingsManager.create(ctx.cwd)
-			.getDefaultProvider()
-			?.startsWith(CONNECTION_PROVIDER_PREFIX);
-	};
 }

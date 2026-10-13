@@ -3,9 +3,9 @@ import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline';
-import { cleanEnv, token } from './helpers.mjs';
+import { cleanEnv, testModel, token } from './helpers.mjs';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
 export const cliPath = process.env.PI_TEST_CLI ?? join(repo, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js');
@@ -21,16 +21,31 @@ export async function until(predicate, label, timeout = 15000) {
   throw new Error(`Timed out: ${label}`);
 }
 
+export async function writeModelFixture(agentDir, models) {
+  const extensionPath = join(agentDir, 'consumer-models.mjs');
+  const providerUrl = pathToFileURL(join(repo, 'dist/index.js')).href;
+  await writeFile(extensionPath, `import { gigachatProvider } from ${JSON.stringify(providerUrl)};
+export default function (pi) {
+  pi.registerProvider({ ...gigachatProvider, getModels: () => ${JSON.stringify(models)} });
+}
+`);
+  return extensionPath;
+}
+
 export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
-  const modelId = runtime.model ?? 'Qwen3.5-397b';
+  const modelId = runtime.model ?? 'test-model';
   const dir = await mkdtemp(join(tmpdir(), 'pi-gigachat-test-'));
   const agentDir = join(dir, 'agent');
   const sessionFile = join(dir, 'session.jsonl');
   await mkdir(agentDir);
+  const fixtureModels = runtime.fixtureModels === false ? [] :
+    runtime.fixtureModels ?? [testModel({ id: modelId, baseUrl, ...runtime.modelOverrides })];
+  const fixturePath = fixtureModels.length ? await writeModelFixture(agentDir, fixtureModels) : undefined;
   await writeFile(join(agentDir, 'settings.json'), JSON.stringify({
-    packages: [repo], retry: { enabled: false, provider: { maxRetries: 0 } },
+    packages: runtime.packages ?? [repo], retry: { enabled: false, provider: { maxRetries: 0 } },
     compaction: { enabled: false, reserveTokens: 16384, keepRecentTokens: 256 }, ...settings,
   }));
+  const initialSettings = await readFile(join(agentDir, 'settings.json'), 'utf8');
   let current;
   async function start() {
     const events = [];
@@ -38,8 +53,9 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
     let counter = 0;
     let stderr = '';
     const child = spawn(process.execPath, [cliPath, '--mode', 'rpc', ...(runtime.sessionFlags === false ? [] : ['--session', sessionFile]),
+      ...[runtime.extensionPath, fixturePath].filter(Boolean).flatMap(path => ['--extension', path]),
       ...(runtime.modelFlags === false ? [] : ['--provider', 'gigachat', '--model', modelId]), ...(runtime.tools ? ['--tools', runtime.tools] : ['--no-tools']), '--no-skills', '--no-prompt-templates'], {
-      cwd: dir, env: { ...cleanEnv(), PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1',
+      cwd: dir, env: { ...cleanEnv(), HOME: dir, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1',
         GIGACHAT_ACCESS_TOKEN: token, GIGACHAT_BASE_URL: baseUrl, ...runtime.env }, stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.stderr.on('data', data => { stderr += data; });
@@ -66,7 +82,7 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
       return response;
     };
     current = {
-      events, command, sessionFile, agentDir,
+      events, command, sessionFile, agentDir, initialSettings,
       async entries() { return (await readFile(sessionFile, 'utf8')).trim().split('\n').map(JSON.parse); },
       async prompt(message) {
         const startIndex = events.length;
@@ -84,7 +100,8 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
       },
     };
     const response = await command('get_state');
-    if (!response.success || response.data.model?.id !== (runtime.expectedModel ?? modelId)) throw new Error('Provider did not load');
+    if (!response.success) throw new Error(response.error);
+    if (fixtureModels.length && response.data.model?.id !== (runtime.expectedModel ?? modelId)) throw new Error('Consumer model did not load');
     return current;
   }
   try { await run(await start(), async () => { await current.stop(); return start(); }); }

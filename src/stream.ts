@@ -127,7 +127,7 @@ export function streamSimpleGigaChat(
 ): AssistantMessageEventStream {
 	if (!options.apiKey)
 		throw new Error(
-			"GigaChat access token is required; use gigachatProvider with createModels() or /login gigachat",
+			"GigaChat access token is required; use /gigachat in Pi or gigachatProvider with createModels()",
 		);
 	const stream = createAssistantMessageEventStream();
 	const output: AssistantMessage = {

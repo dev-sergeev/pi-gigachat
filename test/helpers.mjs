@@ -1,10 +1,25 @@
 import { createServer } from 'node:http';
 import { createModels } from '@earendil-works/pi-ai';
 import { gigachatProvider } from '../dist/index.js';
-import { GIGACHAT_MODELS } from '../dist/models.js';
 
 export const token = 'test.synthetic.token';
 export const user = (content) => ({ role: 'user', content, timestamp: 0 });
+export function testModel(overrides = {}) {
+  return {
+    id: 'test-model',
+    name: 'Synthetic consumer model',
+    api: 'gigachat-extension-api',
+    provider: 'gigachat',
+    baseUrl: 'https://consumer.example/v1',
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 262144,
+    maxTokens: 64000,
+    reasoning: true,
+    thinkingLevelMap: { off: 'off', minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: null, max: null },
+    ...overrides,
+  };
+}
 export const completion = (message = { role: 'assistant', content: 'OK' }, reason = 'stop', usage) => ({
   choices: [{ index: 0, message, finish_reason: reason }],
   usage: usage ?? { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
@@ -35,13 +50,13 @@ export async function withServer(run, respond = (_request, res) => json(res, com
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
-  const model = { ...GIGACHAT_MODELS.find(model => model.id === 'Qwen3.5-397b'), provider: 'gigachat', api: 'gigachat-extension-api', baseUrl };
+  const model = testModel({ baseUrl });
   try { return await run({ model, requests, baseUrl }); }
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 }
 export async function ask(model, context = { messages: [user('Hi')] }, options = {}) {
   const models = createModels();
-  models.setProvider(gigachatProvider);
+  models.setProvider({ ...gigachatProvider, getModels: () => [model] });
   return models.completeSimple(model, context, { ...options, env: { GIGACHAT_ACCESS_TOKEN: token, ...options.env } });
 }
 

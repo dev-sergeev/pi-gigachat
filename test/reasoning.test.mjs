@@ -1,12 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { GIGACHAT_MODELS } from '../dist/models.js';
 import { convertMessages } from '../dist/messages.js';
 import { streamSimpleGigaChat } from '../dist/stream.js';
-import { completion, reply, token, user, withServer } from './helpers.mjs';
+import { completion, reply, testModel, token, user, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
-const glm = GIGACHAT_MODELS.find(model => model.id === 'glm-5.2');
+const selected = testModel({ id: 'test-reasoning-model' });
 const reasoning = 'L checks manifest files etc.';
 const state = '01a0b48f-f796-7e85-ad6c-b730d5bc0619';
 const fixture = {
@@ -15,13 +14,13 @@ const fixture = {
     function_call: { id: 'd5957e6c-52eb-4876-9b17-d6ef71948d69', name: 'bash', arguments: { command: 'cd /home ' } },
     functions_state_id: state, reasoning_content: reasoning,
   }, index: 0, finish_reason: 'function_call' }],
-  created: 1789735729, model: 'glm-5.2:latest', object: 'chat.completions',
+  created: 1789735729, model: `${selected.id}:latest`, object: 'chat.completions',
   usage: { prompt_tokens: 17452, completion_tokens: 168, total_tokens: 17620, precached_prompt_tokens: 0 },
 };
 const toolResult = call => ({ role: 'toolResult', toolCallId: call.id, toolName: call.name,
   content: [{ type: 'text', text: 'Synthetic result; command was not executed.' }], isError: false, timestamp: 0 });
-const assistant = (content, extra = {}) => ({ role: 'assistant', content, api: glm.api,
-  provider: glm.provider, model: glm.id, stopReason: 'stop', timestamp: 0, ...extra });
+const assistant = (content, extra = {}) => ({ role: 'assistant', content, api: selected.api,
+  provider: selected.provider, model: selected.id, stopReason: 'stop', timestamp: 0, ...extra });
 const wireThinking = text => ({ type: 'thinking', thinking: text, thinkingSignature: 'reasoning_content' });
 const data = (delta, finish_reason = null) => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] }) + '\n\n';
 
@@ -32,12 +31,12 @@ async function collect(model, context = { messages: [user('Test')] }, options = 
   return { result: await stream.result(), events };
 }
 
-for (const streaming of [false, true]) test(`GLM reasoning survives a tool response, JSON serialization and the next request (stream=${streaming})`, async () => {
+for (const streaming of [false, true]) test(`reasoning survives a tool response, JSON serialization and the next request (stream=${streaming})`, async () => {
   await withServer(async ({ baseUrl, requests }) => {
-    const model = { ...glm, baseUrl };
+    const model = { ...selected, baseUrl };
     const { result, events } = await collect(model, undefined, { stream: streaming });
     assert.equal(result.stopReason, 'toolUse', result.errorMessage);
-    assert.equal(result.model, 'glm-5.2', 'the response alias must not break same-model replay');
+    assert.equal(result.model, selected.id, 'the response alias must not break same-model replay');
     assert.deepEqual(result.content.map(block => block.type), ['thinking', 'toolCall']);
     assert.equal(result.content[0].thinking, reasoning);
     assert.deepEqual(events.filter(e => e.type.startsWith('thinking')).map(e => e.type), ['thinking_start', 'thinking_delta', 'thinking_end']);
@@ -58,14 +57,14 @@ for (const streaming of [false, true]) test(`GLM reasoning survives a tool respo
 for (const text of [' \nПроверка 🙂𐐀\t ', ' \n\t ']) test(`replay preserves reasoning verbatim, including whitespace: ${JSON.stringify(text)}`, () => {
   const history = [assistant([wireThinking(text), { type: 'text', text: 'Answer' }])];
   const before = JSON.stringify(history);
-  const [message] = convertMessages(glm, { messages: history });
+  const [message] = convertMessages(selected, { messages: history });
   assert.equal(message.reasoning_content, text);
   assert.equal(message.content, 'Answer');
   assert.equal(JSON.stringify(history), before);
 });
 
 test('native thinking blocks are replayed in order without requiring a provider signature', () => {
-  const [message] = convertMessages(glm, { messages: [assistant([
+  const [message] = convertMessages(selected, { messages: [assistant([
     { type: 'thinking', thinking: 'First\n' }, { type: 'thinking', thinking: ' Second' }, { type: 'text', text: 'Answer' },
   ])] });
   assert.equal(message.reasoning_content, 'First\n Second');
@@ -73,7 +72,7 @@ test('native thinking blocks are replayed in order without requiring a provider 
 
 test('model switching retains Pi normalization and never sends foreign reasoning as reasoning_content', () => {
   for (const foreign of [{ model: 'other' }, { provider: 'foreign' }, { api: 'foreign-api' }]) {
-    const [message] = convertMessages(glm, { messages: [assistant([
+    const [message] = convertMessages(selected, { messages: [assistant([
       wireThinking('Prior thought. '), { type: 'text', text: 'Answer', textSignature: 'gigachat:functions_state_id:old-state' },
     ], foreign)] });
     assert.equal(message.reasoning_content, undefined);
@@ -83,11 +82,11 @@ test('model switching retains Pi normalization and never sends foreign reasoning
 });
 
 test('redacted and failed reasoning is not replayed as plaintext reasoning_content', () => {
-  const [message] = convertMessages(glm, { messages: [assistant([
+  const [message] = convertMessages(selected, { messages: [assistant([
     { ...wireThinking('encrypted placeholder'), redacted: true }, { type: 'text', text: 'Answer' },
   ])] });
   assert.equal(message.reasoning_content, undefined);
-  for (const stopReason of ['error', 'aborted']) assert.deepEqual(convertMessages(glm, {
+  for (const stopReason of ['error', 'aborted']) assert.deepEqual(convertMessages(selected, {
     messages: [assistant([wireThinking('incomplete')], { stopReason })],
   }), []);
 });

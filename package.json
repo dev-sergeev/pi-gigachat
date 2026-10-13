@@ -1,7 +1,7 @@
 {
 	"name": "@dev-sergeev/pi-gigachat",
-	"version": "0.5.1",
-	"description": "GLM 5.2 and Qwen 3.5 provider for pi-coding-agent via a GigaChat-compatible API",
+	"version": "0.6.0",
+	"description": "GigaChat-compatible server connections and user-selected models for pi-coding-agent",
 	"private": false,
 	"type": "module",
 	"license": "MIT",
@@ -36,7 +36,6 @@
 	"files": [
 		"dist",
 		"extension.js",
-		"scripts/postinstall.mjs",
 		"THIRD_PARTY_NOTICES",
 		".env.example",
 		"README.md",
@@ -47,7 +46,6 @@
 		"clean": "rm -rf dist",
 		"check": "biome check --error-on-warnings src package.json README.md && tsc --noEmit",
 		"test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
-		"postinstall": "node scripts/postinstall.mjs",
 		"prepublishOnly": "npm run build && npm run check",
 		"prepack": "npm run build"
 	},

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { describeDiscoveryError, discoverModels } from '../dist/discovery.js';
+import { chooseModels } from '../dist/gigachat-dialogs.js';
 
 for (const key of Object.keys(process.env)) {
   if (/^(GIGACHAT_|https?_proxy$|HTTPS?_PROXY$|ALL_PROXY$|all_proxy$)/.test(key)) delete process.env[key];
@@ -62,6 +63,7 @@ test('deduplicates exact Model IDs before serial one-token probes and accepts tr
     assert.equal(probes[0].model.contextWindow, 8192);
     assert.equal(probes[0].model.maxTokens, 256);
     assert.equal(probes[0].model.reasoning, false);
+    assert.equal(probes[0].model.thinkingLevelMap, undefined);
     assert.deepEqual(progress, [[0, 2, undefined], [1, 2, 'Exact'], [2, 2, 'exact']]);
     assert.equal(peak, 1);
     assert.deepEqual(requests.map(req => req.url), ['/v1/models', '/v1/chat/completions', '/v1/chat/completions']);
@@ -69,6 +71,78 @@ test('deduplicates exact Model IDs before serial one-token probes and accepts tr
     assert.deepEqual(requests.slice(1).map(req => req.body), ['Exact', 'exact'].map(model => ({
       model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 1, stream: false,
     })));
+  });
+});
+
+test('discovery defaults missing or invalid metadata while preserving explicit server limits and reasoning', async () => {
+  const cases = [
+    { id: 'missing-metadata', expected: [262144, 64000, true] },
+    { id: 'camel-case', contextWindow: 12288, maxTokens: 1536, reasoning: false, expected: [12288, 1536, false] },
+    { id: 'snake-case', context_window: 8192, max_output_tokens: 256, reasoning: true, expected: [8192, 256, true] },
+    { id: 'alternate-limits', context_length: 4096, max_tokens: 128, expected: [4096, 128, true] },
+    { id: 'minimum-explicit-limits', contextWindow: 1, maxTokens: 1, reasoning: false, expected: [1, 1, false] },
+    { id: 'invalid-limits', contextWindow: 0, context_window: -1, context_length: 2.5, maxTokens: '64', max_tokens: null, max_output_tokens: 0, reasoning: 'false', expected: [262144, 64000, true] },
+    { id: 'valid-alias-after-invalid', contextWindow: 0, context_window: 6144, maxTokens: -1, max_output_tokens: 512, reasoning: null, expected: [6144, 512, true] },
+  ];
+  const thinkingLevelMap = { off: 'off', minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: null, max: null };
+  await withServer((req, res) => {
+    if (req.method === 'GET') return json(res, { data: cases.map(({ expected, ...metadata }) => metadata) });
+    json(res, completion());
+  }, async ({ baseUrl, requests }) => {
+    const probes = await discoverModels(baseUrl, secret, { signal: new AbortController().signal });
+    assert.equal(probes.length, cases.length);
+    for (const [index, probe] of probes.entries()) {
+      const [contextWindow, maxTokens, reasoning] = cases[index].expected;
+      assert.equal(probe.status, 'available');
+      assert.deepEqual(probe.model, {
+        id: cases[index].id, name: cases[index].id, contextWindow, maxTokens, reasoning,
+        ...(reasoning ? { thinkingLevelMap } : {}),
+      });
+    }
+    assert.deepEqual(requests.slice(1).map(req => [req.body.model, req.body.max_tokens]), cases.map(({ id }) => [id, 1]));
+  });
+});
+
+test('refreshing model availability preserves selected saved parameters and gives new selections discovered defaults', async () => {
+  const saved = [
+    { id: 'saved-nonreasoning', name: 'Consumer-edited name', contextWindow: 16384, maxTokens: 777, reasoning: false, temperature: 0.2 },
+    { id: 'saved-reasoning', name: 'Custom reasoning', contextWindow: 24576, maxTokens: 888, reasoning: true, temperature: 0.6,
+      thinkingLevelMap: { off: 'none', minimal: null, low: 'light', medium: 'balanced', high: 'deep', xhigh: null, max: null } },
+    { id: 'denied-model', name: 'Previously selected', contextWindow: 4096, maxTokens: 128, reasoning: false },
+    { id: 'removed-model', name: 'No longer in catalog', contextWindow: 4096, maxTokens: 128, reasoning: false },
+  ];
+  const before = structuredClone(saved);
+  await withServer((req, res) => {
+    if (req.method === 'GET') return json(res, { data: [
+      { id: 'saved-nonreasoning', name: 'Changed server name', context_window: 8192, max_output_tokens: 256, reasoning: true },
+      { id: 'saved-reasoning', reasoning: false },
+      { id: 'new-model' },
+      { id: 'denied-model' },
+    ] });
+    if (req.body.model === 'denied-model') return json(res, { message: 'not permitted' }, 403);
+    json(res, completion());
+  }, async ({ baseUrl }) => {
+    const probes = await discoverModels(baseUrl, secret, { signal: new AbortController().signal });
+    const ctx = { ui: {
+      custom: factory => new Promise(resolve => {
+        const component = factory(
+          { requestRender() {} },
+          { fg: (_color, text) => text },
+          { matches: (data, action) => data === 'confirm' && action === 'tui.select.confirm' },
+          resolve,
+        );
+        component.handleInput('\x01');
+        component.handleInput('confirm');
+      }),
+    } };
+    const chosen = await chooseModels(ctx, probes, saved);
+    assert.deepEqual(chosen, [saved[0], saved[1], probes[2].model]);
+    assert.equal(chosen[0], saved[0]);
+    assert.equal(chosen[1], saved[1]);
+    assert.equal(chosen[2].contextWindow, 262144);
+    assert.equal(chosen[2].maxTokens, 64000);
+    assert.equal(chosen[2].reasoning, true);
+    assert.deepEqual(saved, before, 'refreshing and selecting must not mutate saved metadata or parameters');
   });
 });
 

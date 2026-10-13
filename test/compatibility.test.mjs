@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { isContextOverflow } from '@earendil-works/pi-ai';
-import { GIGACHAT_MODELS } from '../dist/models.js';
-import { ask, completion, json, user, withServer } from './helpers.mjs';
+import { ask, completion, json, testModel, user, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
 const toolResult = (call, text) => ({ role: 'toolResult', toolCallId: call.id, toolName: call.name, content: [{ type: 'text', text }], isError: false, timestamp: 0 });
@@ -121,23 +120,17 @@ test('default output budget follows the model; explicit budgets are bounded by i
   });
 });
 
-test('GLM 5.2 uses a 64,000-token output budget', async () => {
-  const glm = GIGACHAT_MODELS.find(model => model.id === 'glm-5.2');
-  assert(glm);
-  assert.equal(glm.contextWindow, 200000);
+test('consumer-supplied output limits control defaults and cap explicit budgets', async () => {
   await withServer(async ({ baseUrl, requests }) => {
-    const model = { ...glm, baseUrl };
+    const model = testModel({ id: 'custom-budget-model', baseUrl, contextWindow: 8192, maxTokens: 1536 });
     await ask(model);
-    await ask(model, undefined, { maxTokens: 32000 });
-    await ask(model, undefined, { maxTokens: 100000 });
-    assert(requests.every(r => r.body.model === 'glm-5.2'));
-    assert.deepEqual(requests.map(r => r.body.max_tokens), [64000, 32000, 64000]);
+    await ask(model, undefined, { maxTokens: 512 });
+    await ask(model, undefined, { maxTokens: 4096 });
+    assert(requests.every(r => r.body.model === model.id));
+    assert.deepEqual(requests.map(r => r.body.max_tokens), [1536, 512, 1536]);
   });
 });
 
-test('all advertised models reflect the implemented text-only transport', () => {
-  assert(GIGACHAT_MODELS.every(model => !model.input.includes('image')));
-});
 
 test('unsupported images in history become visible placeholders rather than disappearing', async () => {
   await withServer(async ({ model, requests }) => {

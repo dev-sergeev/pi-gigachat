@@ -1,18 +1,25 @@
 # `@dev-sergeev/pi-gigachat`
 
-Native GigaChat provider for **pi 0.85.1** (`@earendil-works/pi-*`). Requires
-Node.js **22.19 or later**. Uses `createProvider()` and
-`pi.registerProvider(provider)`, with pi's native authentication and session
-lifecycle. The legacy provider API and `@mariozechner/pi-*` packages are no longer used.
+GigaChat-compatible server connections for **pi 0.85.1**
+(`@earendil-works/pi-*`). Requires Node.js **22.19 or later**. Uses
+`createProvider()` and `pi.registerProvider(provider)`, with Pi's native
+authentication and session lifecycle.
 
-The built-in `gigachat` provider includes `glm-5.2` (GLM 5.2) and
-`Qwen3.5-397b` (Qwen 3.5 397B), text conversations, pi tools, and JSON or SSE
-responses. GLM and Qwen require a GigaChat-compatible endpoint that exposes these
-exact model IDs; registering them does not make them available on every account.
-Use `/gigachat` to add independent server connections and select additional
-models from each server's catalog.
+The package has no built-in models and does not change Pi's saved default
+provider or model. Use `/gigachat` to add a server connection and select models
+from its catalog, then choose one through `/model`. The adapter supports text
+conversations, Pi tools, and JSON or SSE responses.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
+
+## Release 0.6.0
+
+- Removed built-in GLM/Qwen models and installation/activation default-model writes.
+- `/gigachat` adds only explicitly selected models without changing the active model or Pi defaults.
+- Missing server metadata defaults to 262,144 context tokens, 64,000 output tokens, and reasoning support.
+- Catalog refresh retains previously saved model parameters.
+- Breaking: the programmatic `gigachatProvider` has no model catalog; callers must supply models through `getModels()`.
+- Upgrade: defaults left by earlier versions are preserved. If they reference a removed built-in model, add a connection through `/gigachat` and select it through `/model`.
 
 ## Release 0.5.1
 
@@ -31,30 +38,19 @@ under its original MIT license.
 With Pi 0.85.1 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.5.1
+pi install npm:@dev-sergeev/pi-gigachat@0.6.0
 pi
 ```
 
 You can also install from Git with `pi install git:github.com/dev-sergeev/pi-gigachat`.
-The installation script **overwrites** Pi's saved `defaultProvider` and
-`defaultModel` with `gigachat` and `Qwen3.5-397b`, even if another default was
-previously configured. Other settings are preserved. It writes to
-`$PI_CODING_AGENT_DIR/settings.json`, or `~/.pi/agent/settings.json` when unset.
-Project settings and explicit CLI model flags retain Pi's normal precedence.
-If the package manager blocks lifecycle scripts (including npm 12 by default),
-or you install a local path with `pi install .`, the extension initializes this
-default once on first activation of this version. Saved private connection
-defaults and active or unavailable private session selections are not overwritten.
-A new session without explicit model flags otherwise switches to Qwen immediately;
-explicit model flags, project defaults, and resumed sessions keep their selection.
-Authentication is still required.
-After installation you can choose GLM with `/model`; subsequent launches do not
-force Qwen again. Reinstalling with lifecycle scripts enabled resets the default.
-To apply the default before starting Pi when scripts were blocked, run
-`node scripts/postinstall.mjs` from the installed package directory.
+Installation and extension activation do not register any built-in models or
+write `defaultProvider` / `defaultModel`. Restart Pi or use `/reload`, then run
+`/gigachat` to configure a server connection. Adding models makes them available
+in `/model`; it does not select them automatically or change saved Pi defaults.
 
-Use `/login gigachat` to configure authentication, then select GLM or Qwen
-with `/model`. Restart an existing Pi session or use `/reload` after installation.
+Previously saved connections are restored on restart. Defaults left by older
+package versions are not rewritten or removed: if one points to an unavailable
+built-in model, add a connection through `/gigachat` and choose a model explicitly.
 
 Pi loads the prebuilt `extension.js` and supplies its own `@earendil-works`
 APIs. Installation only adds two runtime packages: `undici` for HTTP/proxy support
@@ -100,7 +96,7 @@ Launch from this checkout with Bash/Zsh:
   set -a
   . ./.env
   set +a
-  ./node_modules/.bin/pi --provider gigachat --model Qwen3.5-397b
+  ./node_modules/.bin/pi
 )
 ```
 
@@ -109,6 +105,11 @@ binary if using a global installation. Add `-p "Привет!"` for a single req
 Keep JSON and values containing spaces inside single quotes, as above.
 Environment-file changes require loading the file again and starting a new pi
 process; `/reload` alone does not reread it.
+
+In Pi, configure connection credentials through `/gigachat` and choose a saved
+connection model through `/model`. The environment credential variables below
+apply to programmatic `gigachatProvider` consumers; they do not add models or
+replace a saved connection's credentials.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -237,17 +238,14 @@ can replace the generated message list. Reload `.env` and restart pi after chang
 The default block is a model instruction; it does not add an API parameter or a
 runtime guarantee of model compliance.
 
-For GLM 5.2 on a compatible endpoint:
-
-```bash
-pi --provider gigachat --model glm-5.2
-```
+Models such as GLM or Qwen can be selected through `/gigachat` if the server's
+catalog exposes them. No Model IDs are registered by installation.
 
 ## Add server connections through `/gigachat`
 
-This is an additional setup path. The built-in models, `/login gigachat`,
-environment authentication, and the programmatic `gigachatProvider` API remain
-available.
+This is the model setup path for the Pi extension. The programmatic
+`gigachatProvider` export supplies transport and authentication but no models;
+library callers must supply their own model definitions.
 
 1. Run `/gigachat` and choose **Токен** (access token) or
    **Авторизационный ключ** (renewable authorization key).
@@ -279,8 +277,10 @@ name is included in **Model Name** and is searchable. The `/gigachat` management
 list adds an ID marker only when connection captions collide.
 
 Valid catalog context/output/reasoning metadata is used when available. Missing
-metadata defaults to **200,000 context tokens**, **64,000 output tokens**, and
-reasoning levels **off / low / medium / high**. Under `/gigachat` →
+metadata defaults to **262,144 context tokens**, **64,000 output tokens**, and
+reasoning support with levels **off / low / medium / high**. Explicit server
+metadata takes precedence, including `reasoning: false`. Saved parameters are
+retained when refreshing an existing selected model. Under `/gigachat` →
 **Управление подключениями** → **Параметры моделей**, edit the context/output
 budgets, set **Температура**, or disable reasoning support for servers that do not
 accept it. Temperature accepts finite numbers greater than or equal to zero,
@@ -317,7 +317,7 @@ still apply to transport.
 
 ## Authentication and renewal
 
-This section applies to the built-in `gigachat` provider and library API.
+This section applies to programmatic `gigachatProvider` consumers.
 Connections created through `/gigachat` manage their authorization independently.
 
 To renew tokens automatically, leave `GIGACHAT_ACCESS_TOKEN` empty and use:
@@ -332,15 +332,14 @@ username/password authentication is also available through `GIGACHAT_USER` and
 `GIGACHAT_PASSWORD`. A rejected standalone access token returns HTTP 401; replace
 it and restart pi.
 
-Alternatively, run `/login gigachat`. Select an access token or the renewable
-login option. Renewable login asks for an authorization key or username/password,
-base URL, and scope. pi stores the credential in its `auth.json` and owns token
-renewal with a storage lock. Existing OAuth credentials saved by this extension
-remain usable.
+For persisted library authentication, supply a `CredentialStore` to
+`createModels()` and use Pi's provider authentication APIs. The extension does
+not register the library-only `gigachat` provider in `/login`; use `/gigachat`
+for connection authorization.
 
-The native pi rules apply: **a stored credential takes priority over environment
-credentials**. Use `/logout gigachat` to switch to `.env` authentication. With no
-stored credential, `GIGACHAT_ACCESS_TOKEN` takes priority over
+The native Pi rules apply: **a stored credential takes priority over environment
+credentials**. Remove the library provider's saved credential to switch to
+environment authentication. With no stored credential, `GIGACHAT_ACCESS_TOKEN` takes priority over
 `GIGACHAT_CREDENTIALS`, then username/password. Programmatic `apiKey` explicitly
 overrides saved credentials and must contain an access token. A saved OAuth
 profile's base URL takes priority over the process environment. An explicit
@@ -364,13 +363,9 @@ OAuth and chat traffic, including SSE. Include the proxy CA in the trusted bundl
 
 ### Reasoning levels
 
-`glm-5.2` and `Qwen3.5-397b` support Pi's `off`, `low`, `medium`, and `high`
-thinking levels. Choose a level in Pi or set it when starting a session:
-
-```bash
-pi --provider gigachat --model glm-5.2 --thinking high
-pi --provider gigachat --model Qwen3.5-397b --thinking medium
-```
+Models with reasoning support use Pi's `off`, `low`, `medium`, and `high`
+thinking levels by default. Choose a level with Pi's normal thinking controls
+after selecting a connection model through `/model`.
 
 The adapter sends the selected level unchanged in the top-level
 `reasoning_effort` field: `off`, `low`, `medium`, or `high`. This requires a gateway
@@ -420,7 +415,7 @@ input contract; returning the field alone does not establish that support.
 For endpoints that ignore `reasoning_content` on input, explicitly enable:
 
 ```bash
-GIGACHAT_REASONING_IN_CONTENT=true pi --provider gigachat --model glm-5.2
+GIGACHAT_REASONING_IN_CONTENT=true pi
 ```
 
 This setting defaults to `false`. Unset or `false` preserves the normal behavior
@@ -475,16 +470,10 @@ HTTP 413 is marked as context overflow so pi can compact and retry. Requests in
 one adapter instance are serialized for the personal account concurrency limit;
 separate processes still share the account's limits.
 
-All registered models advertise text input. Configured token budgets are:
-
-| Models | Context window | Maximum generated tokens |
-| --- | --- | --- |
-| GLM 5.2 | 200,000 | 64,000 |
-| Qwen 3.5 397B | 262,144 | 32,768 |
-
-Qwen's configured context and default output budget follow its
-[model card](https://huggingface.co/Qwen/Qwen3.5-397B-A17B#best-practices);
-your gateway may impose lower limits.
+Connection models advertise text input. Context and output budgets come from
+server metadata or saved user parameters. When metadata is missing, newly added
+models use a 262,144-token context and a 64,000-token output budget. These values
+are configuration defaults, not a guarantee of the server's actual limits.
 
 Pi's `maxTokens` is capped at the selected model's configured output budget.
 An explicit `max_tokens` in the extra JSON overrides that cap, subject to
@@ -500,12 +489,28 @@ install `@earendil-works/pi-ai@0.85.1` alongside this package; Pi normally provi
 that peer for extensions.
 
 ```ts
-import { createModels } from "@earendil-works/pi-ai";
+import { createModels, type Model } from "@earendil-works/pi-ai";
 import { gigachatProvider } from "@dev-sergeev/pi-gigachat";
 
+// Explicit consumer-owned model; use a Model ID supported by your server.
+const model: Model<"gigachat-extension-api"> = {
+  id: "your-server-model",
+  name: "Your server model",
+  api: "gigachat-extension-api",
+  provider: "gigachat",
+  baseUrl: "https://api.giga.chat/v1",
+  input: ["text"],
+  contextWindow: 262144,
+  maxTokens: 64000,
+  reasoning: true,
+  thinkingLevelMap: {
+    off: "off", minimal: null, low: "low", medium: "medium",
+    high: "high", xhigh: null, max: null,
+  },
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
 const models = createModels();
-models.setProvider(gigachatProvider);
-const model = models.getModel("gigachat", "Qwen3.5-397b")!;
+models.setProvider({ ...gigachatProvider, getModels: () => [model] });
 const answer = await models.completeSimple(model, {
   messages: [{ role: "user", content: "Привет!", timestamp: Date.now() }],
 }, {
@@ -515,8 +520,9 @@ const answer = await models.completeSimple(model, {
 
 This example reads environment credentials. Pass a `CredentialStore` to
 `createModels()` when embedding persisted authentication in another application.
-The default export registers the provider in a pi extension. The low-level
-`streamSimpleGigaChat` export requires a resolved access token in `apiKey`.
+The default export registers `/gigachat` and restores saved server connections,
+not the library provider. The low-level `streamSimpleGigaChat` export requires
+a resolved access token in `apiKey`.
 Set the model base URL or pass `env.GIGACHAT_BASE_URL` explicitly when using the
 low-level export. Its `GigaChatStreamOptions` also supports `stream`, `extraBody`, `topP`,
 `responseFormat`, `functionCall`, `repetitionPenalty` and `profanityCheck`.

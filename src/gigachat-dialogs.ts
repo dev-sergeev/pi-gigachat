@@ -203,6 +203,7 @@ export function chooseModels(
 	initial: readonly ConnectionModel[] = [],
 ): Promise<ConnectionModel[] | undefined> {
 	return ctx.ui.custom((tui, theme, keys, done) => {
+		const savedModels = new Map(initial.map((model) => [model.id, model]));
 		const selected = new Set(initial.map((model) => model.id));
 		const items: SelectItem[] = probes.map((probe) => ({
 			value: probe.model.id,
@@ -252,7 +253,7 @@ export function chooseModels(
 							(probe) =>
 								probe.status === "available" && selected.has(probe.model.id),
 						)
-						.map((probe) => probe.model);
+						.map((probe) => savedModels.get(probe.model.id) ?? probe.model);
 					if (models.length) done(models);
 					else {
 						error = "Отметьте хотя бы одну доступную модель.";

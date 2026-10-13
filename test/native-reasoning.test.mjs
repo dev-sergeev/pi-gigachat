@@ -14,7 +14,7 @@ const summary = 'Summary: the file contains NATIVE_REASONING_FIXTURE_742.';
 const isSummary = req => req.body.messages[0]?.content?.includes('summariz');
 
 for (const reasoningInContent of [false, true])
-for (const streaming of [false, true]) test(`native Pi displays, saves, resumes and compacts GLM reasoning (stream=${streaming}, content=${reasoningInContent})`, { timeout: 60000 }, async () => {
+for (const streaming of [false, true]) test(`native Pi displays, saves, resumes and compacts consumer-model reasoning (stream=${streaming}, content=${reasoningInContent})`, { timeout: 60000 }, async () => {
   let path;
   let called = false;
   await withServer(async ({ baseUrl, requests }) => {
@@ -60,7 +60,7 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       assert((await pi.entries()).some(e => e.type === 'message' && e.message.content?.some?.(b => b.thinking === toolThought)), 'compaction must keep the original session entries');
       await pi.prompt('Continue after compaction.');
       assert(requests.at(-1).body.messages.some(m => m.content.includes(summary)));
-    }, {}, { model: 'glm-5.2', tools: 'read', timeout: 30000, env: { GIGACHAT_STREAM: String(streaming), ...(reasoningInContent ? { GIGACHAT_REASONING_IN_CONTENT: 'true' } : {}) } });
+    }, {}, { tools: 'read', timeout: 30000, env: { GIGACHAT_STREAM: String(streaming), ...(reasoningInContent ? { GIGACHAT_REASONING_IN_CONTENT: 'true' } : {}) } });
   }, (req, res) => {
     if (isSummary(req)) reply(req, res, completion({ role: 'assistant', content: summary }));
     else if (!called) {

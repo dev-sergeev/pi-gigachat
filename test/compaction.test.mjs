@@ -21,6 +21,7 @@ for (const streaming of [false, true]) {
 modeTest('real pi compacts, includes its prior summary on recompaction, and resumes the saved session', { timeout: 45000 }, async () => {
   await withServer(async ({ baseUrl, requests }) => {
     await withTestPi(baseUrl, async (pi, restart) => {
+      const model = (await pi.command('get_state')).data.model;
       await seed(pi);
       const first = await pi.command('compact', { customInstructions: 'Preserve AUDIT-42.' });
       assert.equal(first.success, true, first.error);
@@ -38,7 +39,7 @@ modeTest('real pi compacts, includes its prior summary on recompaction, and resu
       assert(requests.at(-1).body.messages.some(m => m.content?.includes(summary)));
       const summaries = requests.filter(isSummary);
       assert(summaries.length >= 2);
-      assert(summaries.every(r => r.body.stream === streaming && !r.body.functions && r.body.max_tokens <= 32768));
+      assert(summaries.every(r => r.body.stream === streaming && !r.body.functions && r.body.max_tokens <= model.maxTokens));
       assert(requests.every(r => r.body.stream === streaming && r.headers.authorization === `Bearer ${token}`));
     });
   }, respond);

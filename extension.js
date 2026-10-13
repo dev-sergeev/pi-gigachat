@@ -263,7 +263,7 @@ var init_http = __esm({
 });
 
 // src/models.ts
-var GIGACHAT_API, GIGACHAT_DEFAULT_BASE_URL, thinkingLevelMap, GIGACHAT_CONNECTION_DEFAULTS, GIGACHAT_MODELS;
+var GIGACHAT_API, GIGACHAT_DEFAULT_BASE_URL, thinkingLevelMap, GIGACHAT_CONNECTION_DEFAULTS;
 var init_models = __esm({
   "src/models.ts"() {
     "use strict";
@@ -279,48 +279,11 @@ var init_models = __esm({
       max: null
     };
     GIGACHAT_CONNECTION_DEFAULTS = {
-      contextWindow: 2e5,
+      contextWindow: 262144,
       maxTokens: 64e3,
       reasoning: true,
       thinkingLevelMap
     };
-    GIGACHAT_MODELS = [
-      {
-        id: "glm-5.2",
-        name: "GLM 5.2",
-        reasoning: true,
-        contextWindow: 2e5,
-        maxTokens: 64e3
-      },
-      {
-        id: "Qwen3.5-397b",
-        name: "Qwen 3.5 397B",
-        reasoning: true,
-        contextWindow: 262144,
-        maxTokens: 32768
-      }
-    ].map(
-      ({
-        id,
-        name,
-        reasoning = false,
-        contextWindow = 128e3,
-        maxTokens = 8192
-      }) => ({
-        id,
-        name,
-        api: GIGACHAT_API,
-        provider: "gigachat",
-        baseUrl: GIGACHAT_DEFAULT_BASE_URL,
-        reasoning,
-        ...reasoning ? { thinkingLevelMap: { ...thinkingLevelMap } } : {},
-        input: ["text"],
-        // Unknown USD prices; tariffs vary by account. Zero is not a free-tier claim.
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow,
-        maxTokens
-      })
-    );
   }
 });
 
@@ -891,7 +854,7 @@ function payload(model, context, options) {
 function streamSimpleGigaChat(model, context, options = {}) {
   if (!options.apiKey)
     throw new Error(
-      "GigaChat access token is required; use gigachatProvider with createModels() or /login gigachat"
+      "GigaChat access token is required; use /gigachat in Pi or gigachatProvider with createModels()"
     );
   const stream = createAssistantMessageEventStream();
   const output = {
@@ -1219,7 +1182,7 @@ var init_stream = __esm({
 // src/connections.ts
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join as join2, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { createProvider, InMemoryModelsStore } from "@earendil-works/pi-ai";
@@ -1475,8 +1438,8 @@ var init_connections = __esm({
       authPath;
       runtime;
       writes = Promise.resolve();
-      constructor(authPath = join2(getAgentDir(), "auth.json")) {
-        const expanded = authPath === "~" ? homedir() : authPath.startsWith("~/") ? join2(homedir(), authPath.slice(2)) : authPath;
+      constructor(authPath = join(getAgentDir(), "auth.json")) {
+        const expanded = authPath === "~" ? homedir() : authPath.startsWith("~/") ? join(homedir(), authPath.slice(2)) : authPath;
         this.authPath = resolve(
           expanded.startsWith("file://") ? fileURLToPath(expanded) : expanded
         );
@@ -1794,6 +1757,7 @@ async function showForm(ctx, title, fields, advanced = [], signal) {
 }
 function chooseModels(ctx, probes, initial = []) {
   return ctx.ui.custom((tui, theme, keys, done) => {
+    const savedModels = new Map(initial.map((model) => [model.id, model]));
     const selected = new Set(initial.map((model) => model.id));
     const items = probes.map((probe) => ({
       value: probe.model.id,
@@ -1838,7 +1802,7 @@ function chooseModels(ctx, probes, initial = []) {
         else if (keys.matches(data, "tui.select.confirm")) {
           const models = probes.filter(
             (probe) => probe.status === "available" && selected.has(probe.model.id)
-          ).map((probe) => probe.model);
+          ).map((probe) => savedModels.get(probe.model.id) ?? probe.model);
           if (models.length) done(models);
           else {
             error = "\u041E\u0442\u043C\u0435\u0442\u044C\u0442\u0435 \u0445\u043E\u0442\u044F \u0431\u044B \u043E\u0434\u043D\u0443 \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0443\u044E \u043C\u043E\u0434\u0435\u043B\u044C.";
@@ -2575,10 +2539,6 @@ async function registerGigaChatCommand(pi) {
       }
     }
   });
-  return (ctx) => {
-    if (unavailableSelection) return false;
-    return !SettingsManager.create(ctx.cwd).getDefaultProvider()?.startsWith(CONNECTION_PROVIDER_PREFIX);
-  };
 }
 var AUTH_LABELS, scopes2, defaultTokenUrl, FormError;
 var init_gigachat_ui = __esm({
@@ -2602,60 +2562,18 @@ var init_gigachat_ui = __esm({
 
 // src/index.ts
 init_auth();
-import { createProvider as createProvider2 } from "@earendil-works/pi-ai";
-
-// src/default-model.ts
-init_models();
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-var installationVersion = "0.5.0";
-function registerDefaultModel(pi, canInitialize) {
-  pi.on("session_start", async (_event, ctx) => {
-    if (!canInitialize(ctx)) return;
-    if (ctx.model?.api === GIGACHAT_API && ctx.model.provider !== "gigachat") {
-      return;
-    }
-    const { getAgentDir: getAgentDir2, SettingsManager: SettingsManager2 } = await import("@earendil-works/pi-coding-agent");
-    const agentDir = getAgentDir2();
-    const marker = join(agentDir, ".pi-gigachat-default-model");
-    if (existsSync(marker) && readFileSync(marker, "utf8").trim() === installationVersion) {
-      return;
-    }
-    const settings = SettingsManager2.create(ctx.cwd, agentDir);
-    settings.setDefaultModelAndProvider("gigachat", "Qwen3.5-397b");
-    await settings.flush();
-    const errors = settings.drainErrors();
-    if (errors.length) throw errors[0].error;
-    const explicitSelection = process.argv.some(
-      (arg) => /^(--model|--provider|--session|--resume|--continue|-c|-r)(=|$)/.test(
-        arg
-      )
-    );
-    const projectDefault = settings.getProjectSettings().defaultModel;
-    if (!explicitSelection && !projectDefault) {
-      const model = ctx.modelRegistry.find("gigachat", "Qwen3.5-397b");
-      if (model) await pi.setModel(model);
-    }
-    writeFileSync(marker, `${installationVersion}
-`, { mode: 384 });
-  });
-}
-
-// src/index.ts
-init_models();
 init_stream();
+import { createProvider as createProvider2 } from "@earendil-works/pi-ai";
 var gigachatProvider = createProvider2({
   id: "gigachat",
   name: "GigaChat",
   auth: gigachatAuth,
-  models: GIGACHAT_MODELS,
+  models: [],
   api: { stream: streamSimpleGigaChat, streamSimple: streamSimpleGigaChat }
 });
 async function index_default(pi) {
-  pi.registerProvider(gigachatProvider);
   const { registerGigaChatCommand: registerGigaChatCommand2 } = await Promise.resolve().then(() => (init_gigachat_ui(), gigachat_ui_exports));
-  const canInitializeLegacyDefault = await registerGigaChatCommand2(pi);
-  registerDefaultModel(pi, canInitializeLegacyDefault);
+  await registerGigaChatCommand2(pi);
 }
 export {
   index_default as default,
