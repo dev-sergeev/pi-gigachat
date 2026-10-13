@@ -43,6 +43,30 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 	let initialError: unknown;
 	let busy = false;
 	let unavailableSelection: string | undefined;
+	let unavailableModelChangeId: string | undefined;
+
+	function latestModelChange(ctx: ExtensionContext) {
+		const branch = ctx.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type === "model_change") return entry;
+		}
+		return undefined;
+	}
+
+	function refreshSelectionGuard(ctx: ExtensionContext): void {
+		if (!unavailableSelection) return;
+		const entry = latestModelChange(ctx);
+		// Pi records explicit same-model selection but emits no model_select event.
+		if (
+			entry &&
+			entry.id !== unavailableModelChangeId &&
+			entry.provider === ctx.model?.provider &&
+			entry.modelId === ctx.model.id &&
+			ctx.modelRegistry.find(entry.provider, entry.modelId)
+		)
+			unavailableSelection = undefined;
+	}
 
 	async function synchronize(ctx?: ExtensionContext): Promise<void> {
 		records = await store.list();
@@ -71,16 +95,19 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		unavailableSelection = undefined;
 	});
 	pi.on("input", (_event, ctx) => {
+		refreshSelectionGuard(ctx);
 		if (!unavailableSelection) return;
 		ctx.ui.notify(unavailableSelection, "error");
 		return { action: "handled" };
 	});
 	pi.on("session_before_compact", (_event, ctx) => {
+		refreshSelectionGuard(ctx);
 		if (!unavailableSelection) return;
 		ctx.ui.notify(unavailableSelection, "error");
 		return { cancel: true };
 	});
 	pi.on("session_before_tree", (event, ctx) => {
+		refreshSelectionGuard(ctx);
 		if (!unavailableSelection || !event.preparation.userWantsSummary) return;
 		ctx.ui.notify(unavailableSelection, "error");
 		return { cancel: true };
@@ -148,6 +175,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		if (!model) {
 			unavailableSelection =
 				"Сохранённая модель подключения недоступна. Выберите другую через /model или откройте /gigachat. Запросы к другому серверу заблокированы.";
+			unavailableModelChangeId = latestModelChange(ctx)?.id;
 			ctx.ui.notify(unavailableSelection, "error");
 			return;
 		}
@@ -159,6 +187,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		if (!(await pi.setModel(model))) {
 			unavailableSelection =
 				"Не удалось восстановить авторизацию выбранного подключения. Откройте /gigachat или выберите другую модель через /model.";
+			unavailableModelChangeId = latestModelChange(ctx)?.id;
 			ctx.ui.notify(unavailableSelection, "error");
 		} else if (thinking) pi.setThinkingLevel(thinking);
 	});
@@ -198,13 +227,18 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 	async function persist(
 		ctx: ExtensionCommandContext,
 		credential: ConnectionCredential,
+		previousId?: string,
 	): Promise<boolean> {
 		const connection = credential.gigachatConnection;
 		const result = await runProgress(
 			ctx,
 			"Сохранение подключения",
 			async (signal) => {
-				if (ctx.model?.provider === connection.id && !ctx.isIdle()) {
+				if (
+					(ctx.model?.provider === connection.id ||
+						ctx.model?.provider === previousId) &&
+					!ctx.isIdle()
+				) {
 					ctx.abort();
 					await ctx.waitForIdle();
 				}
@@ -216,12 +250,22 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						ctx.ui.setStatus("gigachat", "Сохранение авторизации GigaChat"),
 				};
 				try {
-					await store.save(credential, interaction);
+					await store.save(credential, interaction, previousId);
 				} finally {
 					await synchronize(ctx);
 					ctx.ui.setStatus("gigachat", undefined);
 				}
 				const current = ctx.model;
+				if (
+					previousId &&
+					previousId !== connection.id &&
+					current?.provider === previousId
+				) {
+					unavailableSelection =
+						"Подключение переименовано. Выберите модель нового подключения через /model. Ссылки в прежних сессиях и настройках не изменены.";
+					unavailableModelChangeId = latestModelChange(ctx)?.id;
+					ctx.ui.notify(unavailableSelection, "warning");
+				}
 				if (
 					current?.provider === connection.id &&
 					connection.models.some((model) => model.id === current.id)
@@ -327,7 +371,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					id: "name",
 					label: "Название подключения",
 					value: values.name,
-					placeholder: "Рабочий сервер",
+					placeholder: "LDBR",
 				},
 				{
 					id: "url",
@@ -378,6 +422,17 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					.replace(/[\p{Cc}\p{Cf}]/gu, " ")
 					.trim();
 				if (!name) throw new FormError("Укажите название подключения.");
+				const renamed = !old || name !== old.name;
+				if (renamed && !/^[A-Za-z0-9_-]+$/.test(values.name))
+					throw new FormError(
+						"Название должно содержать только латинские буквы, цифры, дефис и подчёркивание.",
+					);
+				const id = renamed ? `${CONNECTION_PROVIDER_PREFIX}${name}` : old.id;
+				if (id !== old?.id && ctx.modelRegistry.getProvider(id))
+					throw new FormError(
+						`Идентификатор провайдера «${id}» уже занят. Выберите другое название подключения.`,
+					);
+				await store.assertAvailable(id, old?.id);
 				const url = baseUrl(values.url.trim() || GIGACHAT_DEFAULT_BASE_URL);
 				const tokenUrl =
 					mode === "credentials"
@@ -402,9 +457,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					};
 				}
 				const draft: Connection = {
-					id:
-						old?.id ??
-						`${CONNECTION_PROVIDER_PREFIX}${randomBytes(6).toString("hex")}`,
+					id,
 					revision: randomBytes(12).toString("hex"),
 					name,
 					baseUrl: url,
@@ -423,7 +476,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					!sameAuthorization ||
 					Boolean(values.secret.trim());
 				let credential: ConnectionCredential | undefined;
-				if (previous && !changedEndpointOrSecret)
+				if (previous && !changedEndpointOrSecret && !renamed)
 					credential = { ...previous, gigachatConnection: draft };
 				else {
 					const secret =
@@ -436,7 +489,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					credential = await verifyAndChoose(ctx, draft, secret, previous);
 				}
 				if (!credential) return;
-				if (await persist(ctx, credential)) {
+				if (await persist(ctx, credential, old?.id)) {
 					values.secret = "";
 					return;
 				}
@@ -543,7 +596,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					models,
 				},
 			};
-			if (await persist(ctx, credential)) return;
+			if (await persist(ctx, credential, connection.id)) return;
 		}
 	}
 
@@ -601,7 +654,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						? record.refresh
 						: (record.env?.GIGACHAT_ACCESS_TOKEN ?? "");
 				const credential = await verifyAndChoose(ctx, draft, secret, record);
-				if (credential) await persist(ctx, credential);
+				if (credential) await persist(ctx, credential, connection.id);
 			} catch (error) {
 				ctx.ui.notify(
 					error instanceof FormError

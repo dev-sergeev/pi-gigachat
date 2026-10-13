@@ -218,6 +218,8 @@ export function describeDiscoveryError(error: unknown): string {
 		return "This GigaChat connection changed or was removed. Reopen /gigachat or restart pi.";
 	if (code === "GIGACHAT_STORAGE_ERROR")
 		return "Cannot read or save GigaChat connections in auth.json. Check file access and retry.";
+	if (code === "GIGACHAT_ID_CONFLICT")
+		return "Идентификатор провайдера уже занят. Выберите другое название подключения.";
 	if (code === "GIGACHAT_AUTH_ERROR")
 		return "GigaChat authorization failed. Check this connection's credentials.";
 	if (error instanceof SyntaxError)

@@ -1186,12 +1186,17 @@ var init_stream = __esm({
 });
 
 // src/connections.ts
-import { mkdir, readFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { createProvider, InMemoryModelsStore } from "@earendil-works/pi-ai";
+import {
+  createProvider,
+  InMemoryCredentialStore,
+  InMemoryModelsStore
+} from "@earendil-works/pi-ai";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
 function stale() {
@@ -1205,6 +1210,20 @@ function storageError() {
     "GIGACHAT_STORAGE_ERROR",
     "Cannot read or update GigaChat connections in auth.json. Check the file and its permissions, then try /gigachat again."
   );
+}
+function authData(content) {
+  const data = JSON.parse((content ?? "{}").replace(/^\uFEFF/, ""));
+  if (!object(data)) throw storageError();
+  return data;
+}
+function assertWritable(data, id, previousId) {
+  if (previousId && !validCredential(data[previousId], previousId))
+    throw stale();
+  if (Object.hasOwn(data, id) && id !== previousId)
+    throw new ConnectionError(
+      "GIGACHAT_ID_CONFLICT",
+      `\u0418\u0434\u0435\u043D\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u043E\u0440 \u043F\u0440\u043E\u0432\u0430\u0439\u0434\u0435\u0440\u0430 \xAB${id}\xBB \u0443\u0436\u0435 \u0437\u0430\u043D\u044F\u0442. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0440\u0443\u0433\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F.`
+    );
 }
 function ownedId(value) {
   return typeof value === "string" && value.startsWith(CONNECTION_PROVIDER_PREFIX) && value.length > CONNECTION_PROVIDER_PREFIX.length && !/\s/.test(value) && !value.includes("\0");
@@ -1431,7 +1450,7 @@ var init_connections = __esm({
     init_http();
     init_models();
     init_stream();
-    CONNECTION_PROVIDER_PREFIX = "gigachat-server-";
+    CONNECTION_PROVIDER_PREFIX = "gigachat-";
     ConnectionError = class extends Error {
       constructor(code, message) {
         super(message);
@@ -1450,7 +1469,7 @@ var init_connections = __esm({
           expanded.startsWith("file://") ? fileURLToPath(expanded) : expanded
         );
       }
-      async list(signal) {
+      async withData(operation, signal) {
         signal?.throwIfAborted();
         let release;
         let compromised = false;
@@ -1489,27 +1508,33 @@ var init_connections = __esm({
           } catch (error) {
             signal?.throwIfAborted();
             if (compromised) throw storageError();
-            if (object(error) && error.code === "ENOENT") return [];
-            throw error;
+            if (object(error) && error.code === "ENOENT") content = "{}";
+            else throw error;
           }
           signal?.throwIfAborted();
           if (compromised) throw storageError();
-          const data = JSON.parse(content.replace(/^\uFEFF/, ""));
-          if (!object(data)) throw storageError();
-          const credentials = [];
-          for (const [id, credential] of Object.entries(data)) {
-            if (!id.startsWith(CONNECTION_PROVIDER_PREFIX)) continue;
-            if (!validCredential(credential, id)) throw storageError();
-            credentials.push(credential);
-          }
-          return credentials;
-        } catch {
+          return await operation(authData(content));
+        } catch (error) {
           signal?.throwIfAborted();
+          if (error instanceof ConnectionError) throw error;
           throw storageError();
         } finally {
           await release?.().catch(() => {
           });
         }
+      }
+      async list(signal) {
+        return this.withData(async (data) => {
+          const credentials = [];
+          for (const [id, credential] of Object.entries(data)) {
+            if (!id.startsWith(CONNECTION_PROVIDER_PREFIX)) continue;
+            if (!object(credential) || !Object.hasOwn(credential, "gigachatConnection"))
+              continue;
+            if (!validCredential(credential, id)) throw storageError();
+            credentials.push(credential);
+          }
+          return credentials;
+        }, signal);
       }
       nativeRuntime() {
         this.runtime ??= ModelRuntime.create({
@@ -1536,16 +1561,46 @@ var init_connections = __esm({
         });
         return signal ? raceWithAbortSignal(pending, signal) : pending;
       }
-      async save(credential, interaction) {
+      async assertAvailable(id, previousId, signal) {
+        if (!ownedId(id)) throw storageError();
+        await this.withData(async (data) => {
+          assertWritable(data, id, previousId);
+        }, signal);
+      }
+      async save(credential, interaction, previousId) {
         if (!validCredential(credential)) throw storageError();
         const saved = structuredClone(credential);
         return this.write(async () => {
           await this.list(interaction.signal);
-          const runtime = await this.nativeRuntime();
-          runtime.registerNativeProvider(
-            createConnectionProvider(saved.gigachatConnection, this, saved)
-          );
-          await runtime.login(saved.gigachatConnection.id, saved.type, interaction);
+          await this.withData(async (data) => {
+            const id = saved.gigachatConnection.id;
+            assertWritable(data, id, previousId);
+            const runtime = await ModelRuntime.create({
+              credentials: new InMemoryCredentialStore(),
+              modelsPath: null,
+              modelsStore: new InMemoryModelsStore(),
+              refreshOnCreate: false,
+              allowModelNetwork: false
+            });
+            runtime.registerNativeProvider(
+              createConnectionProvider(saved.gigachatConnection, this, saved)
+            );
+            data[id] = await runtime.login(id, saved.type, interaction);
+            if (previousId && previousId !== id) delete data[previousId];
+            interaction.signal?.throwIfAborted();
+            const temporary = `${this.authPath}.${randomBytes(12).toString("hex")}.tmp`;
+            try {
+              await writeFile(temporary, JSON.stringify(data, null, 2), {
+                mode: 384,
+                flag: "wx"
+              });
+              interaction.signal?.throwIfAborted();
+              await rename(temporary, this.authPath);
+            } finally {
+              await unlink(temporary).catch(() => {
+              });
+            }
+          }, interaction.signal);
         }, interaction.signal);
       }
       async remove(id, signal) {
@@ -1701,6 +1756,8 @@ function describeDiscoveryError(error) {
     return "This GigaChat connection changed or was removed. Reopen /gigachat or restart pi.";
   if (code === "GIGACHAT_STORAGE_ERROR")
     return "Cannot read or save GigaChat connections in auth.json. Check file access and retry.";
+  if (code === "GIGACHAT_ID_CONFLICT")
+    return "\u0418\u0434\u0435\u043D\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u043E\u0440 \u043F\u0440\u043E\u0432\u0430\u0439\u0434\u0435\u0440\u0430 \u0443\u0436\u0435 \u0437\u0430\u043D\u044F\u0442. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0440\u0443\u0433\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F.";
   if (code === "GIGACHAT_AUTH_ERROR")
     return "GigaChat authorization failed. Check this connection's credentials.";
   if (error instanceof SyntaxError)
@@ -2020,7 +2077,7 @@ var gigachat_ui_exports = {};
 __export(gigachat_ui_exports, {
   registerGigaChatCommand: () => registerGigaChatCommand
 });
-import { randomBytes } from "node:crypto";
+import { randomBytes as randomBytes2 } from "node:crypto";
 import { stripVTControlCharacters as stripVTControlCharacters2 } from "node:util";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
 async function registerGigaChatCommand(pi) {
@@ -2030,6 +2087,21 @@ async function registerGigaChatCommand(pi) {
   let initialError;
   let busy = false;
   let unavailableSelection;
+  let unavailableModelChangeId;
+  function latestModelChange(ctx) {
+    const branch = ctx.sessionManager.getBranch();
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i];
+      if (entry.type === "model_change") return entry;
+    }
+    return void 0;
+  }
+  function refreshSelectionGuard(ctx) {
+    if (!unavailableSelection) return;
+    const entry = latestModelChange(ctx);
+    if (entry && entry.id !== unavailableModelChangeId && entry.provider === ctx.model?.provider && entry.modelId === ctx.model.id && ctx.modelRegistry.find(entry.provider, entry.modelId))
+      unavailableSelection = void 0;
+  }
   async function synchronize(ctx) {
     records = await store.list();
     const ids = new Set(records.map((record) => record.gigachatConnection.id));
@@ -2056,16 +2128,19 @@ async function registerGigaChatCommand(pi) {
     unavailableSelection = void 0;
   });
   pi.on("input", (_event, ctx) => {
+    refreshSelectionGuard(ctx);
     if (!unavailableSelection) return;
     ctx.ui.notify(unavailableSelection, "error");
     return { action: "handled" };
   });
   pi.on("session_before_compact", (_event, ctx) => {
+    refreshSelectionGuard(ctx);
     if (!unavailableSelection) return;
     ctx.ui.notify(unavailableSelection, "error");
     return { cancel: true };
   });
   pi.on("session_before_tree", (event, ctx) => {
+    refreshSelectionGuard(ctx);
     if (!unavailableSelection || !event.preparation.userWantsSummary) return;
     ctx.ui.notify(unavailableSelection, "error");
     return { cancel: true };
@@ -2113,6 +2188,7 @@ async function registerGigaChatCommand(pi) {
     const model = ctx.modelRegistry.find(reference.provider, reference.id);
     if (!model) {
       unavailableSelection = "\u0421\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u0430\u044F \u043C\u043E\u0434\u0435\u043B\u044C \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0440\u0443\u0433\u0443\u044E \u0447\u0435\u0440\u0435\u0437 /model \u0438\u043B\u0438 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 /gigachat. \u0417\u0430\u043F\u0440\u043E\u0441\u044B \u043A \u0434\u0440\u0443\u0433\u043E\u043C\u0443 \u0441\u0435\u0440\u0432\u0435\u0440\u0443 \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043D\u044B.";
+      unavailableModelChangeId = latestModelChange(ctx)?.id;
       ctx.ui.notify(unavailableSelection, "error");
       return;
     }
@@ -2120,6 +2196,7 @@ async function registerGigaChatCommand(pi) {
       return;
     if (!await pi.setModel(model)) {
       unavailableSelection = "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044E \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F. \u041E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 /gigachat \u0438\u043B\u0438 \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0440\u0443\u0433\u0443\u044E \u043C\u043E\u0434\u0435\u043B\u044C \u0447\u0435\u0440\u0435\u0437 /model.";
+      unavailableModelChangeId = latestModelChange(ctx)?.id;
       ctx.ui.notify(unavailableSelection, "error");
     } else if (thinking) pi.setThinkingLevel(thinking);
   });
@@ -2150,13 +2227,13 @@ async function registerGigaChatCommand(pi) {
     if (!values) throw new DOMException("Cancelled", "AbortError");
     return values.value;
   }
-  async function persist(ctx, credential) {
+  async function persist(ctx, credential, previousId) {
     const connection = credential.gigachatConnection;
     const result = await runProgress(
       ctx,
       "\u0421\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F",
       async (signal) => {
-        if (ctx.model?.provider === connection.id && !ctx.isIdle()) {
+        if ((ctx.model?.provider === connection.id || ctx.model?.provider === previousId) && !ctx.isIdle()) {
           ctx.abort();
           await ctx.waitForIdle();
         }
@@ -2167,12 +2244,17 @@ async function registerGigaChatCommand(pi) {
           notify: () => ctx.ui.setStatus("gigachat", "\u0421\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u0438 GigaChat")
         };
         try {
-          await store.save(credential, interaction);
+          await store.save(credential, interaction, previousId);
         } finally {
           await synchronize(ctx);
           ctx.ui.setStatus("gigachat", void 0);
         }
         const current = ctx.model;
+        if (previousId && previousId !== connection.id && current?.provider === previousId) {
+          unavailableSelection = "\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u043D\u043E. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043C\u043E\u0434\u0435\u043B\u044C \u043D\u043E\u0432\u043E\u0433\u043E \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F \u0447\u0435\u0440\u0435\u0437 /model. \u0421\u0441\u044B\u043B\u043A\u0438 \u0432 \u043F\u0440\u0435\u0436\u043D\u0438\u0445 \u0441\u0435\u0441\u0441\u0438\u044F\u0445 \u0438 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445 \u043D\u0435 \u0438\u0437\u043C\u0435\u043D\u0435\u043D\u044B.";
+          unavailableModelChangeId = latestModelChange(ctx)?.id;
+          ctx.ui.notify(unavailableSelection, "warning");
+        }
         if (current?.provider === connection.id && connection.models.some((model) => model.id === current.id)) {
           const refreshed = ctx.modelRegistry.find(connection.id, current.id);
           if (refreshed) await pi.setModel(refreshed);
@@ -2249,7 +2331,7 @@ async function registerGigaChatCommand(pi) {
           id: "name",
           label: "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F",
           value: values.name,
-          placeholder: "\u0420\u0430\u0431\u043E\u0447\u0438\u0439 \u0441\u0435\u0440\u0432\u0435\u0440"
+          placeholder: "LDBR"
         },
         {
           id: "url",
@@ -2290,6 +2372,17 @@ async function registerGigaChatCommand(pi) {
       try {
         const name = stripVTControlCharacters2(values.name).replace(/[\p{Cc}\p{Cf}]/gu, " ").trim();
         if (!name) throw new FormError("\u0423\u043A\u0430\u0436\u0438\u0442\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F.");
+        const renamed = !old || name !== old.name;
+        if (renamed && !/^[A-Za-z0-9_-]+$/.test(values.name))
+          throw new FormError(
+            "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0434\u043E\u043B\u0436\u043D\u043E \u0441\u043E\u0434\u0435\u0440\u0436\u0430\u0442\u044C \u0442\u043E\u043B\u044C\u043A\u043E \u043B\u0430\u0442\u0438\u043D\u0441\u043A\u0438\u0435 \u0431\u0443\u043A\u0432\u044B, \u0446\u0438\u0444\u0440\u044B, \u0434\u0435\u0444\u0438\u0441 \u0438 \u043F\u043E\u0434\u0447\u0451\u0440\u043A\u0438\u0432\u0430\u043D\u0438\u0435."
+          );
+        const id = renamed ? `${CONNECTION_PROVIDER_PREFIX}${name}` : old.id;
+        if (id !== old?.id && ctx.modelRegistry.getProvider(id))
+          throw new FormError(
+            `\u0418\u0434\u0435\u043D\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u043E\u0440 \u043F\u0440\u043E\u0432\u0430\u0439\u0434\u0435\u0440\u0430 \xAB${id}\xBB \u0443\u0436\u0435 \u0437\u0430\u043D\u044F\u0442. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0440\u0443\u0433\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F.`
+          );
+        await store.assertAvailable(id, old?.id);
         const url = baseUrl(values.url.trim() || GIGACHAT_DEFAULT_BASE_URL);
         const tokenUrl = mode === "credentials" ? values.tokenUrl.trim() || (url === GIGACHAT_DEFAULT_BASE_URL ? defaultTokenUrl : "") : "";
         if (mode === "credentials" && !tokenUrl)
@@ -2310,8 +2403,8 @@ async function registerGigaChatCommand(pi) {
           };
         }
         const draft = {
-          id: old?.id ?? `${CONNECTION_PROVIDER_PREFIX}${randomBytes(6).toString("hex")}`,
-          revision: randomBytes(12).toString("hex"),
+          id,
+          revision: randomBytes2(12).toString("hex"),
           name,
           baseUrl: url,
           authorization,
@@ -2320,7 +2413,7 @@ async function registerGigaChatCommand(pi) {
         const sameAuthorization = old?.authorization.type === authorization.type && (authorization.type === "token" || old.authorization.type === "credentials" && old.authorization.tokenUrl === authorization.tokenUrl && old.authorization.scope === authorization.scope);
         const changedEndpointOrSecret = !old || old.baseUrl !== draft.baseUrl || !sameAuthorization || Boolean(values.secret.trim());
         let credential;
-        if (previous && !changedEndpointOrSecret)
+        if (previous && !changedEndpointOrSecret && !renamed)
           credential = { ...previous, gigachatConnection: draft };
         else {
           const secret = values.secret.trim() || (old?.authorization.type === mode ? oldSecret : "");
@@ -2331,7 +2424,7 @@ async function registerGigaChatCommand(pi) {
           credential = await verifyAndChoose(ctx, draft, secret, previous);
         }
         if (!credential) return;
-        if (await persist(ctx, credential)) {
+        if (await persist(ctx, credential, old?.id)) {
           values.secret = "";
           return;
         }
@@ -2413,11 +2506,11 @@ async function registerGigaChatCommand(pi) {
         ...record,
         gigachatConnection: {
           ...connection,
-          revision: randomBytes(12).toString("hex"),
+          revision: randomBytes2(12).toString("hex"),
           models
         }
       };
-      if (await persist(ctx, credential)) return;
+      if (await persist(ctx, credential, connection.id)) return;
     }
   }
   async function manage(ctx) {
@@ -2464,11 +2557,11 @@ async function registerGigaChatCommand(pi) {
       try {
         const draft = {
           ...connection,
-          revision: randomBytes(12).toString("hex")
+          revision: randomBytes2(12).toString("hex")
         };
         const secret = record.type === "oauth" ? record.refresh : record.env?.GIGACHAT_ACCESS_TOKEN ?? "";
         const credential = await verifyAndChoose(ctx, draft, secret, record);
-        if (credential) await persist(ctx, credential);
+        if (credential) await persist(ctx, credential, connection.id);
       } catch (error) {
         ctx.ui.notify(
           error instanceof FormError ? error.message : describeDiscoveryError(error),

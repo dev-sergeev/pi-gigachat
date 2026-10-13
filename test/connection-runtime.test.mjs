@@ -13,23 +13,23 @@ import { cliPath, until, writeModelFixture } from './pi-rpc.mjs';
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const modelId = 'saved-private-model';
 const connection = (id, baseUrl, changes = {}) => ({
-  id: 'gigachat-server-' + id,
+  id: 'gigachat-' + id,
   revision: 'original-revision',
-  name: 'Saved private server',
+  name: id,
   baseUrl,
   authorization: { type: 'token' },
   models: [{ id: modelId, name: 'Private model', contextWindow: 200000, maxTokens: 64000, reasoning: false }],
   ...changes,
 });
 
-async function saveConnection(authPath, entry, secret) {
+async function saveConnection(authPath, entry, secret, previousId) {
   const signal = new AbortController().signal;
   // ConnectionStore commits through the public native ModelRuntime login API.
   await new ConnectionStore(authPath).save(await prepareConnectionCredential(entry, secret, signal), {
     signal,
     prompt: async () => { throw new Error('Saved token must not request interactive authorization'); },
     notify() {},
-  });
+  }, previousId);
 }
 
 function bounded(promise, milliseconds, label) {
@@ -108,7 +108,7 @@ async function withSavedPi(defaultConnection, records, run, runtime = {}) {
         } finally { pending.delete(id); }
       };
       current = {
-        events, agentDir, initialSettings,
+        events, agentDir, sessionFile, initialSettings,
         command,
         async prompt(message) {
           const offset = events.length;
@@ -190,14 +190,19 @@ function assertGenerationsOnly(requests, expectedTokens, maxTokens = 64000, expe
 
 const respond = (request, res) => reply(request, res, completion({ role: 'assistant', content: 'Private fixture reply.' }));
 
-test('native CLI restores a configured private default and resumes an RPC-selected private profile without model flags or paid probes', { timeout: 60000 }, async () => {
+for (const legacy of [false, true]) {
+test(`native CLI restores ${legacy ? 'legacy' : 'case-sensitive named'} private IDs and resumes an RPC-selected profile without model flags or paid probes`, { timeout: 60000 }, async () => {
   await withServer(async ({ baseUrl, requests }) => {
-    const configured = connection('configured-default', baseUrl);
-    const selected = connection('session-selected', baseUrl);
+    const configured = connection('LDBR', baseUrl, legacy ? { id: 'gigachat-server-configured-default', name: 'Legacy configured server / unchanged' } : {});
+    const selected = connection('ldbr', baseUrl, legacy ? { id: 'gigachat-server-session-selected', name: 'Legacy selected server / unchanged' } : {});
     configured.models[0].temperature = 0.27;
     selected.models[0].temperature = 0.41;
     await withSavedPi(configured, [[configured, '!configured-literal-token'], [selected, '$selected-literal-token']], async (pi, restart) => {
       await assertSelected(pi, configured);
+      const available = await pi.command('get_available_models');
+      assert.equal(available.success, true, available.error);
+      assert.deepEqual(available.data.models.filter(model => model.id === modelId).map(model => model.provider).sort(),
+        legacy ? ['gigachat-server-configured-default', 'gigachat-server-session-selected'] : ['gigachat-LDBR', 'gigachat-ldbr']);
       assertGenerationsOnly(requests, []);
       await assertSuccessfulPrompt(pi, configured, 'Use the configured private default.');
       assertGenerationsOnly(requests, ['!configured-literal-token']);
@@ -225,12 +230,13 @@ test('native CLI restores a configured private default and resumes an RPC-select
     });
   }, respond);
 });
+}
 
 test('an open native Pi refuses a changed saved connection before HTTP and restart adopts the current server and token', { timeout: 60000 }, async () => {
   await withServer(async originalServer => withServer(async currentServer => {
     const original = connection('externally-edited', originalServer.baseUrl);
     const updated = connection('externally-edited', currentServer.baseUrl, {
-      revision: 'changed-revision', name: 'Updated private server',
+      revision: 'changed-revision', name: original.name,
       models: [{ ...original.models[0], maxTokens: 32000 }],
     });
     await withSavedPi(original, [[original, 'original-private-token']], async (pi, restart, authPath) => {
@@ -242,7 +248,7 @@ test('an open native Pi refuses a changed saved connection before HTTP and resta
 
       // A separate store/native runtime commits the same edit another Pi process
       // would make, while the first process retains its old provider revision.
-      await saveConnection(authPath, updated, 'changed-private-token');
+      await saveConnection(authPath, updated, 'changed-private-token', original.id);
       const rejected = await pi.prompt('This stale provider must not contact either server.');
       if (rejected.assistant) assert.equal(rejected.assistant.stopReason, 'error');
       assert.match(rejected.error, /connection changed or was removed/i);
@@ -261,6 +267,57 @@ test('an open native Pi refuses a changed saved connection before HTTP and resta
       assertGenerationsOnly(currentServer.requests, ['changed-private-token'], 32000);
     });
   }, respond), respond);
+});
+
+test('renaming a legacy connection preserves historical session and default references until the user selects the new provider', { timeout: 60000 }, async () => {
+  await withServer(async ({ baseUrl, requests }) => {
+    const original = connection('legacy', baseUrl, { id: 'gigachat-server-original-uuid', name: 'Legacy server / unchanged' });
+    const renamed = { ...original, id: 'gigachat-LDBR', name: 'LDBR', revision: 'renamed-revision' };
+    await withSavedPi(original, [[original, 'original-token']], async (pi, restart, authPath) => {
+      await assertSelected(pi, original);
+      await assertSuccessfulPrompt(pi, original, 'Remember RENAME-RESUME-42 in the original connection.');
+      assertGenerationsOnly(requests, ['original-token']);
+      const transcript = await readFile(pi.sessionFile, 'utf8');
+      const history = transcript.trim().split('\n').map(line => JSON.parse(line));
+      assert(history.some(entry => entry.type === 'model_change' && entry.provider === 'gigachat-server-original-uuid'));
+
+      await saveConnection(authPath, renamed, 'renamed-token', original.id);
+      assert.deepEqual((await new ConnectionStore(authPath).list()).map(entry => entry.gigachatConnection.id), ['gigachat-LDBR']);
+      assert.equal(await readFile(pi.sessionFile, 'utf8'), transcript, 'Renaming storage must not rewrite historical model references');
+      assert.equal(await readFile(join(pi.agentDir, 'settings.json'), 'utf8'), pi.initialSettings,
+        'Renaming storage must not migrate the configured default provider');
+      const stale = await pi.prompt('The open old provider must not generate after rename.');
+      if (stale.assistant) assert.equal(stale.assistant.stopReason, 'error');
+      assert.match(stale.error, /connection changed or was removed/i);
+      assertGenerationsOnly(requests, ['original-token']);
+
+      pi = await restart();
+      assert.equal(await readFile(join(pi.agentDir, 'settings.json'), 'utf8'), pi.initialSettings);
+      const available = await pi.command('get_available_models');
+      assert.equal(available.success, true, available.error);
+      assert.deepEqual(available.data.models.filter(model => model.id === modelId).map(model => model.provider), ['gigachat-LDBR']);
+      const offset = pi.events.length;
+      const refused = await pi.command('prompt', { message: 'Do not automatically migrate the resumed provider.' });
+      assert.equal(refused.success, true, refused.error);
+      const notification = pi.events.slice(offset).find(event => event.type === 'extension_ui_request' && event.method === 'notify' && event.notifyType === 'error');
+      assert(notification, 'An old provider reference must require explicit model selection after rename');
+      assert.match(notification.message, /\/model/);
+      assert(!pi.events.slice(offset).some(event => event.type === 'agent_start'));
+      assertGenerationsOnly(requests, ['original-token']);
+
+      // Pi may already have chosen this provider as a fallback. Explicitly
+      // selecting it must still acknowledge the missing historical reference.
+      await assertSelected(pi, renamed);
+      const chosen = await pi.command('set_model', { provider: 'gigachat-LDBR', modelId });
+      assert.equal(chosen.success, true, chosen.error);
+      await assertSelected(pi, renamed);
+      await assertSuccessfulPrompt(pi, renamed, 'I explicitly selected the renamed connection.');
+      assertGenerationsOnly(requests, ['original-token', 'renamed-token']);
+      pi = await restart();
+      await assertSelected(pi, renamed);
+      assertGenerationsOnly(requests, ['original-token', 'renamed-token']);
+    });
+  }, respond);
 });
 
 test('resuming a consumer-configured GigaChat session does not switch to a newly saved private global default', { timeout: 60000 }, async () => {

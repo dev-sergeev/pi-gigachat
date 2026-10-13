@@ -15,7 +15,7 @@ export interface ConnectionModel {
 }
 
 export interface Connection {
-	/** Stable native provider identity, independent of name and endpoint. */
+	/** Native provider identity; retained on same-name edits, replaced on rename. */
 	id: string;
 	/** Changes on a user edit, but not during token renewal. */
 	revision: string;

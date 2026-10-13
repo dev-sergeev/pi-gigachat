@@ -1,4 +1,5 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -11,7 +12,11 @@ import type {
 	Provider,
 	ProviderAuth,
 } from "@earendil-works/pi-ai";
-import { createProvider, InMemoryModelsStore } from "@earendil-works/pi-ai";
+import {
+	createProvider,
+	InMemoryCredentialStore,
+	InMemoryModelsStore,
+} from "@earendil-works/pi-ai";
 import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
@@ -25,11 +30,12 @@ import { GigaChatHttpError, object } from "./http.js";
 import { GIGACHAT_API } from "./models.js";
 import { streamSimpleGigaChat } from "./stream.js";
 
-export const CONNECTION_PROVIDER_PREFIX = "gigachat-server-";
+export const CONNECTION_PROVIDER_PREFIX = "gigachat-";
 
 type ConnectionErrorCode =
 	| "GIGACHAT_STORAGE_ERROR"
 	| "GIGACHAT_STALE_CONNECTION"
+	| "GIGACHAT_ID_CONFLICT"
 	| "GIGACHAT_AUTH_ERROR";
 
 /** Safe to show in the wizard: no raw HTTP, filesystem, or secret-bearing cause. */
@@ -55,6 +61,26 @@ function storageError(): ConnectionError {
 		"GIGACHAT_STORAGE_ERROR",
 		"Cannot read or update GigaChat connections in auth.json. Check the file and its permissions, then try /gigachat again.",
 	);
+}
+
+function authData(content: string | undefined): Record<string, unknown> {
+	const data: unknown = JSON.parse((content ?? "{}").replace(/^\uFEFF/, ""));
+	if (!object(data)) throw storageError();
+	return data;
+}
+
+function assertWritable(
+	data: Record<string, unknown>,
+	id: string,
+	previousId?: string,
+): void {
+	if (previousId && !validCredential(data[previousId], previousId))
+		throw stale();
+	if (Object.hasOwn(data, id) && id !== previousId)
+		throw new ConnectionError(
+			"GIGACHAT_ID_CONFLICT",
+			`Идентификатор провайдера «${id}» уже занят. Выберите другое название подключения.`,
+		);
 }
 
 function ownedId(value: unknown): value is string {
@@ -401,7 +427,10 @@ export class ConnectionStore {
 		);
 	}
 
-	async list(signal?: AbortSignal): Promise<ConnectionCredential[]> {
+	private async withData<T>(
+		operation: (data: Record<string, unknown>) => Promise<T>,
+		signal?: AbortSignal,
+	): Promise<T> {
 		signal?.throwIfAborted();
 		let release: (() => Promise<void>) | undefined;
 		let compromised = false;
@@ -441,26 +470,36 @@ export class ConnectionStore {
 			} catch (error) {
 				signal?.throwIfAborted();
 				if (compromised) throw storageError();
-				if (object(error) && error.code === "ENOENT") return [];
-				throw error;
+				if (object(error) && error.code === "ENOENT") content = "{}";
+				else throw error;
 			}
 			signal?.throwIfAborted();
 			if (compromised) throw storageError();
-			const data: unknown = JSON.parse(content.replace(/^\uFEFF/, ""));
-			if (!object(data)) throw storageError();
-			const credentials: ConnectionCredential[] = [];
-			for (const [id, credential] of Object.entries(data)) {
-				if (!id.startsWith(CONNECTION_PROVIDER_PREFIX)) continue;
-				if (!validCredential(credential, id)) throw storageError();
-				credentials.push(credential);
-			}
-			return credentials;
-		} catch {
+			return await operation(authData(content));
+		} catch (error) {
 			signal?.throwIfAborted();
+			if (error instanceof ConnectionError) throw error;
 			throw storageError();
 		} finally {
 			await release?.().catch(() => {});
 		}
+	}
+
+	async list(signal?: AbortSignal): Promise<ConnectionCredential[]> {
+		return this.withData(async (data) => {
+			const credentials: ConnectionCredential[] = [];
+			for (const [id, credential] of Object.entries(data)) {
+				if (!id.startsWith(CONNECTION_PROVIDER_PREFIX)) continue;
+				if (
+					!object(credential) ||
+					!Object.hasOwn(credential, "gigachatConnection")
+				)
+					continue;
+				if (!validCredential(credential, id)) throw storageError();
+				credentials.push(credential);
+			}
+			return credentials;
+		}, signal);
 	}
 
 	private nativeRuntime(): Promise<ModelRuntime> {
@@ -492,19 +531,55 @@ export class ConnectionStore {
 		return signal ? raceWithAbortSignal(pending, signal) : pending;
 	}
 
+	async assertAvailable(
+		id: string,
+		previousId?: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (!ownedId(id)) throw storageError();
+		await this.withData(async (data) => {
+			assertWritable(data, id, previousId);
+		}, signal);
+	}
+
 	async save(
 		credential: ConnectionCredential,
 		interaction: AuthInteraction,
+		previousId?: string,
 	): Promise<void> {
 		if (!validCredential(credential)) throw storageError();
 		const saved = structuredClone(credential);
 		return this.write(async () => {
 			await this.list(interaction.signal);
-			const runtime = await this.nativeRuntime();
-			runtime.registerNativeProvider(
-				createConnectionProvider(saved.gigachatConnection, this, saved),
-			);
-			await runtime.login(saved.gigachatConnection.id, saved.type, interaction);
+			await this.withData(async (data) => {
+				const id = saved.gigachatConnection.id;
+				assertWritable(data, id, previousId);
+				const runtime = await ModelRuntime.create({
+					credentials: new InMemoryCredentialStore(),
+					modelsPath: null,
+					modelsStore: new InMemoryModelsStore(),
+					refreshOnCreate: false,
+					allowModelNetwork: false,
+				});
+				runtime.registerNativeProvider(
+					createConnectionProvider(saved.gigachatConnection, this, saved),
+				);
+				data[id] = await runtime.login(id, saved.type, interaction);
+				if (previousId && previousId !== id) delete data[previousId];
+				interaction.signal?.throwIfAborted();
+				// Commit replacement in one rename; failed writes retain the original file.
+				const temporary = `${this.authPath}.${randomBytes(12).toString("hex")}.tmp`;
+				try {
+					await writeFile(temporary, JSON.stringify(data, null, 2), {
+						mode: 0o600,
+						flag: "wx",
+					});
+					interaction.signal?.throwIfAborted();
+					await rename(temporary, this.authPath);
+				} finally {
+					await unlink(temporary).catch(() => {});
+				}
+			}, interaction.signal);
 		}, interaction.signal);
 	}
 

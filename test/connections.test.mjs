@@ -13,7 +13,7 @@ const context = { messages: [user('Hello')] };
 const signal = () => new AbortController().signal;
 const interaction = () => ({ signal: signal(), prompt: async () => { throw new Error('Unexpected native secret prompt'); }, notify() {} });
 const connection = (id, baseUrl, changes = {}) => ({
-  id: 'gigachat-server-' + id, revision: 'revision-1', name: 'Same connection name', baseUrl,
+  id: 'gigachat-' + id, revision: 'revision-1', name: id, baseUrl,
   authorization: { type: 'token' },
   models: [{ id: 'shared-model', name: 'Shared model', contextWindow: 32000, maxTokens: 1000, reasoning: false }],
   ...changes,
@@ -33,12 +33,138 @@ async function send(models, entry, modelId = 'shared-model', options) {
 }
 function successful(result) { assert.equal(result.stopReason, 'stop', result.errorMessage); }
 
+test('new case-sensitive provider IDs and unchanged legacy names restore without claiming unrelated prefixed credentials', async () => {
+  await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
+    const unrelated = {
+      'gigachat-external': { type: 'api_key', key: 'external-key' },
+      'gigachat-server-external': { type: 'oauth', access: 'external-access', refresh: 'external-refresh', expires: 123 },
+    };
+    await writeFile(authPath, JSON.stringify(unrelated));
+    const entries = [
+      connection('LDBR', baseUrl),
+      connection('ldbr', baseUrl),
+      connection('legacy', baseUrl, { id: 'gigachat-server-old-uuid', name: 'Старый сервер / unchanged' }),
+    ];
+    const store = new ConnectionStore(authPath);
+    for (const [index, entry] of entries.entries()) {
+      await store.save(await prepareConnectionCredential(entry, 'token-' + index, signal()), interaction());
+    }
+    const restored = await new ConnectionStore(authPath).list();
+    assert.deepEqual(restored.map(entry => entry.gigachatConnection), entries);
+    assert.deepEqual(restored.map(entry => entry.gigachatConnection.id), ['gigachat-LDBR', 'gigachat-ldbr', 'gigachat-server-old-uuid']);
+    const models = await runtime(authPath, restored.map(entry => entry.gigachatConnection));
+    for (const entry of entries) successful(await send(models, entry));
+    assert.deepEqual(requests.map(request => request.headers.authorization), ['Bearer token-0', 'Bearer token-1', 'Bearer token-2']);
+    const saved = JSON.parse(await readFile(authPath, 'utf8'));
+    for (const [id, credential] of Object.entries(unrelated)) assert.deepEqual(saved[id], credential);
+  }));
+});
+
+test('occupied IDs reject new and renamed connections without overwriting any credential', async () => {
+  await withStorage(async authPath => {
+    const store = new ConnectionStore(authPath);
+    const original = connection('original', 'https://example.invalid/v1');
+    const target = connection('LDBR', original.baseUrl);
+    const prior = await prepareConnectionCredential(original, 'original-token', signal());
+    const next = await prepareConnectionCredential(target, 'replacement-token', signal());
+    const occupants = [
+      { type: 'api_key', key: 'non-gigachat-key' },
+      { type: 'oauth', access: 'non-gigachat-access', refresh: 'non-gigachat-refresh', expires: 123 },
+      await prepareConnectionCredential(target, 'existing-connection-token', signal()),
+    ];
+    for (const occupied of occupants) {
+      const saved = JSON.stringify({ [original.id]: prior, [target.id]: occupied });
+      await writeFile(authPath, saved);
+      await assert.rejects(store.save(next, interaction()));
+      assert.equal(await readFile(authPath, 'utf8'), saved);
+      await assert.rejects(store.save(next, interaction(), original.id));
+      assert.equal(await readFile(authPath, 'utf8'), saved);
+      if (!occupied.gigachatConnection) {
+        await assert.rejects(store.save(next, interaction(), target.id));
+        assert.equal(await readFile(authPath, 'utf8'), saved, 'A matching previousId must not authorize overwriting an unrelated credential');
+      }
+    }
+  });
+});
+
+test('independent stores cannot both save a new connection to the same occupied ID', async () => {
+  await withStorage(async authPath => {
+    const entry = connection('LDBR', 'https://example.invalid/v1');
+    const credentials = await Promise.all(['first-token', 'second-token'].map(secret => prepareConnectionCredential(entry, secret, signal())));
+    const results = await Promise.allSettled(credentials.map(credential => new ConnectionStore(authPath).save(credential, interaction())));
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(results.filter(result => result.status === 'rejected').length, 1);
+    const winner = results.findIndex(result => result.status === 'fulfilled');
+    assert.deepEqual(await new ConnectionStore(authPath).list(), [credentials[winner]]);
+    assert.deepEqual(JSON.parse(await readFile(authPath, 'utf8')), { 'gigachat-LDBR': credentials[winner] });
+  });
+});
+
+for (const legacy of [false, true]) {
+test(`same-ID edits replace only that credential and retain an unchanged ${legacy ? 'legacy' : 'named'} ID`, async () => {
+  await withStorage(async authPath => {
+    const store = new ConnectionStore(authPath);
+    const original = connection('LDBR', 'https://example.invalid/v1',
+      legacy ? { id: 'gigachat-server-original-uuid', name: 'Legacy name / unchanged' } : {});
+    const unrelated = { type: 'api_key', key: 'untouched' };
+    await writeFile(authPath, JSON.stringify({ 'gigachat-other': unrelated }));
+    const prior = await prepareConnectionCredential(original, 'original-token', signal());
+    await store.save(prior, interaction());
+    const updated = { ...original, revision: 'edited-revision', models: [{ ...original.models[0], maxTokens: 2000 }] };
+    const next = await prepareConnectionCredential(updated, 'updated-token', signal(), prior);
+    await store.save(next, interaction(), original.id);
+    assert.deepEqual(await new ConnectionStore(authPath).list(), [next]);
+    assert.deepEqual(JSON.parse(await readFile(authPath, 'utf8')), {
+      'gigachat-other': unrelated,
+      [legacy ? 'gigachat-server-original-uuid' : 'gigachat-LDBR']: next,
+    });
+  });
+});
+}
+
+test('rename replaces the old credential and restores only the new provider identity', async () => {
+  await withStorage(async authPath => {
+    const store = new ConnectionStore(authPath);
+    const original = connection('legacy', 'https://example.invalid/v1', { id: 'gigachat-server-original-uuid', name: 'Legacy name' });
+    const renamed = { ...original, id: 'gigachat-LDBR', name: 'LDBR', revision: 'renamed-revision' };
+    const prior = await prepareConnectionCredential(original, 'original-token', signal());
+    const next = await prepareConnectionCredential(renamed, 'renamed-token', signal(), prior);
+    await store.save(prior, interaction());
+    await store.save(next, interaction(), original.id);
+    assert.deepEqual(await new ConnectionStore(authPath).list(), [next]);
+  });
+});
+
+test('failure saving a renamed credential leaves the original credential usable', async t => {
+  await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
+    const store = new ConnectionStore(authPath);
+    const original = connection('original', baseUrl);
+    const renamed = { ...original, id: 'gigachat-LDBR', name: 'LDBR', revision: 'renamed-revision' };
+    const prior = await prepareConnectionCredential(original, 'original-token', signal());
+    await store.save(prior, interaction());
+    const before = await readFile(authPath, 'utf8');
+    const next = await prepareConnectionCredential(renamed, 'renamed-token', signal(), prior);
+    let attempted = false;
+    t.mock.method(ModelRuntime.prototype, 'login', async () => {
+      attempted = true;
+      throw new Error('Native credential commit failed');
+    });
+    await assert.rejects(store.save(next, interaction(), original.id));
+    assert.equal(attempted, true);
+    assert.equal(await readFile(authPath, 'utf8'), before);
+    assert.deepEqual(await new ConnectionStore(authPath).list(), [prior]);
+    const models = await runtime(authPath, [original]);
+    successful(await send(models, original));
+    assert.equal(requests[0].headers.authorization, 'Bearer original-token');
+  }));
+});
+
 // All requests cross native credential storage and provider dispatch, not a mock auth adapter.
 test('same named server and Model ID remain independent across native save and restart', async () => {
   await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
     await writeFile(authPath, JSON.stringify({ unrelated: { type: 'api_key', key: 'keep-this-provider' } }));
-    const first = connection('first', baseUrl);
-    const second = connection('second', baseUrl);
+    const first = connection('first', baseUrl, { id: 'gigachat-server-first', name: 'Same connection name' });
+    const second = connection('second', baseUrl, { id: 'gigachat-server-second', name: 'Same connection name' });
     const store = new ConnectionStore(authPath);
     await store.save(await prepareConnectionCredential(first, 'Bearer !literal-token', signal()), interaction());
     await store.save(await prepareConnectionCredential(second, '$literal-token', signal()), interaction());
@@ -72,7 +198,7 @@ test('native pre-resolved bearer authentication keeps private credentials and re
       successful(await send(models, entry, 'shared-model', { apiKey: auth.apiKey,
         env: { GIGACHAT_ACCESS_TOKEN: 'unrelated-legacy-token', GIGACHAT_BASE_URL: 'http://invalid.example' } }));
       const credential = (await store.list()).find(value => value.gigachatConnection.id === entry.id);
-      await store.save({ ...credential, gigachatConnection: { ...entry, revision: 'changed-bearer-revision' } }, interaction());
+      await store.save({ ...credential, gigachatConnection: { ...entry, revision: 'changed-bearer-revision' } }, interaction(), entry.id);
       const before = requests.length;
       const rejected = await send(models, entry, 'shared-model', { apiKey: auth.apiKey });
       assert.equal(rejected.stopReason, 'error');
@@ -96,11 +222,11 @@ for (const mode of ['token', 'credentials']) {
       await store.save(prior, interaction());
       const models = await runtime(authPath, [original]);
       const retained = models.getModel(original.id, 'shared-model');
-      const updated = { ...original, revision: 'revision-2', name: 'Renamed connection',
+      const updated = { ...original, revision: 'revision-2',
         models: [{ ...original.models[0], contextWindow: 64000, maxTokens: 2000 }] };
       const next = await prepareConnectionCredential(updated, 'original-secret', signal(), prior);
       assert.equal(requests.length, mode === 'credentials' ? 1 : 0, 'Label/model edits must not exchange an unexpired token');
-      await store.save(mode === 'credentials' ? { ...next, expires: 0 } : next, interaction());
+      await store.save(mode === 'credentials' ? { ...next, expires: 0 } : next, interaction(), original.id);
       const before = requests.length;
       const rejected = await models.completeSimple(retained, context);
       assert.equal(rejected.stopReason, 'error');
@@ -125,7 +251,7 @@ test('deselected retained models cannot generate after fresh registration', asyn
     const models = await runtime(authPath, [original]);
     const retained = models.getModel(original.id, 'shared-model');
     const updated = { ...original, revision: 'revision-2', models: [original.models[1]] };
-    await store.save(await prepareConnectionCredential(updated, 'selection-token', signal()), interaction());
+    await store.save(await prepareConnectionCredential(updated, 'selection-token', signal()), interaction(), original.id);
     models.registerNativeProvider(createConnectionProvider(updated, store));
     assert.equal(models.getModel(updated.id, 'shared-model'), undefined);
     const rejected = await models.completeSimple(retained, context);
