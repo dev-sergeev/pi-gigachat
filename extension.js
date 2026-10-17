@@ -348,7 +348,6 @@ async function configuration(ctx, credential) {
     "GIGACHAT_MAX_RETRIES",
     "GIGACHAT_RETRY_BASE_DELAY_MS",
     "GIGACHAT_STREAM",
-    "GIGACHAT_REASONING_IN_CONTENT",
     "GIGACHAT_EXTRA_BODY",
     "GIGACHAT_SYSTEM_PROMPT",
     "HTTP_PROXY",
@@ -665,7 +664,7 @@ var init_transform_messages = __esm({
 });
 
 // src/messages.ts
-function convertMessages(model, context, additionalSystemPrompt, reasoningInContent = false) {
+function convertMessages(model, context, additionalSystemPrompt) {
   const messages = [];
   const transformedMessages = transformMessages(context.messages, model);
   const systemPrompt = [context.systemPrompt, additionalSystemPrompt?.trim()].filter(Boolean).join("\n\n");
@@ -696,11 +695,8 @@ function convertMessages(model, context, additionalSystemPrompt, reasoningInCont
         (item) => item.type === "thinking" && !item.redacted
       );
       const reasoningText = thinking.map((item) => item.thinking).join("");
-      const reasoning = thinking.length && !reasoningInContent ? { reasoning_content: reasoningText } : {};
       const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("");
-      const content = reasoningInContent && reasoningText ? `<previous_reasoning>
-${sanitizeSurrogates(reasoningText)}
-</previous_reasoning>${text ? `
+      const content = reasoningText ? `${sanitizeSurrogates(reasoningText)}${text ? `
 
 ${text}` : ""}` : text;
       const toolCalls = message.content.filter(
@@ -716,7 +712,6 @@ ${text}` : ""}` : text;
           messages.push({
             role: "assistant",
             content: callIndex === 0 ? content : "",
-            ...callIndex === 0 ? reasoning : {},
             function_call: { name: call.name, arguments: call.arguments }
           });
           const result = results.get(call.id);
@@ -736,8 +731,7 @@ ${text}` : ""}` : text;
       } else {
         messages.push({
           role: "assistant",
-          content,
-          ...reasoning
+          content
         });
       }
       continue;
@@ -801,9 +795,6 @@ function payload(model, context, options) {
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
     throw new Error("GIGACHAT_STREAM must be true or false");
-  const reasoningInContent = env.GIGACHAT_REASONING_IN_CONTENT ?? "false";
-  if (reasoningInContent !== "true" && reasoningInContent !== "false")
-    throw new Error("GIGACHAT_REASONING_IN_CONTENT must be true or false");
   const additionalSystemPrompt = env.GIGACHAT_SYSTEM_PROMPT ?? DEFAULT_SYSTEM_PROMPT;
   let extra;
   try {
@@ -819,12 +810,7 @@ function payload(model, context, options) {
   const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
   return {
     model: model.id,
-    messages: convertMessages(
-      model,
-      context,
-      additionalSystemPrompt,
-      reasoningInContent === "true"
-    ),
+    messages: convertMessages(model, context, additionalSystemPrompt),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     function_call: options.toolChoice ?? options.functionCall ?? (context.tools?.length ? "auto" : "none"),
     ...context.tools?.length ? { functions: convertFunctions(context.tools) } : {},

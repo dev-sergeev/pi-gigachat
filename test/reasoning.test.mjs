@@ -48,7 +48,7 @@ for (const streaming of [false, true]) test(`reasoning survives a tool response,
     assert.equal(next.result.stopReason, 'stop', next.result.errorMessage);
     const messages = requests[1].body.messages;
     const replay = messages.find(message => message.role === 'assistant');
-    assert.deepEqual(replay, { role: 'assistant', content: '', reasoning_content: reasoning,
+    assert.deepEqual(replay, { role: 'assistant', content: reasoning,
       function_call: { name: 'bash', arguments: { command: 'cd /home ' } } });
     assert.equal(messages[messages.indexOf(replay) + 1].role, 'function');
   }, (req, res, requests) => reply(req, res, requests.length === 1 ? fixture : completion()));
@@ -58,8 +58,7 @@ for (const text of [' \nПроверка 🙂𐐀\t ', ' \n\t ']) test(`replay p
   const history = [assistant([wireThinking(text), { type: 'text', text: 'Answer' }])];
   const before = JSON.stringify(history);
   const [message] = convertMessages(selected, { messages: history });
-  assert.equal(message.reasoning_content, text);
-  assert.equal(message.content, 'Answer');
+  assert.deepEqual(message, { role: 'assistant', content: `${text}\n\nAnswer` });
   assert.equal(JSON.stringify(history), before);
 });
 
@@ -67,7 +66,7 @@ test('native thinking blocks are replayed in order without requiring a provider 
   const [message] = convertMessages(selected, { messages: [assistant([
     { type: 'thinking', thinking: 'First\n' }, { type: 'thinking', thinking: ' Second' }, { type: 'text', text: 'Answer' },
   ])] });
-  assert.equal(message.reasoning_content, 'First\n Second');
+  assert.deepEqual(message, { role: 'assistant', content: 'First\n Second\n\nAnswer' });
 });
 
 test('model switching retains Pi normalization and never sends foreign reasoning as reasoning_content', () => {
@@ -81,11 +80,11 @@ test('model switching retains Pi normalization and never sends foreign reasoning
   }
 });
 
-test('redacted and failed reasoning is not replayed as plaintext reasoning_content', () => {
+test('redacted and failed reasoning is not replayed as plaintext', () => {
   const [message] = convertMessages(selected, { messages: [assistant([
     { ...wireThinking('encrypted placeholder'), redacted: true }, { type: 'text', text: 'Answer' },
   ])] });
-  assert.equal(message.reasoning_content, undefined);
+  assert.deepEqual(message, { role: 'assistant', content: 'Answer' });
   for (const stopReason of ['error', 'aborted']) assert.deepEqual(convertMessages(selected, {
     messages: [assistant([wireThinking('incomplete')], { stopReason })],
   }), []);
@@ -101,7 +100,7 @@ for (const streaming of [false, true]) {
       const next = await collect(model, { messages: [JSON.parse(JSON.stringify(result)), user('Continue')] }, { stream: streaming });
       assert.equal(next.result.stopReason, 'length', next.result.errorMessage);
       assert.deepEqual(requests[1].body.messages.find(m => m.role === 'assistant'),
-        { role: 'assistant', reasoning_content: 'Still thinking.', content: '' });
+        { role: 'assistant', content: 'Still thinking.' });
     }, (req, res) => reply(req, res, completion({ role: 'assistant', content: '', reasoning_content: 'Still thinking.', functions_state_id: state }, 'length')));
   });
 
@@ -139,8 +138,7 @@ test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alter
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.deepEqual(result.content.map(block => block.type), ['thinking', 'text', 'thinking', 'text']);
     const [message] = convertMessages(model, { messages: [result] });
-    assert.equal(message.reasoning_content, ' \nПроверка 🙂𐐀\t Second\n');
-    assert.equal(message.content, 'AB');
+    assert.deepEqual(message, { role: 'assistant', content: ' \nПроверка 🙂𐐀\t Second\n\n\nAB' });
     assert.deepEqual(events.filter(e => !e.type.endsWith('_delta')).map(e => e.type), [
       'start', 'thinking_start', 'thinking_end', 'text_start', 'text_end',
       'thinking_start', 'thinking_end', 'text_start', 'text_end', 'done',

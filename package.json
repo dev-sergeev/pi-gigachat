@@ -1,6 +1,6 @@
 {
 	"name": "@dev-sergeev/pi-gigachat",
-	"version": "0.6.2",
+	"version": "0.6.3",
 	"description": "GigaChat-compatible server connections and user-selected models for pi-coding-agent",
 	"private": false,
 	"type": "module",

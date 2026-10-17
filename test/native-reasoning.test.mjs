@@ -13,8 +13,7 @@ const answerThought = 'REASONING_ANSWER_742\n  Use the file result.  ';
 const summary = 'Summary: the file contains NATIVE_REASONING_FIXTURE_742.';
 const isSummary = req => req.body.messages[0]?.content?.includes('summariz');
 
-for (const reasoningInContent of [false, true])
-for (const streaming of [false, true]) test(`native Pi displays, saves, resumes and compacts consumer-model reasoning (stream=${streaming}, content=${reasoningInContent})`, { timeout: 60000 }, async () => {
+for (const streaming of [false, true]) test(`native Pi displays, saves, resumes and compacts consumer-model reasoning (stream=${streaming})`, { timeout: 60000 }, async () => {
   let path;
   let called = false;
   await withServer(async ({ baseUrl, requests }) => {
@@ -24,9 +23,9 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       await pi.prompt(`Read ${path}`);
       assert(pi.events.some(e => e.type === 'tool_execution_end' && !e.isError));
       const followup = requests[1].body.messages.find(m => m.role === 'assistant');
-      assert.equal(followup.reasoning_content, reasoningInContent ? undefined : toolThought);
+      assert(!Object.hasOwn(followup, 'reasoning_content'));
       assert(!Object.hasOwn(followup, 'functions_state_id'));
-      assert.equal(followup.content, reasoningInContent ? `<previous_reasoning>\n${toolThought}\n</previous_reasoning>` : '');
+      assert.equal(followup.content, toolThought);
       const messages = (await pi.command('get_messages')).data.messages;
       const assistants = messages.filter(m => m.role === 'assistant');
       assert.deepEqual(assistants.map(m => m.content[0].thinking), [toolThought, answerThought]);
@@ -44,12 +43,9 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       assert.deepEqual((await pi.command('get_messages')).data.messages.filter(m => m.role === 'assistant').map(m => m.content), assistants.map(m => m.content));
       await pi.prompt('Continue from the previous reasoning.');
       const replayed = requests.at(-1).body.messages.filter(m => m.role === 'assistant');
-      if (reasoningInContent) {
-        assert(replayed.every(m => !Object.hasOwn(m, 'reasoning_content')));
-        assert.deepEqual(replayed.map(m => m.content.split('<previous_reasoning>').length - 1), [1, 1]);
-        assert.equal(replayed[0].content, `<previous_reasoning>\n${toolThought}\n</previous_reasoning>`);
-        assert.equal(replayed[1].content, `<previous_reasoning>\n${answerThought}\n</previous_reasoning>\n\nThe file contains NATIVE_REASONING_FIXTURE_742.`);
-      } else assert.deepEqual(replayed.map(m => m.reasoning_content), [toolThought, answerThought]);
+      assert(replayed.every(m => !Object.hasOwn(m, 'reasoning_content')));
+      assert.equal(replayed[0].content, toolThought);
+      assert.equal(replayed[1].content, `${answerThought}\n\nThe file contains NATIVE_REASONING_FIXTURE_742.`);
       assert(replayed.every(m => !Object.hasOwn(m, 'functions_state_id')));
       for (let i = 0; i < 3; i++) await pi.prompt(`Keep the file fact ${i}. ${'conversation '.repeat(200)}`);
       const compacted = await pi.command('compact');
@@ -60,7 +56,7 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       assert((await pi.entries()).some(e => e.type === 'message' && e.message.content?.some?.(b => b.thinking === toolThought)), 'compaction must keep the original session entries');
       await pi.prompt('Continue after compaction.');
       assert(requests.at(-1).body.messages.some(m => m.content.includes(summary)));
-    }, {}, { tools: 'read', timeout: 30000, env: { GIGACHAT_STREAM: String(streaming), ...(reasoningInContent ? { GIGACHAT_REASONING_IN_CONTENT: 'true' } : {}) } });
+    }, {}, { tools: 'read', timeout: 30000, env: { GIGACHAT_STREAM: String(streaming) } });
   }, (req, res) => {
     if (isSummary(req)) reply(req, res, completion({ role: 'assistant', content: summary }));
     else if (!called) {
