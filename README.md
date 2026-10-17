@@ -12,6 +12,13 @@ conversations, Pi tools, and JSON or SSE responses.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Release 0.6.2
+
+- Model availability checks now allow up to three sequential attempts per model, each with a fixed five-second timeout covering the complete response.
+- Every failed probe is retried immediately, including HTTP, network, and invalid-response errors; retry-delay headers do not add waits.
+- Models that exhaust all three attempts remain visible with the last failure reason but cannot be selected. Cancellation stops the check without further attempts.
+- Normal generation, authentication, and catalog-request timeout/retry policies are unchanged.
+
 ## Release 0.6.1
 
 - New `/gigachat` connections use readable, case-sensitive provider IDs such as `gigachat-LDBR`, shown directly in Pi's native `/model` selector.
@@ -46,7 +53,7 @@ under its original MIT license.
 With Pi 0.85.1 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.6.1
+pi install npm:@dev-sergeev/pi-gigachat@0.6.2
 pi
 ```
 
@@ -264,18 +271,30 @@ library callers must supply their own model definitions.
    `GIGACHAT_API_PERS` by default, or `GIGACHAT_API_B2B` / `GIGACHAT_API_CORP`.
    This wizard accepts an authorization key, not a username/password pair.
 3. The extension reads `GET <API URL>/models`, removes duplicate Model IDs within
-   this connection, and checks each unique model with a simple non-streaming
-   generation using `max_tokens: 1`.
+   this connection, and checks each unique model sequentially with a simple
+   non-streaming generation using `max_tokens: 1`. Each model gets up to three
+   attempts, stopping on the first valid response. Every attempt has a fixed
+   five-second timeout covering both response headers and the complete body;
+   time spent waiting in the generation queue is not part of that timeout.
 4. Use **Space** to select successful models, **Ctrl+A** to select all successful
    models, and **Enter** to save. Failed models remain visible with a reason but
    cannot be selected. An empty successful set is never saved.
 5. Open the normal `/model` picker and select an added model. It is available
    immediately, without restarting Pi or creating a named provider manually.
 
-The discovery generations can be billed. A one-token output budget does not
-limit response time or prove tool compatibility, reasoning support, or the
-server's maximum output budget. Failed checks do not replace an existing
-connection.
+The discovery generations can be billed, including repeat attempts. Any failed
+probe is retried immediately without backoff or `Retry-After` waits. After three
+failures, the model is unavailable for selection in the current check; the
+displayed reason describes the last failure. Cancellation stops the active
+request and prevents further attempts. Thirty models exhausting all three
+timeouts require about 7.5 minutes of request time, excluding queue waits and
+catalog/authentication requests.
+
+A one-token output budget does not prove tool compatibility, reasoning support,
+or the server's maximum output budget. Failed checks do not replace an existing
+connection. Probe limits are independent of `GIGACHAT_TIMEOUT` and
+`GIGACHAT_MAX_RETRIES`; ordinary generation, authentication, and catalog requests
+keep their existing policies.
 
 Each connection has one name and authorization configuration shared by its
 selected models. New connection names and changed names must match

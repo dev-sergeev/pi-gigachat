@@ -1703,40 +1703,43 @@ async function discoverModels(baseUrl2, apiKey, options) {
     async (response) => catalog(await readJson(response))
   );
   options.signal.throwIfAborted();
+  const probeTransport = { ...transport, timeoutMs: 5e3 };
+  const consumeProbe = async (response) => validateCompletion(await readJson(response));
   const probes = [];
   options.progress?.(0, models.length);
   for (const model of models) {
     options.signal.throwIfAborted();
-    let probe;
-    try {
-      await serial(
-        options.signal,
-        () => request(
-          `${root}/chat/completions`,
-          {
-            method: "POST",
-            headers: headers2,
-            body: JSON.stringify({
-              model: model.id,
-              messages: [{ role: "user", content: "Hi" }],
-              max_tokens: 1,
-              stream: false
-            })
-          },
-          transport,
-          async (response) => validateCompletion(await readJson(response))
-        )
-      );
-      probe = { model, status: "available" };
-    } catch (error) {
-      options.signal.throwIfAborted();
-      const denied = error instanceof GigaChatHttpError && [400, 401, 402, 403, 404, 422].includes(error.status);
-      probe = {
-        model,
-        status: denied ? "unavailable" : "unverified",
-        reason: describeDiscoveryError(error)
+    const probe = await serial(options.signal, async () => {
+      const init = {
+        method: "POST",
+        headers: headers2,
+        body: JSON.stringify({
+          model: model.id,
+          messages: [{ role: "user", content: "Hi" }],
+          max_tokens: 1,
+          stream: false
+        })
       };
-    }
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await request(
+            `${root}/chat/completions`,
+            init,
+            probeTransport,
+            consumeProbe
+          );
+          return { model, status: "available" };
+        } catch (error) {
+          options.signal.throwIfAborted();
+          if (attempt === 3)
+            return {
+              model,
+              status: "unavailable",
+              reason: `GigaChat model unavailable after 3 attempts. ${describeDiscoveryError(error)}`
+            };
+        }
+      }
+    });
     options.signal.throwIfAborted();
     probes.push(probe);
     options.progress?.(probes.length, models.length, probe);
@@ -1748,7 +1751,7 @@ function describeDiscoveryError(error) {
   if (error instanceof DiscoveryError) return error.message;
   if (error instanceof GigaChatHttpError) {
     const status = error.status;
-    const detail = status === 401 ? "access token rejected" : status === 403 ? "access denied" : status === 404 ? "endpoint or model not found" : status === 429 ? "rate limited; availability is not verified" : status === 408 ? "request timed out; availability is not verified" : status >= 500 ? "server temporarily unavailable" : "request rejected";
+    const detail = status === 401 ? "access token rejected" : status === 403 ? "access denied" : status === 404 ? "endpoint or model not found" : status === 429 ? "rate limited" : status === 408 ? "request timed out" : status >= 500 ? "server temporarily unavailable" : "request rejected";
     return `GigaChat HTTP ${status}: ${detail}.`;
   }
   const code = object(error) ? error.code : void 0;
@@ -1765,7 +1768,7 @@ function describeDiscoveryError(error) {
   if (error instanceof Error && error.name === "AbortError")
     return "GigaChat discovery cancelled.";
   if (error instanceof Error && error.name === "TimeoutError")
-    return "GigaChat request timed out; availability is not verified.";
+    return "GigaChat request timed out.";
   if (error instanceof TypeError || typeof code === "string" && /^(?:E|UND_ERR_)/.test(code) || error instanceof Error && error.cause !== void 0)
     return "Cannot reach the GigaChat server. Check the network, URL and proxy settings.";
   return "GigaChat discovery failed. Check the connection settings and try again.";

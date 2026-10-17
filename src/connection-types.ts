@@ -34,7 +34,7 @@ export type ConnectionCredential = (ApiKeyCredential | OAuthCredential) & {
 
 export interface ModelProbe {
 	model: ConnectionModel;
-	status: "available" | "unavailable" | "unverified";
+	status: "available" | "unavailable";
 	reason?: string;
 }
 

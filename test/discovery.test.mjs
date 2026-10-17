@@ -35,8 +35,8 @@ async function withServer(respond, run) {
   }
 }
 
-// The public discovery call and actual HTTP requests are the seam: one paid
-// generation per exact server Model ID, not per catalog row or display name.
+// The public discovery call and actual HTTP requests are the seam: probes are
+// scoped to each exact server Model ID, not catalog rows or display names.
 test('deduplicates exact Model IDs before serial one-token probes and accepts truncated empty completions', async () => {
   let active = 0;
   let peak = 0;
@@ -146,7 +146,7 @@ test('refreshing model availability preserves selected saved parameters and give
   });
 });
 
-test('keeps partial successes and distinguishes denied models from temporary HTTP and network failures without retries', async () => {
+test('keeps partial successes and exhausts three attempts for HTTP and network failures', async () => {
   const ids = ['good', 'denied', 'invalid', 'limited', 'server-down', 'network-down', 'last-good'];
   await withServer((req, res) => {
     if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
@@ -165,15 +165,46 @@ test('keeps partial successes and distinguishes denied models from temporary HTT
       progress: (_completed, _total, probe) => { if (probe) reported.push(probe); },
     });
     assert.deepEqual(probes.map(probe => probe.status), [
-      'available', 'unavailable', 'unavailable', 'unverified', 'unverified', 'unverified', 'available',
+      'available', 'unavailable', 'unavailable', 'unavailable', 'unavailable', 'unavailable', 'available',
     ]);
     assert.deepEqual(reported, probes);
-    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), ids);
+    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), [
+      'good', 'denied', 'denied', 'denied', 'invalid', 'invalid', 'invalid',
+      'limited', 'limited', 'limited', 'server-down', 'server-down', 'server-down',
+      'network-down', 'network-down', 'network-down', 'last-good',
+    ]);
     assert.match(probes[1].reason, /403.*denied/i);
     assert.match(probes[3].reason, /429.*rate/i);
     assert.match(probes[4].reason, /503.*temporar/i);
     assert.match(probes[5].reason, /network/i);
     assert.ok(probes.every(probe => !probe.reason?.includes(secret)));
+  });
+});
+
+test('a model can recover on its third attempt after different errors without retry waits', { timeout: 3000 }, async () => {
+  let attempts = 0;
+  await withServer((req, res) => {
+    if (req.method === 'GET') return json(res, { data: [{ id: 'recovering' }, { id: 'next' }] });
+    if (req.body.model === 'next') return json(res, completion());
+    attempts++;
+    if (attempts === 1) return json(res, { error: 'denied' }, 403);
+    if (attempts === 2) {
+      res.writeHead(429, { 'Retry-After': '600' });
+      return res.end('limited');
+    }
+    json(res, completion());
+  }, async ({ baseUrl, requests }) => {
+    const progress = [];
+    const probes = await discoverModels(baseUrl, secret, {
+      signal: new AbortController().signal,
+      progress: (completed, total, probe) => progress.push([completed, total, probe?.status]),
+    });
+    assert.deepEqual(probes.map(probe => [probe.model.id, probe.status]), [
+      ['recovering', 'available'], ['next', 'available'],
+    ]);
+    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model),
+      ['recovering', 'recovering', 'recovering', 'next']);
+    assert.deepEqual(progress, [[0, 2, undefined], [1, 2, 'available'], [2, 2, 'available']]);
   });
 });
 
@@ -214,7 +245,7 @@ test('catalog HTTP failure rejects instead of returning or probing models and do
   });
 });
 
-test('malformed completions remain unverified and do not prevent later successful probes', async () => {
+test('malformed completions exhaust their attempts without preventing later successful probes', async () => {
   const malformed = [
     { choices: [] },
     { choices: [{ message: { role: 'assistant', content: 'unfinished' } }] },
@@ -231,12 +262,12 @@ test('malformed completions remain unverified and do not prevent later successfu
     json(res, body);
   }, async ({ baseUrl, requests }) => {
     const probes = await discoverModels(baseUrl, secret, { signal: new AbortController().signal });
-    assert.deepEqual(probes.map(probe => probe.status), [...malformed.map(() => 'unverified'), 'available']);
+    assert.deepEqual(probes.map(probe => probe.status), [...malformed.map(() => 'unavailable'), 'available']);
     for (const probe of probes.slice(0, -1)) {
       assert.match(probe.reason, /invalid response/i);
       assert.ok(!probe.reason.includes(secret));
     }
-    assert.equal(requests.length, malformed.length + 2);
+    assert.equal(requests.length, 20);
   });
 });
 
@@ -301,21 +332,50 @@ for (const phase of ['catalog', 'probe']) {
   });
 }
 
-test('a timed-out paid probe is unverified and later models still run', async () => {
+test('each probe attempt times out after five seconds while reading the body, independently of generation settings', { timeout: 25000 }, async t => {
   const original = process.env.GIGACHAT_TIMEOUT;
-  process.env.GIGACHAT_TIMEOUT = '0.2';
+  process.env.GIGACHAT_TIMEOUT = '1';
+  const started = [];
   try {
     await withServer((req, res) => {
       if (req.method === 'GET') return json(res, { data: [{ id: 'slow' }, { id: 'good' }] });
-      if (req.body.model === 'good') json(res, completion());
+      started.push(performance.now());
+      if (req.body.model === 'good') return json(res, completion());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.write('{"choices":[');
+      // Headers arrived, but the body never completes.
     }, async ({ baseUrl, requests }) => {
-      const probes = await discoverModels(baseUrl, secret, { signal: new AbortController().signal });
-      assert.deepEqual(probes.map(probe => probe.status), ['unverified', 'available']);
+      const probes = await discoverModels(baseUrl, secret, { signal: t.signal });
+      assert.deepEqual(probes.map(probe => probe.status), ['unavailable', 'available']);
       assert.match(probes[0].reason, /timed out/i);
-      assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), ['slow', 'good']);
+      assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model),
+        ['slow', 'slow', 'slow', 'good']);
+      for (let index = 1; index < started.length; index++) {
+        const elapsed = started[index] - started[index - 1];
+        assert(elapsed >= 4500 && elapsed < 6500, `Expected a fresh five-second attempt, got ${elapsed} ms`);
+      }
     });
   } finally {
     if (original === undefined) delete process.env.GIGACHAT_TIMEOUT;
     else process.env.GIGACHAT_TIMEOUT = original;
   }
+});
+
+test('cancelling during a retry stops remaining attempts and models without reporting unavailability', async () => {
+  const controller = new AbortController();
+  const reason = new Error('cancel second attempt');
+  let attempts = 0;
+  await withServer((req, res) => {
+    if (req.method === 'GET') return json(res, { data: [{ id: 'one' }, { id: 'two' }] });
+    if (++attempts === 1) return json(res, { error: 'temporary' }, 503);
+    controller.abort(reason);
+  }, async ({ baseUrl, requests }) => {
+    const reported = [];
+    await assert.rejects(discoverModels(baseUrl, secret, {
+      signal: controller.signal,
+      progress: (_completed, _total, probe) => { if (probe) reported.push(probe); },
+    }), error => error === reason);
+    assert.deepEqual(reported, []);
+    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), ['one', 'one']);
+  });
 });
