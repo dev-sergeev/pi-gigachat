@@ -1,9 +1,14 @@
 # `@dev-sergeev/pi-gigachat`
 
-GigaChat-compatible server connections for **pi 0.85.1**
+GigaChat-compatible server connections for **pi 0.85.1 only**
 (`@earendil-works/pi-*`). Requires Node.js **22.19 or later**. Uses
 `createProvider()` and `pi.registerProvider(provider)`, with Pi's native
 authentication and session lifecycle.
+
+The `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and
+`@earendil-works/pi-tui` peer dependencies are pinned to exactly `0.85.1`.
+Newer Pi versions are not supported. These are package-manager constraints,
+not a runtime version check; options such as `--legacy-peer-deps` can bypass them.
 
 The package has no built-in models and does not change Pi's saved default
 provider or model. Use `/gigachat` to add a server connection and select models
@@ -11,6 +16,12 @@ from its catalog, then choose one through `/model`. The adapter supports text
 conversations, Pi tools, and JSON or SSE responses.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
+
+## Release 0.6.4
+
+- Pinned all three Pi peer dependencies (`pi-ai`, `pi-coding-agent`, and `pi-tui`) to exactly `0.85.1`, excluding newer releases.
+- Clarified that Pi 0.85.1 is the supported host version. Peer-dependency constraints are not a runtime version check and can be bypassed by package-manager options.
+- No generation, model discovery, reasoning replay, or saved-history behavior changes.
 
 ## Release 0.6.3
 
@@ -61,7 +72,7 @@ under its original MIT license.
 With Pi 0.85.1 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.6.3
+pi install npm:@dev-sergeev/pi-gigachat@0.6.4
 pi
 ```
 

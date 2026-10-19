@@ -1,6 +1,6 @@
 {
 	"name": "@dev-sergeev/pi-gigachat",
-	"version": "0.6.3",
+	"version": "0.6.4",
 	"description": "GigaChat-compatible server connections and user-selected models for pi-coding-agent",
 	"private": false,
 	"type": "module",
@@ -58,9 +58,9 @@
 		]
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "^0.85.1",
-		"@earendil-works/pi-coding-agent": "^0.85.1",
-		"@earendil-works/pi-tui": "^0.85.1"
+		"@earendil-works/pi-ai": "0.85.1",
+		"@earendil-works/pi-coding-agent": "0.85.1",
+		"@earendil-works/pi-tui": "0.85.1"
 	},
 	"dependencies": {
 		"eventsource-parser": "^3.0.6",
