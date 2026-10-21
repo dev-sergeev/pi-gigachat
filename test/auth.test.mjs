@@ -9,7 +9,8 @@ const credentials = Buffer.from('synthetic:credentials').toString('base64');
 const tokenResponse = () => ({ access_token: token, expires_at: Date.now() + 1800000 });
 function collection(env = {}, store = new InMemoryCredentialStore()) {
   const models = createModels({ credentials: store, authContext: { env: async name => env[name], fileExists: async () => false } });
-  models.setProvider({ ...gigachatProvider, getModels: () => [testModel()] });
+  const catalog = [testModel()];
+  models.setProvider({ ...gigachatProvider, getModels: () => catalog, getAllModels: () => catalog });
   return models;
 }
 const context = { messages: [user('Hello')] };
@@ -19,7 +20,7 @@ test('programmatic consumers explicitly register their own model catalog', () =>
   models.setProvider(gigachatProvider);
   assert.equal(models.getModel('gigachat', 'test-model'), undefined);
   const consumer = testModel({ id: 'consumer-owned-model', name: 'Consumer-owned model', maxTokens: 2048 });
-  models.setProvider({ ...gigachatProvider, getModels: () => [consumer] });
+  models.setProvider({ ...gigachatProvider, getModels: () => [consumer], getAllModels: () => [consumer] });
   const registered = models.getModel('gigachat', consumer.id);
   assert.equal(registered.id, consumer.id);
   assert.equal(registered.name, consumer.name);
@@ -66,6 +67,45 @@ test('pi refreshes existing legacy OAuth data once under the credential store lo
     } finally { delete process.env.GIGACHAT_AUTH_URL; }
   }, (req, res) => json(res, req.url.endsWith('/oauth') ? tokenResponse() : completion()));
 });
+test('started stored OAuth refresh persists its token and configuration after caller cancellation', async () => {
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  let release;
+  const proceed = new Promise(resolve => { release = resolve; });
+  await withServer(async ({ baseUrl, model, requests }) => {
+    process.env.GIGACHAT_AUTH_URL = baseUrl + '/oauth';
+    const store = new InMemoryCredentialStore();
+    await store.modify('gigachat', async () => ({
+      type: 'oauth', access: 'expired.synthetic.token', expires: 0,
+      refresh: credentials, authorizationKey: credentials, authMode: 'token',
+      scope: 'GIGACHAT_API_PERS', baseUrl,
+    }));
+    const models = collection({}, store);
+    const controller = new AbortController();
+    try {
+      const pending = models.getAuth(model, { signal: controller.signal });
+      await started;
+      controller.abort();
+      await assert.rejects(pending, { name: 'AbortError' });
+      release();
+      // The public store mutation waits behind the in-progress refresh.
+      const renewed = await store.modify('gigachat', async () => undefined);
+      assert.equal(renewed.access, token);
+      assert.equal(renewed.baseUrl, baseUrl);
+      assert.equal(renewed.authorizationKey, credentials);
+      assert.equal((await models.getAuth(model)).auth.apiKey, token);
+      assert.deepEqual(requests.map(request => request.url), ['/v1/oauth']);
+    } finally {
+      release();
+      delete process.env.GIGACHAT_AUTH_URL;
+    }
+  }, async (_req, res) => {
+    entered();
+    await proceed;
+    json(res, tokenResponse());
+  });
+});
+
 
 test('environment authorization keys are checked without I/O and reuse an exchanged token', async () => {
   await withServer(async ({ baseUrl, model, requests }) => {
@@ -88,7 +128,7 @@ test('aborting during token exchange cancels before any chat request is sent', a
     const models = collection({ GIGACHAT_CREDENTIALS: credentials, GIGACHAT_AUTH_URL: baseUrl + '/oauth' });
     const start = Date.now();
     const result = await models.completeSimple(model, context, { signal: controller.signal });
-    // pi 0.85.1's lazyStream reports failures during auth resolution as error.
+    // Pi's lazyStream reports failures during auth resolution as error.
     // Cancellation itself must still stop HTTP immediately, before generation.
     assert.equal(result.stopReason, 'error');
     assert.match(result.errorMessage, /abort/i);

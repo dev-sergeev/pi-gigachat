@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { streamSimpleGigaChat } from '../dist/stream.js';
 import { completion, json, reply, token, user, withServer } from './helpers.mjs';
 import { piRoot, until, withPi } from './pi-rpc.mjs';
@@ -7,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
 const isSummary = req => req.body.messages[0]?.content?.includes('summariz');
-const summary = '# Goal\nRemember AUDIT-42.\n## Progress\nConversation condensed.\n## Next Steps\nContinue.';
+const summary = '# Goal\nRemember AUDIT-42 and the summary-only fact COMPACTION_MEMORY_071.\n## Progress\nConversation condensed.\n## Next Steps\nContinue.';
 const seed = async pi => {
   for (let i = 0; i < 3; i++) await pi.prompt(`Turn ${i}: AUDIT-42. ${'history '.repeat(300)}`);
 };
@@ -16,7 +17,7 @@ const respond = (req, res) => reply(req, res, completion({ role: 'assistant', co
 for (const streaming of [false, true]) {
   const modeTest = (name, ...args) => test(`${name} (stream=${streaming})`, ...args);
   const withTestPi = (url, run, settings) => withPi(url, run, settings, { env: { GIGACHAT_STREAM: String(streaming) } });
-  const streamFn = (model, context, options) => streamSimpleGigaChat(model, context, { ...options, stream: streaming });
+  const streamFn = (model, context, options) => streamSimpleGigaChat(model, normalizeContext(context), { ...options, stream: streaming });
 
 modeTest('real pi compacts, includes its prior summary on recompaction, and resumes the saved session', { timeout: 45000 }, async () => {
   await withServer(async ({ baseUrl, requests }) => {
@@ -33,7 +34,8 @@ modeTest('real pi compacts, includes its prior summary on recompaction, and resu
       await seed(pi);
       const second = await pi.command('compact');
       assert.equal(second.success, true, second.error);
-      assert(requests.slice(before).filter(isSummary).some(r => JSON.stringify(r.body).includes('<previous-summary>')));
+      assert(requests.slice(before).filter(isSummary).some(r => r.body.messages.some(m => m.content?.includes('COMPACTION_MEMORY_071'))),
+        'Recompaction must retain the fact from the earlier summary');
       pi = await restart();
       await pi.prompt('Continue after restart.');
       assert(requests.at(-1).body.messages.some(m => m.content?.includes(summary)));
@@ -158,7 +160,8 @@ modeTest('original pi split-turn compaction retains both summaries without concu
     };
     const signal = new AbortController().signal;
     const result = await compact(preparation, model, token, undefined, undefined, signal, undefined, streamFn);
-    assert.match(result.summary, /Turn Context \(split turn\)/);
+    assert.match(result.summary, /AUDIT-42/);
+    assert.match(result.summary, /PREFIX-42/);
     assert.equal(result.firstKeptEntryId, 'kept-entry');
     assert.equal(requests.length, 2);
     assert.equal(maximum, 1);
@@ -167,7 +170,7 @@ modeTest('original pi split-turn compaction retains both summaries without concu
     maximum = Math.max(maximum, ++active);
     await new Promise(resolve => setTimeout(resolve, 35));
     active--;
-    respond(req, res);
+    reply(req, res, completion({ role: 'assistant', content: JSON.stringify(req.body).includes('PREFIX-42') ? 'Preserve PREFIX-42.' : summary }));
   });
 });
 

@@ -3,20 +3,23 @@ import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEventStream,
-	Context,
 	Model,
 	ModelThinkingLevel,
 	SimpleStreamOptions,
 	TextContent,
 	ThinkingContent,
 	ToolCall,
+	TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
 	calculateCost,
 	clampThinkingLevel,
 	createAssistantMessageEventStream,
+	getCurrentTools,
 	parseStreamingJson,
+	parseToolCallArguments,
 } from "@earendil-works/pi-ai";
+import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { createParser } from "eventsource-parser";
 import { baseUrl } from "./auth.js";
 import { environment, headers, object, request, serial } from "./http.js";
@@ -59,7 +62,7 @@ export type GigaChatStreamOptions = Omit<SimpleStreamOptions, "reasoning"> & {
 
 function payload(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: GigaChatStreamOptions,
 ): Record<string, unknown> {
 	const env = environment(options);
@@ -81,6 +84,7 @@ function payload(
 		throw new Error("GigaChat maxTokens must be positive");
 	// Pi represents its off selection by omitting options.reasoning.
 	const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
+	const tools = getCurrentTools(context.messages);
 	return {
 		model: model.id,
 		messages: convertMessages(model, context, additionalSystemPrompt),
@@ -88,10 +92,8 @@ function payload(
 		function_call:
 			options.toolChoice ??
 			options.functionCall ??
-			(context.tools?.length ? "auto" : "none"),
-		...(context.tools?.length
-			? { functions: convertFunctions(context.tools) }
-			: {}),
+			(tools.length ? "auto" : "none"),
+		...(tools.length ? { functions: convertFunctions(tools) } : {}),
 		temperature: options.temperature,
 		top_p: options.topP,
 		response_format: options.responseFormat,
@@ -114,7 +116,7 @@ function payload(
 // Native pi calls this after resolving provider.auth to an access token.
 export function streamSimpleGigaChat(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: GigaChatStreamOptions = {},
 ): AssistantMessageEventStream {
 	if (!options.apiKey)
@@ -162,6 +164,7 @@ export function streamSimpleGigaChat(
 				body.messages = cleaned;
 			}
 			let recoveryAdded = false;
+			let observerFailed = false;
 			stream.push({ type: "start", partial: output });
 			await serial(signal, () =>
 				request(
@@ -188,7 +191,7 @@ export function streamSimpleGigaChat(
 					},
 					{
 						...options,
-						canRetry: () => output.content.length === 0,
+						canRetry: () => !observerFailed && output.content.length === 0,
 						recover422: (init) => {
 							if (recoveryAdded) return init;
 							const recoveredBody = {
@@ -208,8 +211,26 @@ export function streamSimpleGigaChat(
 						delete output.rawStopReason;
 						output.usage = emptyUsage();
 						const consume = completionConsumer(output, stream, model);
-						if (streaming)
-							await readSSE(response, (chunk) => consume.add(chunk, true));
+						const observe = async (chunk: unknown) => {
+							signal.throwIfAborted();
+							try {
+								if (options.onProviderStreamEvent)
+									await raceWithAbortSignal(
+										Promise.resolve().then(() =>
+											options.onProviderStreamEvent?.(chunk, model),
+										),
+										signal,
+									);
+							} catch (error) {
+								// Observer failures are not transport failures, even if their
+								// error happens to match a transient network error.
+								observerFailed = true;
+								throw error;
+							}
+							signal.throwIfAborted();
+							consume.add(chunk, Boolean(streaming));
+						};
+						if (streaming) await readSSE(response, observe);
 						else {
 							if (
 								!response.headers
@@ -217,7 +238,7 @@ export function streamSimpleGigaChat(
 									?.includes("application/json")
 							)
 								throw new Error("Expected a GigaChat JSON response");
-							consume.add(await response.json(), false);
+							await observe(await response.json());
 						}
 						consume.finish();
 					},
@@ -372,6 +393,8 @@ function completionConsumer(
 			if (message.function_call != null) {
 				const call = message.function_call;
 				if (!object(call)) throw new Error("Invalid GigaChat function_call");
+				if (call.name !== undefined && typeof call.name !== "string")
+					throw new Error("Invalid GigaChat function_call name");
 				if (!tool) {
 					closeThinking();
 					closeText();
@@ -436,10 +459,8 @@ function completionConsumer(
 			closeThinking();
 			closeText();
 			if (tool) {
-				const args: unknown = JSON.parse(argumentsJson || "{}");
-				if (!tool.name || !object(args))
-					throw new Error("Invalid GigaChat function_call name or arguments");
-				tool.arguments = args;
+				if (!tool.name) throw new Error("Invalid GigaChat function_call name");
+				Object.assign(tool, parseToolCallArguments(argumentsJson));
 				if (signature) tool.thoughtSignature = signature;
 				stream.push({
 					type: "toolcall_end",
@@ -452,17 +473,22 @@ function completionConsumer(
 	};
 }
 
-async function readSSE(response: Response, consume: (chunk: unknown) => void) {
+async function readSSE(
+	response: Response,
+	consume: (chunk: unknown) => Promise<void>,
+) {
 	if (
 		!response.headers.get("content-type")?.includes("text/event-stream") ||
 		!response.body
 	)
 		throw new Error("Expected a GigaChat SSE response");
 	let done = false;
+	// Only queue events from the current reader chunk. Await normalization
+	// before reading again, so a slow observer cannot buffer the response.
+	const events: string[] = [];
 	const parser = createParser({
 		onEvent(event) {
-			if (event.data === "[DONE]") done = true;
-			else if (!done) consume(JSON.parse(event.data));
+			events.push(event.data);
 		},
 	});
 	const decoder = new TextDecoder();
@@ -472,8 +498,23 @@ async function readSSE(response: Response, consume: (chunk: unknown) => void) {
 			const next = await reader.read();
 			if (next.done) break;
 			parser.feed(decoder.decode(next.value, { stream: true }));
+			for (const event of events) {
+				if (event === "[DONE]") {
+					done = true;
+					break;
+				}
+				await consume(JSON.parse(event));
+			}
+			events.length = 0;
 		}
 		parser.feed(decoder.decode());
+		for (const event of events) {
+			if (event === "[DONE]") {
+				done = true;
+				break;
+			}
+			await consume(JSON.parse(event));
+		}
 		if (!done)
 			throw new Error("Incomplete GigaChat SSE response: missing [DONE]");
 	} finally {

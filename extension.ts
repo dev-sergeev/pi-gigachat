@@ -337,9 +337,14 @@ import {
   calculateCost,
   clampThinkingLevel,
   createAssistantMessageEventStream,
-  parseStreamingJson
+  getCurrentTools,
+  parseStreamingJson,
+  parseToolCallArguments
 } from "@earendil-works/pi-ai";
 import { createParser } from "eventsource-parser";
+
+// src/messages.ts
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 
 // node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
 var NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
@@ -385,7 +390,7 @@ function transformMessages(messages, model, normalizeToolCallId) {
   const normalizedMessages = messages.map((msg) => msg.content == null ? { ...msg, content: [] } : msg);
   const imageAwareMessages = downgradeUnsupportedImages(normalizedMessages, model);
   const transformed = imageAwareMessages.map((msg) => {
-    if (msg.role === "user") {
+    if (msg.role === "system" || msg.role === "user") {
       return msg;
     }
     if (msg.role === "toolResult") {
@@ -400,19 +405,13 @@ function transformMessages(messages, model, normalizeToolCallId) {
       const isSameModel = assistantMsg.provider === model.provider && assistantMsg.api === model.api && assistantMsg.model === model.id;
       const transformedContent = assistantMsg.content.flatMap((block) => {
         if (block.type === "thinking") {
-          if (block.redacted) {
-            return isSameModel ? block : [];
-          }
-          if (isSameModel && block.thinkingSignature)
+          if (!isSameModel)
+            return [];
+          if (block.redacted || block.thinkingSignature)
             return block;
           if (!block.thinking || block.thinking.trim() === "")
             return [];
-          if (isSameModel)
-            return block;
-          return {
-            type: "text",
-            text: block.thinking
-          };
+          return block;
         }
         if (block.type === "text") {
           if (isSameModel)
@@ -450,7 +449,8 @@ function transformMessages(messages, model, normalizeToolCallId) {
   const result = [];
   let pendingToolCalls = [];
   let existingToolResultIds = /* @__PURE__ */ new Set();
-  const insertSyntheticToolResults = () => {
+  const heldSystemMessages = [];
+  const closePendingToolCalls = () => {
     if (pendingToolCalls.length > 0) {
       for (const tc of pendingToolCalls) {
         if (!existingToolResultIds.has(tc.id)) {
@@ -467,11 +467,13 @@ function transformMessages(messages, model, normalizeToolCallId) {
       pendingToolCalls = [];
       existingToolResultIds = /* @__PURE__ */ new Set();
     }
+    result.push(...heldSystemMessages);
+    heldSystemMessages.length = 0;
   };
   for (let i = 0; i < transformed.length; i++) {
     const msg = transformed[i];
     if (msg.role === "assistant") {
-      insertSyntheticToolResults();
+      closePendingToolCalls();
       const assistantMsg = msg;
       if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
         continue;
@@ -485,14 +487,20 @@ function transformMessages(messages, model, normalizeToolCallId) {
     } else if (msg.role === "toolResult") {
       existingToolResultIds.add(msg.toolCallId);
       result.push(msg);
+    } else if (msg.role === "system") {
+      if (pendingToolCalls.length > 0) {
+        heldSystemMessages.push(msg);
+      } else {
+        result.push(msg);
+      }
     } else if (msg.role === "user") {
-      insertSyntheticToolResults();
+      closePendingToolCalls();
       result.push(msg);
     } else {
       result.push(msg);
     }
   }
-  insertSyntheticToolResults();
+  closePendingToolCalls();
   return result;
 }
 
@@ -500,8 +508,14 @@ function transformMessages(messages, model, normalizeToolCallId) {
 var STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
 function convertMessages(model, context, additionalSystemPrompt) {
   const messages = [];
-  const transformedMessages = transformMessages(context.messages, model);
-  const systemPrompt = [context.systemPrompt, additionalSystemPrompt?.trim()].filter(Boolean).join("\n\n");
+  const transformedMessages = transformMessages(
+    context.messages.filter((message) => message.role !== "system"),
+    model
+  );
+  const systemPrompt = [
+    getCurrentSystemPrompt(context.messages),
+    additionalSystemPrompt?.trim()
+  ].filter(Boolean).join("\n\n");
   if (systemPrompt) {
     messages.push({
       role: "system",
@@ -627,12 +641,13 @@ function payload(model, context, options) {
   if (!Number.isFinite(maxTokens) || maxTokens < 1)
     throw new Error("GigaChat maxTokens must be positive");
   const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
+  const tools = getCurrentTools(context.messages);
   return {
     model: model.id,
     messages: convertMessages(model, context, additionalSystemPrompt),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
-    function_call: options.toolChoice ?? options.functionCall ?? (context.tools?.length ? "auto" : "none"),
-    ...context.tools?.length ? { functions: convertFunctions(context.tools) } : {},
+    function_call: options.toolChoice ?? options.functionCall ?? (tools.length ? "auto" : "none"),
+    ...tools.length ? { functions: convertFunctions(tools) } : {},
     temperature: options.temperature,
     top_p: options.topP,
     response_format: options.responseFormat,
@@ -691,6 +706,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
         body.messages = cleaned;
       }
       let recoveryAdded = false;
+      let observerFailed = false;
       stream.push({ type: "start", partial: output });
       await serial(
         signal,
@@ -716,7 +732,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
           },
           {
             ...options,
-            canRetry: () => output.content.length === 0,
+            canRetry: () => !observerFailed && output.content.length === 0,
             recover422: (init) => {
               if (recoveryAdded) return init;
               const recoveredBody = {
@@ -735,12 +751,28 @@ function streamSimpleGigaChat(model, context, options = {}) {
             delete output.rawStopReason;
             output.usage = emptyUsage();
             const consume = completionConsumer(output, stream, model);
-            if (streaming)
-              await readSSE(response, (chunk) => consume.add(chunk, true));
+            const observe = async (chunk) => {
+              signal.throwIfAborted();
+              try {
+                if (options.onProviderStreamEvent)
+                  await raceWithAbortSignal(
+                    Promise.resolve().then(
+                      () => options.onProviderStreamEvent?.(chunk, model)
+                    ),
+                    signal
+                  );
+              } catch (error) {
+                observerFailed = true;
+                throw error;
+              }
+              signal.throwIfAborted();
+              consume.add(chunk, Boolean(streaming));
+            };
+            if (streaming) await readSSE(response, observe);
             else {
               if (!response.headers.get("content-type")?.includes("application/json"))
                 throw new Error("Expected a GigaChat JSON response");
-              consume.add(await response.json(), false);
+              await observe(await response.json());
             }
             consume.finish();
           },
@@ -878,6 +910,8 @@ function completionConsumer(output, stream, model) {
       if (message.function_call != null) {
         const call = message.function_call;
         if (!object(call)) throw new Error("Invalid GigaChat function_call");
+        if (call.name !== void 0 && typeof call.name !== "string")
+          throw new Error("Invalid GigaChat function_call name");
         if (!tool) {
           closeThinking();
           closeText();
@@ -937,10 +971,9 @@ function completionConsumer(output, stream, model) {
       closeThinking();
       closeText();
       if (tool) {
-        const args = JSON.parse(argumentsJson || "{}");
-        if (!tool.name || !object(args))
-          throw new Error("Invalid GigaChat function_call name or arguments");
-        tool.arguments = args;
+        if (!tool.name)
+          throw new Error("Invalid GigaChat function_call name");
+        Object.assign(tool, parseToolCallArguments(argumentsJson));
         if (signature) tool.thoughtSignature = signature;
         stream.push({
           type: "toolcall_end",
@@ -956,10 +989,10 @@ async function readSSE(response, consume) {
   if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body)
     throw new Error("Expected a GigaChat SSE response");
   let done = false;
+  const events = [];
   const parser = createParser({
     onEvent(event) {
-      if (event.data === "[DONE]") done = true;
-      else if (!done) consume(JSON.parse(event.data));
+      events.push(event.data);
     }
   });
   const decoder = new TextDecoder();
@@ -969,8 +1002,23 @@ async function readSSE(response, consume) {
       const next = await reader.read();
       if (next.done) break;
       parser.feed(decoder.decode(next.value, { stream: true }));
+      for (const event of events) {
+        if (event === "[DONE]") {
+          done = true;
+          break;
+        }
+        await consume(JSON.parse(event));
+      }
+      events.length = 0;
     }
     parser.feed(decoder.decode());
+    for (const event of events) {
+      if (event === "[DONE]") {
+        done = true;
+        break;
+      }
+      await consume(JSON.parse(event));
+    }
     if (!done)
       throw new Error("Incomplete GigaChat SSE response: missing [DONE]");
   } finally {
@@ -1560,6 +1608,7 @@ import {
   Input,
   Key,
   matchesKey,
+  renderFakeCursor,
   SelectList,
   stripTerminalSequences,
   truncateToWidth,
@@ -1574,7 +1623,7 @@ function maskedInput(input, width) {
     const marker = line.indexOf(CURSOR_MARKER);
     if (marker < 0) return mask;
     const cursor = Math.min(visibleWidth(line.slice(0, marker)), width - 1);
-    return mask.slice(0, cursor) + CURSOR_MARKER + `\x1B[7m${cursor < cells ? "\u2022" : " "}\x1B[27m` + mask.slice(cursor + 1);
+    return mask.slice(0, cursor) + CURSOR_MARKER + renderFakeCursor(cursor < cells ? "\u2022" : " ") + mask.slice(cursor + 1);
   });
 }
 var FormDialog = class {
@@ -2402,9 +2451,9 @@ async function registerGigaChatCommand(pi) {
 
 // src/extension.ts
 async function extension_default(pi) {
-  if (VERSION !== "0.85.1") {
+  if (VERSION !== "1.3.0") {
     throw new Error(
-      `Unsupported Pi version ${VERSION || "unknown"}: @dev-sergeev/pi-gigachat requires Pi 0.85.1. Use Pi 0.85.1 or remove this extension.`
+      `Unsupported Pi version ${VERSION || "unknown"}: @dev-sergeev/pi-gigachat requires Pi 1.3.0. Use Pi 1.3.0 or remove this extension.`
     );
   }
   await registerGigaChatCommand(pi);

@@ -9,6 +9,7 @@ import {
 	Input,
 	Key,
 	matchesKey,
+	renderFakeCursor,
 	SelectList,
 	stripTerminalSequences,
 	truncateToWidth,
@@ -38,7 +39,7 @@ function maskedInput(input: Input, width: number): string[] {
 		return (
 			mask.slice(0, cursor) +
 			CURSOR_MARKER +
-			`\x1b[7m${cursor < cells ? "•" : " "}\x1b[27m` +
+			renderFakeCursor(cursor < cells ? "•" : " ") +
 			mask.slice(cursor + 1)
 		);
 	});

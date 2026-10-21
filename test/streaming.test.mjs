@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { streamSimpleGigaChat } from '../dist/stream.js';
 import { ask, completion, token, user, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
-const context = { messages: [user('Hello')] };
+const context = normalizeContext({ messages: [user('Hello')] });
 const chunk = (delta, finish_reason = null, usage) => ({ choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) });
 const data = value => `data: ${typeof value === 'string' ? value : JSON.stringify(value)}\r\n\r\n`;
 function begin(res) { res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' }); }
@@ -70,7 +71,6 @@ for (const [name, events] of [
   ['missing DONE', [chunk({ content: 'partial' }, 'stop')]],
   ['missing finish reason', [chunk({ content: 'partial' }), '[DONE]']],
   ['missing tool', [chunk({}, 'function_call'), '[DONE]']],
-  ['invalid JSON arguments', [chunk({ function_call: { name: 'read', arguments: '{' } }, 'function_call'), '[DONE]']],
   ['unknown finish reason', [chunk({}, 'unknown'), '[DONE]']],
 ]) test(`SSE fails clearly on ${name}`, async () => {
   await withServer(async ({ model }) => {
@@ -150,4 +150,110 @@ test('custom fetch implementations are supported by the native transport', async
     },
   }).result();
   assert.equal(result.stopReason, 'stop', result.errorMessage);
+});
+
+for (const streaming of [false, true]) test(`provider observers are awaited before normalization in wire order (stream=${streaming})`, async () => {
+  let entered;
+  let release;
+  const observing = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  await withServer(async ({ model }) => {
+    const before = [];
+    let partial;
+    const stream = streamSimpleGigaChat(model, context, {
+      apiKey: token, stream: streaming,
+      onProviderStreamEvent: async (event, selected) => {
+        assert.equal(selected.id, model.id);
+        assert(Array.isArray(event.choices));
+        before.push(partial.content.map(block => block.text).join(''));
+        if (before.length === 1) { entered(); await gate; }
+        await new Promise(resolve => setImmediate(resolve));
+      },
+    });
+    const collecting = (async () => {
+      for await (const event of stream) if (event.type === 'start') partial = event.partial;
+    })();
+    await observing;
+    assert.deepEqual(before, ['']);
+    assert.deepEqual(partial.content, []);
+    release();
+    await collecting;
+    const result = await stream.result();
+    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.equal(result.content[0].text, streaming ? 'AB' : 'OK');
+    assert.deepEqual(before, streaming ? ['', 'A', 'AB'] : ['']);
+  }, (_req, res) => {
+    if (streaming) {
+      begin(res);
+      res.end(data(chunk({ content: 'A' })) + data(chunk({ content: 'B' })) + data(chunk({}, 'stop')) + data('[DONE]'));
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(completion()));
+    }
+  });
+});
+
+for (const streaming of [false, true]) test(`provider observer errors terminate without retrying or normalizing the event (stream=${streaming})`, async () => {
+  await withServer(async ({ model, requests }) => {
+    const result = await streamSimpleGigaChat(model, context, {
+      apiKey: token, stream: streaming, maxRetries: 2,
+      env: { GIGACHAT_RETRY_BASE_DELAY_MS: '0' },
+      onProviderStreamEvent: async () => {
+        await new Promise(resolve => setImmediate(resolve));
+        throw Object.assign(new Error('Observer refused the event'), { code: 'ECONNRESET' });
+      },
+    }).result();
+    assert.equal(result.stopReason, 'error');
+    assert.equal(result.errorMessage, 'Observer refused the event');
+    assert.deepEqual(result.content, []);
+    assert.equal(requests.length, 1);
+  }, (_req, res) => {
+    if (streaming) { begin(res); end(res, chunk({ content: 'Not normalized' }, 'stop')); }
+    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(completion())); }
+  });
+});
+
+for (const streaming of [false, true]) test(`cancellation while awaiting a provider observer cannot normalize a late event (stream=${streaming})`, async () => {
+  const controller = new AbortController();
+  let entered;
+  let release;
+  const observing = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  await withServer(async ({ model }) => {
+    const stream = streamSimpleGigaChat(model, context, {
+      apiKey: token, stream: streaming, signal: controller.signal,
+      onProviderStreamEvent: async () => { entered(); await gate; },
+    });
+    await observing;
+    controller.abort();
+    const result = await stream.result();
+    assert.equal(result.stopReason, 'aborted');
+    assert.deepEqual(result.content, []);
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(result.content, []);
+  }, (_req, res) => {
+    if (streaming) { begin(res); end(res, chunk({ content: 'Too late' }, 'stop')); }
+    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(completion())); }
+  });
+});
+
+for (const streaming of [false, true]) test(`malformed final tool arguments expose argumentsError without executable partial input (stream=${streaming})`, async () => {
+  const argumentsJson = '{"path":"partial.txt","content":';
+  await withServer(async ({ model }) => {
+    const stream = streamSimpleGigaChat(model, context, { apiKey: token, stream: streaming });
+    const events = [];
+    for await (const event of stream) {
+      events.push(event.type);
+    }
+    const result = await stream.result();
+    assert.equal(result.stopReason, 'toolUse', result.errorMessage);
+    assert.deepEqual(result.content[0].arguments, {});
+    assert(result.content[0].argumentsError.includes(argumentsJson));
+    assert.deepEqual(events.slice(-2), ['toolcall_end', 'done']);
+  }, (_req, res) => {
+    const message = { role: 'assistant', function_call: { name: 'write', arguments: argumentsJson } };
+    if (streaming) { begin(res); end(res, chunk(message, 'function_call')); }
+    else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(completion(message, 'function_call'))); }
+  });
 });

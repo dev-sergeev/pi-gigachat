@@ -1,12 +1,13 @@
 import type {
 	Api,
-	Context,
 	Model,
 	ThinkingContent,
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 
 export const STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
@@ -19,12 +20,18 @@ interface GigaChatMessage {
 
 export function convertMessages(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	additionalSystemPrompt?: string,
 ): GigaChatMessage[] {
 	const messages: GigaChatMessage[] = [];
-	const transformedMessages = transformMessages(context.messages, model);
-	const systemPrompt = [context.systemPrompt, additionalSystemPrompt?.trim()]
+	const transformedMessages = transformMessages(
+		context.messages.filter((message) => message.role !== "system"),
+		model,
+	);
+	const systemPrompt = [
+		getCurrentSystemPrompt(context.messages),
+		additionalSystemPrompt?.trim(),
+	]
 		.filter(Boolean)
 		.join("\n\n");
 
@@ -57,8 +64,8 @@ export function convertMessages(
 		}
 
 		if (message.role === "assistant") {
-			// Pi retains thinking blocks for the same provider/API/model and
-			// normalizes foreign-model thinking into text before this point.
+			// Pi retains thinking only for the same provider/API/model and drops
+			// foreign-model thinking before this point.
 			const thinking = message.content.filter(
 				(item): item is ThinkingContent =>
 					item.type === "thinking" && !item.redacted,

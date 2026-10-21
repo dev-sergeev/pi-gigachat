@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { convertMessages } from '../dist/messages.js';
 import { streamSimpleGigaChat } from '../dist/stream.js';
 import { completion, reply, testModel, token, user, withServer } from './helpers.mjs';
@@ -25,7 +26,7 @@ const wireThinking = text => ({ type: 'thinking', thinking: text, thinkingSignat
 const data = (delta, finish_reason = null) => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] }) + '\n\n';
 
 async function collect(model, context = { messages: [user('Test')] }, options = {}) {
-  const stream = streamSimpleGigaChat(model, context, { apiKey: token, maxRetries: 0, ...options });
+  const stream = streamSimpleGigaChat(model, normalizeContext(context), { apiKey: token, maxRetries: 0, ...options });
   const events = [];
   for await (const event of stream) events.push(event);
   return { result: await stream.result(), events };
@@ -57,37 +58,43 @@ for (const streaming of [false, true]) test(`reasoning survives a tool response,
 for (const text of [' \nПроверка 🙂𐐀\t ', ' \n\t ']) test(`replay preserves reasoning verbatim, including whitespace: ${JSON.stringify(text)}`, () => {
   const history = [assistant([wireThinking(text), { type: 'text', text: 'Answer' }])];
   const before = JSON.stringify(history);
-  const [message] = convertMessages(selected, { messages: history });
+  const [message] = convertMessages(selected, normalizeContext({ messages: history }));
   assert.deepEqual(message, { role: 'assistant', content: `${text}\n\nAnswer` });
   assert.equal(JSON.stringify(history), before);
 });
 
 test('native thinking blocks are replayed in order without requiring a provider signature', () => {
-  const [message] = convertMessages(selected, { messages: [assistant([
+  const [message] = convertMessages(selected, normalizeContext({ messages: [assistant([
     { type: 'thinking', thinking: 'First\n' }, { type: 'thinking', thinking: ' Second' }, { type: 'text', text: 'Answer' },
-  ])] });
+  ])] }));
   assert.deepEqual(message, { role: 'assistant', content: 'First\n Second\n\nAnswer' });
 });
 
-test('model switching retains Pi normalization and never sends foreign reasoning as reasoning_content', () => {
+for (const streaming of [false, true]) test(`model switching drops foreign reasoning instead of mixing it with the visible answer (stream=${streaming})`, async () => {
   for (const foreign of [{ model: 'other' }, { provider: 'foreign' }, { api: 'foreign-api' }]) {
-    const [message] = convertMessages(selected, { messages: [assistant([
-      wireThinking('Prior thought. '), { type: 'text', text: 'Answer', textSignature: 'gigachat:functions_state_id:old-state' },
-    ], foreign)] });
-    assert.equal(message.reasoning_content, undefined);
-    assert.equal(message.functions_state_id, undefined);
-    assert.equal(message.content, 'Prior thought. Answer');
+    await withServer(async ({ baseUrl, requests }) => {
+      const model = { ...selected, baseUrl };
+      const context = { messages: [assistant([
+        wireThinking('Prior thought. '), { type: 'text', text: 'Answer', textSignature: 'gigachat:functions_state_id:old-state' },
+      ], foreign), user('Continue')] };
+      const original = structuredClone(context);
+      const { result } = await collect(model, context, { stream: streaming });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+      assert.deepEqual(requests[0].body.messages.find(message => message.role === 'assistant'),
+        { role: 'assistant', content: 'Answer' });
+      assert.deepEqual(context, original);
+    }, (req, res) => reply(req, res, completion()));
   }
 });
 
 test('redacted and failed reasoning is not replayed as plaintext', () => {
-  const [message] = convertMessages(selected, { messages: [assistant([
+  const [message] = convertMessages(selected, normalizeContext({ messages: [assistant([
     { ...wireThinking('encrypted placeholder'), redacted: true }, { type: 'text', text: 'Answer' },
-  ])] });
+  ])] }));
   assert.deepEqual(message, { role: 'assistant', content: 'Answer' });
-  for (const stopReason of ['error', 'aborted']) assert.deepEqual(convertMessages(selected, {
+  for (const stopReason of ['error', 'aborted']) assert.deepEqual(convertMessages(selected, normalizeContext({
     messages: [assistant([wireThinking('incomplete')], { stopReason })],
-  }), []);
+  })), []);
 });
 
 for (const streaming of [false, true]) {
@@ -110,7 +117,7 @@ for (const streaming of [false, true]) {
       assert.equal(result.stopReason, 'stop', result.errorMessage);
       assert.deepEqual(result.content, [{ type: 'text', text: 'Answer' }]);
       assert(!events.some(e => e.type.startsWith('thinking')));
-      const [message] = convertMessages(model, { messages: [result] });
+      const [message] = convertMessages(model, normalizeContext({ messages: [result] }));
       assert.equal(message.reasoning_content, undefined);
     }, (req, res) => reply(req, res, completion({ role: 'assistant', content: 'Answer', reasoning_content: value })));
   });
@@ -128,7 +135,7 @@ test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alter
   let continueResponse;
   const proceed = new Promise(resolve => { continueResponse = resolve; });
   await withServer(async ({ model }) => {
-    const stream = streamSimpleGigaChat(model, { messages: [user('Test')] }, { apiKey: token, stream: true, maxRetries: 0 });
+    const stream = streamSimpleGigaChat(model, normalizeContext({ messages: [user('Test')] }), { apiKey: token, stream: true, maxRetries: 0 });
     const events = [];
     for await (const event of stream) {
       events.push(event);
@@ -137,7 +144,7 @@ test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alter
     const result = await stream.result();
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.deepEqual(result.content.map(block => block.type), ['thinking', 'text', 'thinking', 'text']);
-    const [message] = convertMessages(model, { messages: [result] });
+    const [message] = convertMessages(model, normalizeContext({ messages: [result] }));
     assert.deepEqual(message, { role: 'assistant', content: ' \nПроверка 🙂𐐀\t Second\n\n\nAB' });
     assert.deepEqual(events.filter(e => !e.type.endsWith('_delta')).map(e => e.type), [
       'start', 'thinking_start', 'thinking_end', 'text_start', 'text_end',
@@ -157,13 +164,13 @@ test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alter
 test('cancellation keeps partial thinking for display but excludes the aborted turn from replay', async () => {
   const controller = new AbortController();
   await withServer(async ({ model, requests }) => {
-    const stream = streamSimpleGigaChat(model, { messages: [user('Test')] }, { apiKey: token, stream: true, signal: controller.signal });
+    const stream = streamSimpleGigaChat(model, normalizeContext({ messages: [user('Test')] }), { apiKey: token, stream: true, signal: controller.signal });
     for await (const event of stream) if (event.type === 'thinking_delta') controller.abort();
     const result = await stream.result();
     assert.equal(result.stopReason, 'aborted', result.errorMessage);
     assert.equal(result.content[0].thinking, 'Partial thought');
     assert.equal(requests.length, 1);
-    assert.deepEqual(convertMessages(model, { messages: [result] }), []);
+    assert.deepEqual(convertMessages(model, normalizeContext({ messages: [result] })), []);
   }, (_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     res.write(data({ reasoning_content: 'Partial thought' }));

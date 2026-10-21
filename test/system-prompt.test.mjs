@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createModels } from '@earendil-works/pi-ai';
+import { createModels, normalizeContext } from '@earendil-works/pi-ai';
 import { gigachatProvider } from '../dist/index.js';
+import { streamSimpleGigaChat } from '../dist/stream.js';
 import { ask, completion, reply, token, user, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) if (key.startsWith('GIGACHAT_')) delete process.env[key];
@@ -62,7 +63,7 @@ test('native auth context forwards provider instructions to the adapter', async 
   await withServer(async ({ model, requests }) => {
     const env = { GIGACHAT_ACCESS_TOKEN: token, GIGACHAT_SYSTEM_PROMPT: extra };
     const models = createModels({ authContext: { env: async name => env[name], fileExists: async () => false } });
-    models.setProvider({ ...gigachatProvider, getModels: () => [model] });
+    models.setProvider({ ...gigachatProvider, getModels: () => [model], getAllModels: () => [model] });
     const result = await models.completeSimple(model, { systemPrompt: 'Original pi prompt.', messages: [user('Hello')] });
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.equal(requests[0].body.messages[0].content, 'Original pi prompt.\n\n' + extra);
@@ -99,4 +100,38 @@ test('unset instructions use the default; custom text replaces it and empty text
       [{ role: 'system', content: singleToolInstruction }, { role: 'user', content: 'Hi' }],
     ]);
   });
+});
+
+for (const streaming of [false, true]) test(`transcript updates resolve current sections and tool declarations without changing history (stream=${streaming})`, async () => {
+  await withServer(async ({ model, requests }) => {
+    const read = { name: 'read', description: 'Old read', parameters: { type: 'object', properties: {} } };
+    const write = { name: 'write', description: 'Old write', parameters: { type: 'object', properties: {} } };
+    const updatedWrite = { ...write, description: 'Current write', parameters: { type: 'object', properties: { path: { type: 'string' } } } };
+    const context = normalizeContext({ systemPrompt: 'Base instructions', tools: [read, write], messages: [
+      { role: 'system', content: '', sections: { rules: 'OLD', temporary: 'REMOVE' }, timestamp: 0 },
+      user('First'),
+      { role: 'system', content: 'Additional instructions', sections: { rules: 'CURRENT', temporary: null },
+        toolsRemoved: [{ name: 'read' }], toolsAdded: [updatedWrite], timestamp: 1 },
+      user('Continue'),
+    ] });
+    const original = structuredClone(context);
+    for (let i = 0; i < 2; i++) {
+      const result = await streamSimpleGigaChat(model, context, { apiKey: token, stream: streaming, env: { GIGACHAT_SYSTEM_PROMPT: extra } }).result();
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+      const body = requests.at(-1).body;
+      assert.deepEqual(body.messages, [
+        { role: 'system', content: `Base instructions\n\nAdditional instructions\n\nCURRENT\n\n${extra}` },
+        { role: 'user', content: 'First' }, { role: 'user', content: 'Continue' },
+      ]);
+      assert.deepEqual(body.functions, [updatedWrite]);
+      assert.equal(body.function_call, 'auto');
+    }
+    context.messages.push({ role: 'system', content: '', toolsRemoved: [{ name: 'write' }], timestamp: 2 });
+    const result = await streamSimpleGigaChat(model, context, { apiKey: token, stream: streaming }).result();
+    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.equal(requests.at(-1).body.function_call, 'none');
+    assert.equal(requests.at(-1).body.functions, undefined);
+    context.messages.pop();
+    assert.deepEqual(context, original);
+  }, respond);
 });

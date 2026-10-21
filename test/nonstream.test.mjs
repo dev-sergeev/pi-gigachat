@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { streamSimpleGigaChat } from '../dist/stream.js';
 import { testModel } from './helpers.mjs';
 
@@ -37,7 +38,7 @@ async function withServer(run, respond = (_request,res) => json(res,completion()
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 }
 async function ask(model, options = {}, context = {messages:[{role:'user',content:'Привет',timestamp:0}]}) {
-  const stream = streamSimpleGigaChat(model,context,{apiKey:token,...options});
+  const stream = streamSimpleGigaChat(model,normalizeContext(context),{apiKey:token,...options});
   const events = [];
   for await (const event of stream) events.push(event);
   return {events,result:await stream.result()};
@@ -90,6 +91,10 @@ for (const [name,body] of [
   ['empty choices',{choices:[]}],
   ['missing finish reason',{choices:[{message:{role:'assistant',content:'incomplete'}}]}],
   ['missing function call',completion({role:'assistant',content:''},'function_call')],
+  ['invalid function envelope',completion({role:'assistant',function_call:[]},'function_call')],
+  ['missing function name',completion({role:'assistant',function_call:{arguments:{}}},'function_call')],
+  ['invalid function name',completion({role:'assistant',function_call:{name:42,arguments:{}}},'function_call')],
+  ['invalid function arguments envelope',completion({role:'assistant',function_call:{name:'read',arguments:[]}},'function_call')],
 ]) {
   test(`rejects ${name} instead of reporting successful completion`,async()=>{
     await withServer(async ({model})=>{

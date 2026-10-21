@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import { completion, reply, withServer } from './helpers.mjs';
 import { withPi } from './pi-rpc.mjs';
@@ -45,4 +46,51 @@ for (const streaming of [false, true]) test(`native pi uses GigaChat tools, comp
       reply(req, res, completion({ role: 'assistant', content: '', function_call: { name: 'read', arguments: { path } }, functions_state_id: 'native-tool-state' }, 'function_call'));
     } else reply(req, res, completion({ role: 'assistant', content: summarizing ? summary : 'Remembered GIGA-NATIVE-42.' }));
   });
+});
+
+test('native context_with_system applies current sections and tool deltas without changing saved history', { timeout: 30000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pi-gigachat-transcript-'));
+  const extensionPath = join(directory, 'transcript.mjs');
+  try {
+    await writeFile(extensionPath, `export default function (pi) {
+  pi.on('context_with_system', event => ({
+    messages: [
+      ...event.messages,
+      { role: 'system', content: 'NATIVE_DELTA_INSTRUCTION_42',
+        sections: { rules: 'OBSOLETE_NATIVE_SECTION_42', temporary: 'REMOVED_NATIVE_SECTION_42' },
+        timestamp: 1 },
+      { role: 'system', content: '',
+        sections: { rules: 'CURRENT_NATIVE_SECTION_42', temporary: null },
+        toolsRemoved: [{ name: 'read' }],
+        toolsAdded: [{ name: 'native_delta_tool', description: 'Current declaration',
+          parameters: { type: 'object', properties: { fact: { type: 'string' } }, required: ['fact'] } }],
+        timestamp: 2 },
+    ],
+  }));
+}
+`);
+    await withServer(async ({ baseUrl, requests }) => {
+      await withPi(baseUrl, async (pi, restart) => {
+        await pi.prompt('Keep NATIVE_TRANSCRIPT_FACT_42.');
+        pi = await restart();
+        await pi.prompt('Recall NATIVE_TRANSCRIPT_FACT_42.');
+        assert.equal(requests.length, 2, 'Native activation and resume must not make hidden requests');
+        for (const { body } of requests) {
+          const systems = body.messages.filter(message => message.role === 'system');
+          assert.equal(systems.length, 1);
+          assert(systems[0].content.includes('NATIVE_DELTA_INSTRUCTION_42'));
+          assert(systems[0].content.includes('CURRENT_NATIVE_SECTION_42'));
+          assert(!systems[0].content.includes('OBSOLETE_NATIVE_SECTION_42'));
+          assert(!systems[0].content.includes('REMOVED_NATIVE_SECTION_42'));
+          assert(body.functions.some(tool => tool.name === 'native_delta_tool'));
+          assert(!body.functions.some(tool => tool.name === 'read'));
+        }
+        assert(requests.at(-1).body.messages.some(message => message.role === 'user' && message.content.includes('NATIVE_TRANSCRIPT_FACT_42')));
+        assert(!(await pi.entries()).some(entry => JSON.stringify(entry).includes('NATIVE_DELTA_INSTRUCTION_42')),
+          'Request-local transcript changes must not rewrite saved conversation history');
+      }, {}, { tools: 'read', extensionPath });
+    }, (req, res) => reply(req, res, completion({ role: 'assistant', content: 'NATIVE_TRANSCRIPT_FACT_42 retained.' })));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

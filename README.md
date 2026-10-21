@@ -1,19 +1,19 @@
 # `@dev-sergeev/pi-gigachat`
 
-GigaChat-compatible server connections for **pi 0.85.1 only**
+GigaChat-compatible server connections for **pi 1.3.0**
 (`@earendil-works/pi-*`). Requires Node.js **22.19 or later**. Uses
 `createProvider()` and `pi.registerProvider(provider)`, with Pi's native
 authentication and session lifecycle.
 
 The `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and
-`@earendil-works/pi-tui` peer dependencies are pinned to exactly `0.85.1`.
-These pins alone do not restrict the running Pi: managed `pi install` deliberately
-disables peer resolution (npm uses `--legacy-peer-deps`). At activation, the extension
-checks the host-provided `VERSION` and rejects every version other than exactly
-`0.85.1`, before registering commands or restoring connections. Downloading or
-installing package files can still succeed; bypassing peer checks does not bypass
-this activation check. Pi versions that treat extension errors as fatal, including
-1.3.0, stop startup; remove the package or start without extensions with `pi -ne`.
+`@earendil-works/pi-tui` peers are supplied by Pi. Their `"*"` peer ranges follow
+Pi's package-loading convention; they do not declare compatibility with arbitrary
+host versions. Development dependencies are pinned to `1.3.0`. At activation,
+the extension checks the host-provided `VERSION` and accepts only `1.3.0`,
+before registering commands or restoring connections. Managed `pi install`
+disables peer resolution, so downloading/installing package files can still
+succeed on an unsupported host. If activation prevents startup, remove the
+package or start without extensions with `pi -ne`.
 
 The package has no built-in models and does not change Pi's saved default
 provider or model. Use `/gigachat` to add a server connection and select models
@@ -21,6 +21,16 @@ from its catalog, then choose one through `/model`. The adapter supports text
 conversations, Pi tools, and JSON or SSE responses.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
+
+## Release 0.7.1
+
+- Migrated the native provider to Pi **1.3.0**. Pi 0.85.1 is no longer supported by this release.
+- Adapted request conversion to `TranscriptContext`, including replacement/removal of prompt sections and current tool declarations, without changing saved history.
+- Updated bundled Pi helpers: model handoffs drop foreign thinking; same-provider/API/model reasoning replay remains supported. Pi 1.3 compaction omits thinking from summary input.
+- Added awaited `onProviderStreamEvent` observation for JSON and SSE. Cancellation and observer failures cannot normalize a late event or silently retry the observer.
+- Final malformed tool arguments now carry Pi's `argumentsError` instead of executable partial input; native tool validation reports the error to the model.
+- Updated masked input to Pi's fake-cursor markers, including hardware-cursor mode.
+- Preserved saved connection identities, credentials, user-selected models, bounded retries and passive installation. Existing connections do not require discovery or paid probes again.
 
 ## Release 0.6.5
 
@@ -80,10 +90,10 @@ under its original MIT license.
 
 ## Install in Pi
 
-With Pi 0.85.1 installed:
+With Pi 1.3.0 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.6.5
+pi install npm:@dev-sergeev/pi-gigachat@0.7.1
 pi
 ```
 
@@ -97,10 +107,11 @@ Previously saved connections are restored on restart. Defaults left by older
 package versions are not rewritten or removed: if one points to an unavailable
 built-in model, add a connection through `/gigachat` and choose a model explicitly.
 
-Pi loads the prebuilt `extension.ts` through its host-aware module loader and supplies its own `@earendil-works`
-APIs. Installation only adds two runtime packages: `undici` for HTTP/proxy support
-and `eventsource-parser` for SSE. Pi peers are optional to avoid installing another
-agent; they are required for development and supplied by the host at runtime.
+Pi loads the prebuilt `extension.ts` through its host-aware module loader and
+supplies its own `@earendil-works` APIs. Runtime dependencies are `undici` for
+HTTP/proxy support, `eventsource-parser` for SSE and `proper-lockfile` for shared
+credential-store locking. Optional Pi peers avoid installing another agent;
+they are supplied by the host at runtime and installed for local development.
 
 To work on a local checkout:
 
@@ -434,6 +445,18 @@ OAuth and chat traffic, including SSE. Include the proxy CA in the trusted bundl
 
 ## Context and tools
 
+Pi 1.3 passes providers a normalized transcript. The adapter resolves all system
+messages into one leading GigaChat system message, including named section
+updates/removals and the current tool set. Tools added, removed or redefined
+during a session are reflected in the next request; request conversion does not
+rewrite saved messages. MCP, codemode and tool search remain Pi features, not
+separate protocols implemented by this package.
+
+Final malformed function arguments carry `argumentsError` with empty arguments.
+Pi's tool validation rejects that call and reports the problem to the model;
+partially parsed arguments are never executed as a completed call. Invalid
+provider envelopes, missing function names and truncated streams remain errors.
+
 ### Reasoning levels
 
 Models with reasoning support use Pi's `off`, `low`, `medium`, and `high`
@@ -477,12 +500,12 @@ overrides. This avoids API errors when replaying function state. Stored Pi
 history and response parsing are unchanged; nested function arguments are not
 modified.
 
-History follows Pi's normal rules: aborted/failed assistant turns are excluded
-from requests, while model switches convert non-redacted thinking into ordinary
-assistant text and strip model-specific state. Redacted blocks are not sent as
-plaintext reasoning. Compaction can include thinking in its summary input and
-replace older active context with a summary; the original session entries remain
-on disk. Older reasoning discarded by earlier adapter versions cannot be recovered.
+History follows Pi 1.3's rules: aborted/failed assistant turns are excluded from
+requests, while model switches drop foreign thinking and strip model-specific
+state. Redacted blocks are not sent as plaintext reasoning. Compaction omits
+thinking from its summary input and can replace older active context with a
+summary; the original session entries remain on disk. Older reasoning discarded
+by earlier adapter versions cannot be recovered.
 
 Preserving and replaying reasoning history is independent of the generation level
 above. Use `GIGACHAT_EXTRA_BODY` for additional reasoning parameters supported by
@@ -557,7 +580,7 @@ zero because USD prices are unknown, not because usage is free.
 ## Programmatic use
 
 Build the checkout first with `npm run build`. In a separate Node.js application,
-install `@earendil-works/pi-ai@0.85.1` alongside this package; Pi normally provides
+install `@earendil-works/pi-ai@1.3.0` alongside this package; Pi normally provides
 that peer for extensions.
 
 ```ts
@@ -582,7 +605,12 @@ const model: Model<"gigachat-extension-api"> = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 const models = createModels();
-models.setProvider({ ...gigachatProvider, getModels: () => [model] });
+const catalog = [model];
+models.setProvider({
+  ...gigachatProvider,
+  getModels: () => catalog,
+  getAllModels: () => catalog,
+});
 const answer = await models.completeSimple(model, {
   messages: [{ role: "user", content: "Привет!", timestamp: Date.now() }],
 }, {
@@ -593,16 +621,24 @@ const answer = await models.completeSimple(model, {
 This example reads environment credentials. Pass a `CredentialStore` to
 `createModels()` when embedding persisted authentication in another application.
 The default export registers `/gigachat` and restores saved server connections,
-not the library provider. The low-level `streamSimpleGigaChat` export requires
-a resolved access token in `apiKey`.
-Set the model base URL or pass `env.GIGACHAT_BASE_URL` explicitly when using the
-low-level export. Its `GigaChatStreamOptions` also supports `stream`, `extraBody`, `topP`,
-`responseFormat`, `functionCall`, `repetitionPenalty` and `profanityCheck`.
+not the library provider. Keep `getModels()` and `getAllModels()` consistent when
+supplying a consumer-owned catalog.
+
+The low-level `streamSimpleGigaChat` export accepts a normalized
+`TranscriptContext`: pass `normalizeContext({ systemPrompt, tools, messages })`
+from `@earendil-works/pi-ai`, plus a resolved access token in `apiKey`.
+`Models.completeSimple()` still accepts ordinary `Context` and normalizes it
+before provider dispatch. Set the model base URL or pass `env.GIGACHAT_BASE_URL`
+explicitly when using the low-level export. `GigaChatStreamOptions` also supports
+`stream`, `extraBody`, `topP`, `responseFormat`, `functionCall`,
+`repetitionPenalty` and `profanityCheck`.
 Body precedence is generated fields → model/request `samplingParams` → environment
 JSON → `extraBody` → `onPayload`. `options.stream` overrides `GIGACHAT_STREAM`.
 Custom `fetch`, headers (including null removals), `onResponse`, `timeoutMs`, and
-provider-scoped `env` are supported. `maxRetries` overrides the provider's HTTP
-retry count; Pi retains its separate turn-level recovery policy as described above.
+provider-scoped `env` are supported. `onProviderStreamEvent` is awaited for each
+parsed JSON/SSE event before assistant-message normalization; the SSE `[DONE]`
+sentinel is not an event. `maxRetries` overrides the provider's HTTP retry count;
+Pi retains its separate turn-level recovery policy as described above.
 
 ## Development
 
@@ -615,6 +651,6 @@ npm pack --dry-run
 ```
 
 Tests use synthetic credentials, local HTTP fixtures and actual pi RPC sessions.
-For another installed pi, set `PI_TEST_CLI=/absolute/path/to/pi/dist/cli.js`.
+For another Pi 1.3.0 installation, set `PI_TEST_CLI=/absolute/path/to/pi/dist/bundle/cli.js`.
 Secrets, local traffic captures, audit scripts and generated files are excluded
 from Git; `.env.example` is included in the package.

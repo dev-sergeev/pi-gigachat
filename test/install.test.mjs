@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -57,42 +57,6 @@ async function assertPassiveActivation(extensionPath, settings) {
   });
 }
 
-test('extension rejects unsupported host versions even with local Pi 0.85.1 peers', { timeout: 30000 }, async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'pi-gigachat-host-version-'));
-  try {
-    const hostDir = join(dir, 'host');
-    const installedHost = join(repo, 'node_modules/@earendil-works/pi-coding-agent');
-    const hostPackage = JSON.parse(await readFile(join(installedHost, 'package.json'), 'utf8'));
-    // A separate host tree exercises Pi's real aliases while native imports
-    // from the extension still see the original local 0.85.1 peers.
-    await cp(join(installedHost, 'dist'), join(hostDir, 'dist'), { recursive: true });
-    await symlink(join(repo, 'node_modules'), join(hostDir, 'node_modules'), 'dir');
-    const env = { ...cleanEnv(), HOME: dir, PI_CODING_AGENT_DIR: join(dir, 'agent') };
-    delete env.PI_PACKAGE_DIR;
-    for (const version of ['1.3.0', '0.85.0', '0.85.2', '0.85.1-rc.1']) {
-      await writeFile(join(hostDir, 'package.json'), JSON.stringify({ ...hostPackage, version }));
-      const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
-        import { VERSION as localVersion } from '@earendil-works/pi-coding-agent';
-        import { pathToFileURL } from 'node:url';
-        // Intentionally load the isolated host, not the extension's local peer.
-        const { VERSION } = await import(pathToFileURL(process.argv[2] + '/dist/index.js'));
-        const { loadExtensions } = await import(pathToFileURL(process.argv[2] + '/dist/core/extensions/loader.js'));
-        const { extensions, errors } = await loadExtensions([process.argv[1]], process.cwd());
-        console.log(JSON.stringify({ version: VERSION, localVersion, loaded: extensions.map(extension => extension.path), errors }));
-      `, join(repo, 'extension.ts'), hostDir], {
-        cwd: repo,
-        env,
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000,
-      }));
-      assert.equal(result.version, version);
-      assert.equal(result.localVersion, '0.85.1');
-      assert.deepEqual(result.loaded, [], `Pi ${version} must not activate the extension`);
-      assert.equal(result.errors.length, 1);
-      assert(result.errors[0].error.includes(`Unsupported Pi version ${version}`), result.errors[0].error);
-      assert.match(result.errors[0].error, /requires Pi 0\.85\.1/);
-    }
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
 
 for (const [label, settings] of settingsCases) {
   test(`loading the local extension preserves ${label} and registers no built-ins`, { timeout: 30000 }, async () => {

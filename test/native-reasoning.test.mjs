@@ -3,7 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { completion, reply, withServer } from './helpers.mjs';
+import { completion, reply, testModel, withServer } from './helpers.mjs';
 import { piRoot, withPi } from './pi-rpc.mjs';
 
 const { AssistantMessageComponent } = await import(pathToFileURL(`${piRoot}/dist/modes/interactive/components/assistant-message.js`));
@@ -51,8 +51,11 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       const compacted = await pi.command('compact');
       assert.equal(compacted.success, true, compacted.error);
       const summaries = requests.filter(isSummary);
-      assert(summaries.some(req => req.body.messages.some(m => m.content.includes('REASONING_TOOL_742'))), 'thinking must reach Pi compaction input');
-      assert(summaries.some(req => req.body.messages.some(m => m.content.includes('REASONING_ANSWER_742'))));
+      assert(summaries.length > 0);
+      assert(summaries.every(req => req.body.messages.every(m => !m.content.includes('REASONING_TOOL_742') && !m.content.includes('REASONING_ANSWER_742'))),
+        'Pi 1.3 compaction omits thinking rather than treating it as visible conversation');
+      assert(summaries.some(req => req.body.messages.some(m => m.content.includes('NATIVE_REASONING_FIXTURE_742'))),
+        'Compaction must retain the visible answer and tool-result fact');
       assert((await pi.entries()).some(e => e.type === 'message' && e.message.content?.some?.(b => b.thinking === toolThought)), 'compaction must keep the original session entries');
       await pi.prompt('Continue after compaction.');
       assert(requests.at(-1).body.messages.some(m => m.content.includes(summary)));
@@ -65,4 +68,29 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
         function_call: { name: 'read', arguments: { path } }, functions_state_id: 'native-reasoning-state' }, 'function_call'));
     } else reply(req, res, completion({ role: 'assistant', content: 'The file contains NATIVE_REASONING_FIXTURE_742.', reasoning_content: answerThought }));
   });
+});
+
+test('native model handoff drops foreign thinking but retains visible history and saved reasoning', { timeout: 30000 }, async () => {
+  await withServer(async ({ baseUrl, requests }) => {
+    await withPi(baseUrl, async pi => {
+      await pi.prompt('Remember VISIBLE_HANDOFF_FACT_742.');
+      const selected = await pi.command('set_model', { provider: 'gigachat', modelId: 'handoff-target' });
+      assert.equal(selected.success, true, selected.error);
+      await pi.prompt('Continue with the visible fact.');
+      assert.equal(requests.length, 2, 'Changing the selected model must not run a hidden generation probe');
+      const previousAnswers = requests[1].body.messages.filter(message => message.role === 'assistant');
+      assert(previousAnswers.some(message => message.content.includes('VISIBLE_HANDOFF_FACT_742')));
+      assert(previousAnswers.every(message => !message.content.includes('FOREIGN_PRIVATE_THOUGHT_742')),
+        'Pi 1.3 must not turn another model\'s thinking into visible conversation');
+      const saved = (await pi.entries()).filter(entry => entry.type === 'message' && entry.message.role === 'assistant');
+      assert(saved[0].message.content.some(block => block.type === 'thinking' && block.thinking === 'FOREIGN_PRIVATE_THOUGHT_742'),
+        'Dropping foreign thinking from a request must not alter saved reasoning');
+    }, {}, { fixtureModels: [
+      testModel({ id: 'test-model', baseUrl }),
+      testModel({ id: 'handoff-target', baseUrl }),
+    ] });
+  }, (req, res) => reply(req, res, completion({
+    role: 'assistant', content: 'VISIBLE_HANDOFF_FACT_742 retained.',
+    reasoning_content: req.body.model === 'test-model' ? 'FOREIGN_PRIVATE_THOUGHT_742' : 'Target reasoning.',
+  })));
 });

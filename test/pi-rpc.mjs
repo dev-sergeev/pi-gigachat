@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { readFileSync, realpathSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -8,8 +9,23 @@ import { createInterface } from 'node:readline';
 import { cleanEnv, testModel, token } from './helpers.mjs';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
-export const cliPath = process.env.PI_TEST_CLI ?? join(repo, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js');
-export const piRoot = resolve(dirname(cliPath), '..');
+export const cliPath = resolve(process.env.PI_TEST_CLI ?? join(repo, 'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'));
+export const piRoot = findPiRoot(cliPath);
+
+function findPiRoot(cli) {
+  let directory = dirname(realpathSync(cli));
+  for (;;) {
+    try {
+      const manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
+      if (manifest.name === '@earendil-works/pi-coding-agent') return directory;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) throw new Error(`Cannot locate Pi package root for ${cli}`);
+    directory = parent;
+  }
+}
 export const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function until(predicate, label, timeout = 15000) {
@@ -26,7 +42,8 @@ export async function writeModelFixture(agentDir, models) {
   const providerUrl = pathToFileURL(join(repo, 'dist/index.js')).href;
   await writeFile(extensionPath, `import { gigachatProvider } from ${JSON.stringify(providerUrl)};
 export default function (pi) {
-  pi.registerProvider({ ...gigachatProvider, getModels: () => ${JSON.stringify(models)} });
+  const models = ${JSON.stringify(models)};
+  pi.registerProvider({ ...gigachatProvider, getModels: () => models, getAllModels: () => models });
 }
 `);
   return extensionPath;
@@ -66,10 +83,6 @@ export async function withPi(baseUrl, run, settings = {}, runtime = {}) {
       events.push(event);
       if (event.type === 'response' && pending.has(event.id)) {
         pending.get(event.id)(event); pending.delete(event.id);
-      } else if (event.type === 'response' && event.command === 'parse' && !event.success && pending.size === 1) {
-        // pi 0.58 reports exceptions without the original command id.
-        const [id, resolve] = pending.entries().next().value;
-        resolve(event); pending.delete(id);
       }
     });
     const command = async (type, args = {}) => {

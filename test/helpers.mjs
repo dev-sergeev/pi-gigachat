@@ -56,7 +56,7 @@ export async function withServer(run, respond = (_request, res) => json(res, com
 }
 export async function ask(model, context = { messages: [user('Hi')] }, options = {}) {
   const models = createModels();
-  models.setProvider({ ...gigachatProvider, getModels: () => [model] });
+  models.setProvider({ ...gigachatProvider, getModels: () => [model], getAllModels: () => [model] });
   return models.completeSimple(model, context, { ...options, env: { GIGACHAT_ACCESS_TOKEN: token, ...options.env } });
 }
 

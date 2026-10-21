@@ -298,7 +298,7 @@ test('OAuth and chat retries receive scoped environment settings', async () => {
   await withServer(async ({ model, baseUrl, requests }) => {
     const env = { GIGACHAT_CREDENTIALS: 'synthetic.retry.credentials', GIGACHAT_AUTH_URL: baseUrl + '/oauth', GIGACHAT_MAX_RETRIES: '1', ...fast };
     const models = createModels({ authContext: { env: async name => env[name], fileExists: async () => false } });
-    models.setProvider({ ...gigachatProvider, getModels: () => [model] });
+    models.setProvider({ ...gigachatProvider, getModels: () => [model], getAllModels: () => [model] });
     const result = await models.completeSimple(model, { messages: [user('Hi')] });
     assert.equal(result.stopReason, 'stop', result.errorMessage);
     assert.equal(requests.filter(r => r.url.endsWith('/oauth')).length, 2);
