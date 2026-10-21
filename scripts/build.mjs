@@ -3,8 +3,9 @@ import { build } from 'esbuild';
 // Pi aliases the public pi-ai entrypoint, but not its internal helper paths.
 // Bundle those helpers from the pinned development version; retain host APIs.
 await build({
-  entryPoints: ['src/index.ts'],
-  outfile: 'extension.js',
+  entryPoints: ['src/extension.ts'],
+  // .ts forces Pi's loader to apply host aliases instead of native ESM/local peers.
+  outfile: 'extension.ts',
   bundle: true,
   platform: 'node',
   format: 'esm',

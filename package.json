@@ -1,6 +1,6 @@
 {
 	"name": "@dev-sergeev/pi-gigachat",
-	"version": "0.6.4",
+	"version": "0.6.5",
 	"description": "GigaChat-compatible server connections and user-selected models for pi-coding-agent",
 	"private": false,
 	"type": "module",
@@ -35,7 +35,7 @@
 	},
 	"files": [
 		"dist",
-		"extension.js",
+		"extension.ts",
 		"THIRD_PARTY_NOTICES",
 		".env.example",
 		"README.md",
@@ -54,7 +54,7 @@
 	},
 	"pi": {
 		"extensions": [
-			"./extension.js"
+			"./extension.ts"
 		]
 	},
 	"peerDependencies": {

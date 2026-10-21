@@ -1,4 +1,4 @@
-extension.js includes transformMessages and abort helpers from
+extension.ts includes transformMessages and abort helpers from
 @earendil-works/pi-ai 0.85.1 (https://github.com/earendil-works/pi).
 
 MIT License

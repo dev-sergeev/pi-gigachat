@@ -15,7 +15,7 @@ export const gigachatProvider = createProvider({
 });
 
 export default async function (pi: ExtensionAPI) {
-	// Pi UI peers are absent when this package is used only as a pi-ai library.
-	const { registerGigaChatCommand } = await import("./gigachat-ui.js");
-	await registerGigaChatCommand(pi);
+	// Pi host/UI peers may be absent for pi-ai-only consumers; load them only on activation.
+	const { default: activate } = await import("./extension.js");
+	await activate(pi);
 }

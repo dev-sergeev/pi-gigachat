@@ -7,8 +7,13 @@ authentication and session lifecycle.
 
 The `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and
 `@earendil-works/pi-tui` peer dependencies are pinned to exactly `0.85.1`.
-Newer Pi versions are not supported. These are package-manager constraints,
-not a runtime version check; options such as `--legacy-peer-deps` can bypass them.
+These pins alone do not restrict the running Pi: managed `pi install` deliberately
+disables peer resolution (npm uses `--legacy-peer-deps`). At activation, the extension
+checks the host-provided `VERSION` and rejects every version other than exactly
+`0.85.1`, before registering commands or restoring connections. Downloading or
+installing package files can still succeed; bypassing peer checks does not bypass
+this activation check. Pi versions that treat extension errors as fatal, including
+1.3.0, stop startup; remove the package or start without extensions with `pi -ne`.
 
 The package has no built-in models and does not change Pi's saved default
 provider or model. Use `/gigachat` to add a server connection and select models
@@ -16,6 +21,12 @@ from its catalog, then choose one through `/model`. The adapter supports text
 conversations, Pi tools, and JSON or SSE responses.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
+
+## Release 0.6.5
+
+- Added a host-version activation guard: only Pi `0.85.1` can load the extension; older, newer, and prerelease versions are rejected with the detected and required versions.
+- Changed the prebuilt Pi entrypoint to `extension.ts` so Pi applies host API aliases even when local `0.85.1` peers are present. The file is still bundled ahead of time; Git installs need no build tools.
+- Installation itself is not blocked. Unlike `0.6.4`, this release rejects activation on unsupported Pi hosts even when peer-dependency checks are bypassed.
 
 ## Release 0.6.4
 
@@ -72,7 +83,7 @@ under its original MIT license.
 With Pi 0.85.1 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.6.4
+pi install npm:@dev-sergeev/pi-gigachat@0.6.5
 pi
 ```
 
@@ -86,7 +97,7 @@ Previously saved connections are restored on restart. Defaults left by older
 package versions are not rewritten or removed: if one points to an unavailable
 built-in model, add a connection through `/gigachat` and choose a model explicitly.
 
-Pi loads the prebuilt `extension.js` and supplies its own `@earendil-works`
+Pi loads the prebuilt `extension.ts` through its host-aware module loader and supplies its own `@earendil-works`
 APIs. Installation only adds two runtime packages: `undici` for HTTP/proxy support
 and `eventsource-parser` for SSE. Pi peers are optional to avoid installing another
 agent; they are required for development and supplied by the host at runtime.
@@ -102,9 +113,9 @@ cp -n .env.example .env
 ```
 
 After changing source, run `npm run build`, then restart Pi or use `/reload`.
-The build updates `extension.js` and produces JavaScript and declarations in
+The build updates `extension.ts` and produces JavaScript and declarations in
 `dist/` for programmatic use; `npm pack` builds them automatically. Commit the
-updated `extension.js` with source changes so Git installs need no build tools. To load the checkout for one session, use
+updated `extension.ts` with source changes so Git installs need no build tools. To load the checkout for one session, use
 `pi -e /absolute/path/to/pi-gigachat`.
 
 ## Token, base URL and request settings
