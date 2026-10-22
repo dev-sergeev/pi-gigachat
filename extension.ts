@@ -25,7 +25,7 @@ function raceWithAbortSignal(operation, signal) {
     });
     return Promise.reject(abortReason(signal));
   }
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     let settled = false;
     const cleanup = () => signal.removeEventListener("abort", onAbort);
     const onAbort = () => {
@@ -41,7 +41,7 @@ function raceWithAbortSignal(operation, signal) {
         return;
       settled = true;
       cleanup();
-      resolve2(value);
+      resolve3(value);
     }, (error) => {
       if (settled)
         return;
@@ -56,6 +56,87 @@ function raceWithAbortSignal(operation, signal) {
 
 // src/http.ts
 import { EnvHttpProxyAgent, fetch } from "undici";
+
+// src/mtls.ts
+import { createPrivateKey, X509Certificate } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import { createSecureContext } from "node:tls";
+var GigaChatMtlsError = class extends Error {
+  code = "GIGACHAT_MTLS_ERROR";
+};
+function certificates(pem, label) {
+  const blocks = pem.match(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
+  );
+  if (!blocks?.length || pem.replace(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g,
+    ""
+  ).trim())
+    throw new GigaChatMtlsError(
+      `GigaChat mTLS ${label}: expected PEM certificates.`
+    );
+  try {
+    return blocks.map((block) => new X509Certificate(block));
+  } catch {
+    throw new GigaChatMtlsError(
+      `GigaChat mTLS ${label}: invalid PEM certificate.`
+    );
+  }
+}
+async function importMtlsMaterials(paths, signal) {
+  const read = async (path, label) => {
+    signal.throwIfAborted();
+    try {
+      const expanded = path === "~" ? homedir() : path.startsWith("~/") ? resolve(homedir(), path.slice(2)) : resolve(path);
+      return await readFile(expanded, { encoding: "utf8", signal });
+    } catch {
+      signal.throwIfAborted();
+      throw new GigaChatMtlsError(`GigaChat mTLS ${label}: cannot read file.`);
+    }
+  };
+  const ca = await read(paths.caPath, "CA");
+  certificates(ca, "CA");
+  const cert = await read(paths.certPath, "client certificate");
+  const chain = certificates(cert, "client certificate");
+  const pem = await read(paths.keyPath, "private key");
+  if (!/^\s*-----BEGIN (?:ENCRYPTED PRIVATE KEY|PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY)-----/.test(
+    pem
+  ))
+    throw new GigaChatMtlsError(
+      "GigaChat mTLS private key: expected a PEM private key."
+    );
+  let key;
+  try {
+    const privateKey = createPrivateKey({
+      key: pem,
+      format: "pem",
+      passphrase: paths.passphrase
+    });
+    if (!chain[0].checkPrivateKey(privateKey))
+      throw new GigaChatMtlsError(
+        "GigaChat mTLS private key does not match the client certificate."
+      );
+    key = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  } catch (error) {
+    if (error instanceof GigaChatMtlsError) throw error;
+    throw new GigaChatMtlsError(
+      "GigaChat mTLS private key: invalid key or incorrect passphrase."
+    );
+  }
+  signal.throwIfAborted();
+  try {
+    createSecureContext({ ca, cert, key });
+  } catch {
+    throw new GigaChatMtlsError(
+      "GigaChat mTLS materials are not suitable for TLS."
+    );
+  }
+  return { ca, cert, key };
+}
+
+// src/http.ts
 function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -149,11 +230,11 @@ function serverDelay(error) {
   return Number.isFinite(delay) ? Math.max(0, delay) : 0;
 }
 function wait(ms, signal) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     signal.throwIfAborted();
     const timer = setTimeout(() => {
       signal.removeEventListener("abort", abort);
-      resolve2();
+      resolve3();
     }, ms);
     const abort = () => {
       clearTimeout(timer);
@@ -164,6 +245,8 @@ function wait(ms, signal) {
   });
 }
 async function request(url, init, options, consume, observe) {
+  if (options.mtls && new URL(url).protocol !== "https:")
+    throw new GigaChatMtlsError("GigaChat mTLS requires an HTTPS endpoint.");
   const env = environment(options);
   const timeout = options.timeoutMs ?? Number(env.GIGACHAT_TIMEOUT ?? 300) * 1e3;
   if (!Number.isFinite(timeout) || timeout <= 0)
@@ -179,10 +262,12 @@ async function request(url, init, options, consume, observe) {
   const signal = options.signal ?? new AbortController().signal;
   signal.throwIfAborted();
   const proxy = (name) => options.env?.[name.toLowerCase()] ?? options.env?.[name] ?? env[name.toLowerCase()] ?? env[name] ?? "";
+  const originTls = options.mtls ? { ...options.mtls, rejectUnauthorized: true } : void 0;
   const dispatcher = new EnvHttpProxyAgent({
     httpProxy: proxy("HTTP_PROXY"),
     httpsProxy: proxy("HTTPS_PROXY"),
-    noProxy: proxy("NO_PROXY")
+    noProxy: proxy("NO_PROXY"),
+    ...originTls && { connect: originTls, requestTls: originTls }
   });
   try {
     const send = options.fetch ?? fetch;
@@ -197,8 +282,11 @@ async function request(url, init, options, consume, observe) {
       let observing = false;
       let delay = 0;
       try {
+        const requestHeaders = options.mtls ? new Headers(currentInit.headers) : void 0;
+        requestHeaders?.delete("Authorization");
         response = await send(url, {
           ...currentInit,
+          ...options.mtls && { headers: requestHeaders, redirect: "error" },
           signal: attemptSignal,
           dispatcher
         });
@@ -217,6 +305,12 @@ async function request(url, init, options, consume, observe) {
         const error = attemptSignal.aborted ? attemptSignal.reason : caught;
         const recover422 = error instanceof GigaChatHttpError && error.status === 422 ? options.recover422 : void 0;
         if (maxRetries === 0 || observing || options.canRetry?.() === false || !recover422 && !transient(error)) {
+          if (options.mtls && !response && error instanceof Error && error.name !== "TimeoutError") {
+            const cause = object(error.cause) ? error.cause : error;
+            const code = object(cause) && typeof cause.code === "string" ? cause.code : "";
+            const detail = code === "ERR_TLS_CERT_ALTNAME_INVALID" ? "server hostname verification failed" : /CERT|ISSUER|SELF_SIGNED|VERIFY_LEAF/.test(code) ? "server certificate verification failed against the imported CA" : /TLS|SSL/.test(code) ? "TLS handshake failed; check the client certificate and key" : "connection failed; check the network, proxy and TLS materials";
+            throw new GigaChatMtlsError(`GigaChat mTLS ${detail}.`);
+          }
           if (error instanceof Error && error.message === "fetch failed" && error.cause instanceof Error)
             throw new Error(
               `GigaChat connection failed: ${error.cause.message}`,
@@ -318,9 +412,9 @@ async function exchange(stored, signal, env = {}, options = {}) {
 
 // src/connections.ts
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readFile as readFile2, rename, unlink, writeFile } from "node:fs/promises";
+import { homedir as homedir2 } from "node:os";
+import { dirname, join, resolve as resolve2 } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
@@ -664,7 +758,7 @@ function payload(model, context, options) {
   };
 }
 function streamSimpleGigaChat(model, context, options = {}) {
-  if (!options.apiKey)
+  if (!options.apiKey && !options.mtls)
     throw new Error(
       "GigaChat access token is required; use /gigachat in Pi or gigachatProvider with createModels()"
     );
@@ -721,7 +815,9 @@ function streamSimpleGigaChat(model, context, options = {}) {
               {
                 "Content-Type": "application/json",
                 Accept: streaming ? "text/event-stream" : "application/json",
-                Authorization: `Bearer ${options.apiKey}`,
+                ...!options.mtls && {
+                  Authorization: `Bearer ${options.apiKey}`
+                },
                 "User-Agent": "pi-gigachat",
                 "Cache-Control": "no-store",
                 ...options.sessionId && options.cacheRetention !== "none" ? { "X-Session-ID": options.sessionId } : {}
@@ -971,8 +1067,7 @@ function completionConsumer(output, stream, model) {
       closeThinking();
       closeText();
       if (tool) {
-        if (!tool.name)
-          throw new Error("Invalid GigaChat function_call name");
+        if (!tool.name) throw new Error("Invalid GigaChat function_call name");
         Object.assign(tool, parseToolCallArguments(argumentsJson));
         if (signature) tool.thoughtSignature = signature;
         stream.push({
@@ -1081,7 +1176,11 @@ function httpUrl(value) {
 function validConnection(value) {
   if (!object(value) || !ownedId(value.id) || !nonempty(value.revision) || !nonempty(value.name) || !httpUrl(value.baseUrl) || !object(value.authorization) || !Array.isArray(value.models))
     return false;
-  if (value.authorization.type !== "token") {
+  if (value.authorization.type === "mtls") {
+    const materials = value.authorization.materials;
+    if (new URL(value.baseUrl).protocol !== "https:" || !object(materials) || !nonempty(materials.ca) || !nonempty(materials.cert) || !nonempty(materials.key))
+      return false;
+  } else if (value.authorization.type !== "token") {
     if (value.authorization.type !== "credentials" || !httpUrl(value.authorization.tokenUrl) || !nonempty(value.authorization.scope))
       return false;
   }
@@ -1110,6 +1209,9 @@ function validConnection(value) {
 function validCredential(value, id) {
   if (!object(value) || !validConnection(value.gigachatConnection) || id !== void 0 && value.gigachatConnection.id !== id)
     return false;
+  if (value.gigachatConnection.authorization.type === "mtls") {
+    return value.type === "api_key" && value.key === void 0 && value.env === void 0;
+  }
   if (value.gigachatConnection.authorization.type === "token") {
     return value.type === "api_key" && value.key === void 0 && object(value.env) && Object.values(value.env).every((entry) => typeof entry === "string") && nonempty(value.env.GIGACHAT_ACCESS_TOKEN);
   }
@@ -1153,6 +1255,8 @@ async function prepareConnectionCredential(connection, secret, signal, previous)
       "Invalid GigaChat connection configuration."
     );
   const saved = structuredClone(connection);
+  if (saved.authorization.type === "mtls")
+    return { type: "api_key", gigachatConnection: saved };
   const normalized = secret.trim().replace(
     saved.authorization.type === "token" ? /^Bearer(?:\s+|$)/i : /^Basic(?:\s+|$)/i,
     ""
@@ -1194,15 +1298,15 @@ function createConnectionProvider(connection, store, loginCredential) {
   }));
   const selected = new Map(models.map((model) => [model.id, model]));
   const auth = {};
-  if (saved.authorization.type === "token") {
+  if (saved.authorization.type === "token" || saved.authorization.type === "mtls") {
     auth.apiKey = {
-      name: "GigaChat connection access token",
+      name: saved.authorization.type === "mtls" ? "GigaChat connection client certificate" : "GigaChat connection access token",
       async login({ signal }) {
         signal.throwIfAborted();
         if (loginCredential?.type !== "api_key")
           throw new ConnectionError(
             "GIGACHAT_AUTH_ERROR",
-            "Use /gigachat to enter a GigaChat access token securely."
+            "Use /gigachat to configure GigaChat authorization securely."
           );
         return structuredClone(loginCredential);
       },
@@ -1217,10 +1321,13 @@ function createConnectionProvider(connection, store, loginCredential) {
           (entry) => entry.gigachatConnection.id === saved.id
         );
         const current = currentCredential(credential, saved);
-        if (current.type !== "api_key") throw stale();
+        if (current.type !== "api_key" || current.gigachatConnection.authorization.type !== saved.authorization.type)
+          throw stale();
         return {
           auth: {
-            apiKey: current.env?.GIGACHAT_ACCESS_TOKEN,
+            // Native Pi accepts header-based auth for keyless providers.
+            // No dummy API key or Authorization header is needed for mTLS.
+            ...saved.authorization.type === "mtls" ? { headers: {} } : { apiKey: current.env?.GIGACHAT_ACCESS_TOKEN },
             baseUrl: endpoint
           },
           source: saved.name
@@ -1262,6 +1369,8 @@ function createConnectionProvider(connection, store, loginCredential) {
     if (!current || model.provider !== saved.id) throw stale();
     return streamSimpleGigaChat(current, context, {
       ...options,
+      mtls: saved.authorization.type === "mtls" ? saved.authorization.materials : void 0,
+      apiKey: saved.authorization.type === "mtls" ? void 0 : options.apiKey,
       temperature: options.temperature ?? current.temperature,
       // These legacy overrides must not redirect a connection or its selected Model ID.
       env: {
@@ -1285,8 +1394,8 @@ var ConnectionStore = class {
   runtime;
   writes = Promise.resolve();
   constructor(authPath = join(getAgentDir(), "auth.json")) {
-    const expanded = authPath === "~" ? homedir() : authPath.startsWith("~/") ? join(homedir(), authPath.slice(2)) : authPath;
-    this.authPath = resolve(
+    const expanded = authPath === "~" ? homedir2() : authPath.startsWith("~/") ? join(homedir2(), authPath.slice(2)) : authPath;
+    this.authPath = resolve2(
       expanded.startsWith("file://") ? fileURLToPath(expanded) : expanded
     );
   }
@@ -1325,7 +1434,7 @@ var ConnectionStore = class {
       if (compromised) throw storageError();
       let content;
       try {
-        content = await readFile(this.authPath, "utf8");
+        content = await readFile2(this.authPath, "utf8");
       } catch (error) {
         signal?.throwIfAborted();
         if (compromised) throw storageError();
@@ -1519,11 +1628,13 @@ async function discoverModels(baseUrl2, apiKey, options) {
   } catch {
     throw new DiscoveryError("INVALID_URL");
   }
-  const headers2 = {
-    Authorization: `Bearer ${apiKey}`,
-    "Content-Type": "application/json"
+  const headers2 = new Headers({ "Content-Type": "application/json" });
+  if (!options.mtls) headers2.set("Authorization", `Bearer ${apiKey}`);
+  const transport = {
+    signal: options.signal,
+    maxRetries: 0,
+    mtls: options.mtls
   };
-  const transport = { signal: options.signal, maxRetries: 0 };
   const models = await request(
     `${root}/models`,
     { method: "GET", headers: headers2 },
@@ -1577,6 +1688,7 @@ async function discoverModels(baseUrl2, apiKey, options) {
 }
 function describeDiscoveryError(error) {
   if (error instanceof DiscoveryError) return error.message;
+  if (error instanceof GigaChatMtlsError) return error.message;
   if (error instanceof GigaChatHttpError) {
     const status = error.status;
     const detail = status === 401 ? "access token rejected" : status === 403 ? "access denied" : status === 404 ? "endpoint or model not found" : status === 429 ? "rate limited" : status === 408 ? "request timed out" : status >= 500 ? "server temporarily unavailable" : "request rejected";
@@ -1883,9 +1995,13 @@ function runProgress(ctx, title, work) {
 // src/gigachat-ui.ts
 var AUTH_LABELS = {
   token: "\u0422\u043E\u043A\u0435\u043D",
-  credentials: "\u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u043E\u043D\u043D\u044B\u0439 \u043A\u043B\u044E\u0447"
+  credentials: "\u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u043E\u043D\u043D\u044B\u0439 \u043A\u043B\u044E\u0447",
+  mtls: "\u0421\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u044B (mTLS)"
 };
 var scopes2 = ["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"];
+var authModes = Object.keys(
+  AUTH_LABELS
+);
 var defaultTokenUrl = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
 var FormError = class extends Error {
 };
@@ -2098,6 +2214,7 @@ async function registerGigaChatCommand(pi) {
         const token = credential.type === "oauth" ? credential.access : credential.env?.GIGACHAT_ACCESS_TOKEN ?? "";
         const probes = await discoverModels(draft.baseUrl, token, {
           signal,
+          mtls: draft.authorization.type === "mtls" ? draft.authorization.materials : void 0,
           progress: (completed, total, probe) => update(
             `\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043C\u043E\u0434\u0435\u043B\u0435\u0439: ${completed}/${total}${probe ? ` \xB7 ${probe.model.id}: ${probe.status === "available" ? "\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430" : probe.reason}` : ""}`
           )
@@ -2132,7 +2249,11 @@ async function registerGigaChatCommand(pi) {
       url: old?.baseUrl ?? "",
       tokenUrl: old?.authorization.type === "credentials" ? old.authorization.tokenUrl : "",
       scope: old?.authorization.type === "credentials" ? old.authorization.scope : scopes2[0],
-      secret: ""
+      secret: "",
+      caPath: "",
+      certPath: "",
+      keyPath: "",
+      passphrase: ""
     };
     for (; ; ) {
       const fields = [
@@ -2156,13 +2277,32 @@ async function registerGigaChatCommand(pi) {
           value: values.tokenUrl,
           placeholder: defaultTokenUrl
         });
-      fields.push({
-        id: "secret",
-        label: mode === "token" ? "\u0422\u043E\u043A\u0435\u043D \u0434\u043E\u0441\u0442\u0443\u043F\u0430 (\u0441\u043A\u0440\u044B\u0442\u044B\u0439 \u0432\u0432\u043E\u0434)" : "\u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u043E\u043D\u043D\u044B\u0439 \u043A\u043B\u044E\u0447 (\u0441\u043A\u0440\u044B\u0442\u044B\u0439 \u0432\u0432\u043E\u0434)",
-        value: values.secret,
-        secret: true,
-        placeholder: old?.authorization.type === mode ? "\u041F\u0443\u0441\u0442\u043E \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u0442\u0435\u043A\u0443\u0449\u0438\u0439 \u0441\u0435\u043A\u0440\u0435\u0442" : void 0
-      });
+      if (mode === "mtls") {
+        const retained = old?.authorization.type === "mtls";
+        for (const [id, label] of [
+          ["caPath", "\u041F\u0443\u0442\u044C \u043A PEM CA"],
+          ["certPath", "\u041F\u0443\u0442\u044C \u043A PEM \u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u0443 \u043A\u043B\u0438\u0435\u043D\u0442\u0430"],
+          ["keyPath", "\u041F\u0443\u0442\u044C \u043A PEM \u043F\u0440\u0438\u0432\u0430\u0442\u043D\u043E\u043C\u0443 \u043A\u043B\u044E\u0447\u0443"]
+        ])
+          fields.push({
+            id,
+            label,
+            value: values[id],
+            placeholder: retained ? "\u0412\u0441\u0435 \u0442\u0440\u0438 \u043F\u0443\u0442\u0438 \u043F\u0443\u0441\u0442\u044B \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u0438\u043C\u043F\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u044B\u0439 \u043D\u0430\u0431\u043E\u0440" : "\u041E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u044C\u043D\u044B\u0439 \u043F\u0443\u0442\u044C \u043A \u0444\u0430\u0439\u043B\u0443"
+          });
+        fields.push({
+          id: "passphrase",
+          label: "\u041F\u0430\u0440\u043E\u043B\u044C PEM \u043A\u043B\u044E\u0447\u0430 (\u043D\u0435\u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u044C\u043D\u043E, \u0441\u043A\u0440\u044B\u0442\u044B\u0439 \u0432\u0432\u043E\u0434)",
+          secret: true
+        });
+      } else
+        fields.push({
+          id: "secret",
+          label: mode === "token" ? "\u0422\u043E\u043A\u0435\u043D \u0434\u043E\u0441\u0442\u0443\u043F\u0430 (\u0441\u043A\u0440\u044B\u0442\u044B\u0439 \u0432\u0432\u043E\u0434)" : "\u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u043E\u043D\u043D\u044B\u0439 \u043A\u043B\u044E\u0447 (\u0441\u043A\u0440\u044B\u0442\u044B\u0439 \u0432\u0432\u043E\u0434)",
+          value: values.secret,
+          secret: true,
+          placeholder: old?.authorization.type === mode ? "\u041F\u0443\u0441\u0442\u043E \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u0442\u0435\u043A\u0443\u0449\u0438\u0439 \u0441\u0435\u043A\u0440\u0435\u0442" : void 0
+        });
       const entered = await showForm(
         ctx,
         `${previous ? "\u0418\u0437\u043C\u0435\u043D\u0438\u0442\u044C" : "\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C"} \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \xB7 ${AUTH_LABELS[mode]}`,
@@ -2193,6 +2333,8 @@ async function registerGigaChatCommand(pi) {
           );
         await store.assertAvailable(id, old?.id);
         const url = baseUrl(values.url.trim() || GIGACHAT_DEFAULT_BASE_URL);
+        if (mode === "mtls" && new URL(url).protocol !== "https:")
+          throw new FormError("\u0414\u043B\u044F mTLS API URL \u0434\u043E\u043B\u0436\u0435\u043D \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C HTTPS.");
         const tokenUrl = mode === "credentials" ? values.tokenUrl.trim() || (url === GIGACHAT_DEFAULT_BASE_URL ? defaultTokenUrl : "") : "";
         if (mode === "credentials" && !tokenUrl)
           throw new FormError(
@@ -2211,6 +2353,56 @@ async function registerGigaChatCommand(pi) {
             scope: values.scope
           };
         }
+        if (mode === "mtls") {
+          const paths = {
+            caPath: values.caPath.trim(),
+            certPath: values.certPath.trim(),
+            keyPath: values.keyPath.trim()
+          };
+          const count = Object.values(paths).filter(Boolean).length;
+          if (count !== 0 && count !== 3)
+            throw new FormError(
+              "\u0414\u043B\u044F \u0438\u043C\u043F\u043E\u0440\u0442\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0432\u0441\u0435 \u0442\u0440\u0438 \u043F\u0443\u0442\u0438: CA, \u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442 \u0438 \u043A\u043B\u044E\u0447."
+            );
+          if (count === 0) {
+            if (old?.authorization.type !== "mtls")
+              throw new FormError(
+                "\u0423\u043A\u0430\u0436\u0438\u0442\u0435 \u043F\u0443\u0442\u0438 \u043A CA, \u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u0443 \u0438 \u043F\u0440\u0438\u0432\u0430\u0442\u043D\u043E\u043C\u0443 \u043A\u043B\u044E\u0447\u0443."
+              );
+            if (values.passphrase)
+              throw new FormError(
+                "\u041F\u0430\u0440\u043E\u043B\u044C \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u043F\u0440\u0438 \u0438\u043C\u043F\u043E\u0440\u0442\u0435: \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0432\u0441\u0435 \u0442\u0440\u0438 \u043F\u0443\u0442\u0438."
+              );
+            authorization = old.authorization;
+          } else {
+            if (!await ctx.ui.confirm(
+              "\u0418\u043C\u043F\u043E\u0440\u0442 \u043F\u0440\u0438\u0432\u0430\u0442\u043D\u043E\u0433\u043E \u043A\u043B\u044E\u0447\u0430 mTLS",
+              "\u041F\u0440\u0438\u0432\u0430\u0442\u043D\u044B\u0439 \u043A\u043B\u044E\u0447 \u0431\u0443\u0434\u0435\u0442 \u0440\u0430\u0441\u0448\u0438\u0444\u0440\u043E\u0432\u0430\u043D \u0438 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u0432 plaintext (\u043E\u0442\u043A\u0440\u044B\u0442\u043E\u043C \u0432\u0438\u0434\u0435) \u0432 auth.json. \u0415\u0433\u043E \u0437\u0430\u0449\u0438\u0442\u0430 \u0437\u0430\u0432\u0438\u0441\u0438\u0442 \u043E\u0442 \u0444\u0430\u0439\u043B\u043E\u0432\u044B\u0445 \u043F\u0440\u0430\u0432 auth.json. \u041F\u0430\u0440\u043E\u043B\u044C \u043D\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u0435\u0442\u0441\u044F. \u0418\u0441\u0445\u043E\u0434\u043D\u044B\u0435 PEM \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u0441\u043B\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u043D\u0435 \u043D\u0443\u0436\u043D\u044B. \u041F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u044C?"
+            ))
+              return;
+            const imported = await runProgress(
+              ctx,
+              "\u0418\u043C\u043F\u043E\u0440\u0442 \u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u043E\u0432 mTLS",
+              async (signal) => {
+                try {
+                  return await importMtlsMaterials(
+                    {
+                      ...paths,
+                      passphrase: values.passphrase || void 0
+                    },
+                    signal
+                  );
+                } finally {
+                  values.passphrase = "";
+                  entered.passphrase = "";
+                }
+              }
+            );
+            if (!imported) return;
+            if ("error" in imported) throw imported.error;
+            authorization = { type: "mtls", materials: imported.value };
+          }
+        }
         const draft = {
           id,
           revision: randomBytes2(12).toString("hex"),
@@ -2219,18 +2411,23 @@ async function registerGigaChatCommand(pi) {
           authorization,
           models: old?.models ?? []
         };
-        const sameAuthorization = old?.authorization.type === authorization.type && (authorization.type === "token" || old.authorization.type === "credentials" && old.authorization.tokenUrl === authorization.tokenUrl && old.authorization.scope === authorization.scope);
+        const sameAuthorization = old?.authorization.type === authorization.type && (authorization.type === "token" || (authorization.type === "mtls" ? old.authorization.type === "mtls" && old.authorization.materials === authorization.materials : old.authorization.type === "credentials" && old.authorization.tokenUrl === authorization.tokenUrl && old.authorization.scope === authorization.scope));
         const changedEndpointOrSecret = !old || old.baseUrl !== draft.baseUrl || !sameAuthorization || Boolean(values.secret.trim());
         let credential;
         if (previous && !changedEndpointOrSecret && !renamed)
           credential = { ...previous, gigachatConnection: draft };
         else {
           const secret = values.secret.trim() || (old?.authorization.type === mode ? oldSecret : "");
-          if (!secret)
+          if (mode !== "mtls" && !secret)
             throw new FormError(
               "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0441\u0435\u043A\u0440\u0435\u0442 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0441\u043F\u043E\u0441\u043E\u0431\u0430 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u0438."
             );
-          credential = await verifyAndChoose(ctx, draft, secret, previous);
+          credential = await verifyAndChoose(
+            ctx,
+            draft,
+            mode === "mtls" ? "" : secret,
+            previous
+          );
         }
         if (!credential) return;
         if (await persist(ctx, credential, old?.id)) {
@@ -2242,6 +2439,9 @@ async function registerGigaChatCommand(pi) {
           error instanceof FormError ? error.message : describeDiscoveryError(error),
           "error"
         );
+      } finally {
+        values.passphrase = "";
+        entered.passphrase = "";
       }
     }
   }
@@ -2349,17 +2549,16 @@ async function registerGigaChatCommand(pi) {
       ]
     );
     if (action === "\u0418\u0437\u043C\u0435\u043D\u0438\u0442\u044C \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435") {
-      const options = [
-        AUTH_LABELS[connection.authorization.type],
-        AUTH_LABELS[connection.authorization.type === "token" ? "credentials" : "token"]
+      const modes = [
+        connection.authorization.type,
+        ...authModes.filter((mode2) => mode2 !== connection.authorization.type)
       ];
-      const mode = await ctx.ui.select("\u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F", options);
-      if (mode)
-        await configure(
-          ctx,
-          mode === AUTH_LABELS.token ? "token" : "credentials",
-          record
-        );
+      const selected2 = await ctx.ui.select(
+        "\u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F",
+        modes.map((mode2) => AUTH_LABELS[mode2])
+      );
+      const mode = modes.find((mode2) => AUTH_LABELS[mode2] === selected2);
+      if (mode) await configure(ctx, mode, record);
     } else if (action === "\u041F\u0430\u0440\u0430\u043C\u0435\u0442\u0440\u044B \u043C\u043E\u0434\u0435\u043B\u0435\u0439")
       await editModelParameters(ctx, record);
     else if (action === "\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u043A\u0430\u0442\u0430\u043B\u043E\u0433 \u0438 \u0432\u044B\u0431\u043E\u0440 \u043C\u043E\u0434\u0435\u043B\u0435\u0439") {
@@ -2428,6 +2627,7 @@ async function registerGigaChatCommand(pi) {
         const options = [
           AUTH_LABELS.token,
           AUTH_LABELS.credentials,
+          AUTH_LABELS.mtls,
           ...records.length ? ["\u0423\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F\u043C\u0438"] : []
         ];
         const choice = await ctx.ui.select(
@@ -2435,11 +2635,10 @@ async function registerGigaChatCommand(pi) {
           options
         );
         if (choice === "\u0423\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F\u043C\u0438") await manage(ctx);
-        else if (choice)
-          await configure(
-            ctx,
-            choice === AUTH_LABELS.token ? "token" : "credentials"
-          );
+        else {
+          const mode = authModes.find((mode2) => AUTH_LABELS[mode2] === choice);
+          if (mode) await configure(ctx, mode);
+        }
       } catch (error) {
         ctx.ui.notify(describeDiscoveryError(error), "error");
       } finally {

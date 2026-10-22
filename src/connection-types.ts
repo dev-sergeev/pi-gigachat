@@ -14,6 +14,13 @@ export interface ConnectionModel {
 	thinkingLevelMap?: ThinkingLevelMap;
 }
 
+/** Imported PEM material owned by one server connection, never file references. */
+export interface MtlsMaterials {
+	ca: string;
+	cert: string;
+	key: string;
+}
+
 export interface Connection {
 	/** Native provider identity; retained on same-name edits, replaced on rename. */
 	id: string;
@@ -23,7 +30,8 @@ export interface Connection {
 	baseUrl: string;
 	authorization:
 		| { type: "token" }
-		| { type: "credentials"; tokenUrl: string; scope: string };
+		| { type: "credentials"; tokenUrl: string; scope: string }
+		| { type: "mtls"; materials: MtlsMaterials };
 	models: ConnectionModel[];
 }
 
@@ -40,5 +48,6 @@ export interface ModelProbe {
 
 export interface DiscoveryOptions {
 	signal: AbortSignal;
+	mtls?: MtlsMaterials;
 	progress?: (completed: number, total: number, probe?: ModelProbe) => void;
 }

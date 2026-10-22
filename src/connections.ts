@@ -117,7 +117,17 @@ function validConnection(value: unknown): value is Connection {
 		!Array.isArray(value.models)
 	)
 		return false;
-	if (value.authorization.type !== "token") {
+	if (value.authorization.type === "mtls") {
+		const materials = value.authorization.materials;
+		if (
+			new URL(value.baseUrl).protocol !== "https:" ||
+			!object(materials) ||
+			!nonempty(materials.ca) ||
+			!nonempty(materials.cert) ||
+			!nonempty(materials.key)
+		)
+			return false;
+	} else if (value.authorization.type !== "token") {
 		if (
 			value.authorization.type !== "credentials" ||
 			!httpUrl(value.authorization.tokenUrl) ||
@@ -179,6 +189,13 @@ function validCredential(
 		(id !== undefined && value.gigachatConnection.id !== id)
 	)
 		return false;
+	if (value.gigachatConnection.authorization.type === "mtls") {
+		return (
+			value.type === "api_key" &&
+			value.key === undefined &&
+			value.env === undefined
+		);
+	}
 	if (value.gigachatConnection.authorization.type === "token") {
 		return (
 			value.type === "api_key" &&
@@ -254,6 +271,8 @@ export async function prepareConnectionCredential(
 			"Invalid GigaChat connection configuration.",
 		);
 	const saved = structuredClone(connection);
+	if (saved.authorization.type === "mtls")
+		return { type: "api_key", gigachatConnection: saved };
 	const normalized = secret
 		.trim()
 		.replace(
@@ -317,15 +336,21 @@ export function createConnectionProvider(
 		}));
 	const selected = new Map(models.map((model) => [model.id, model]));
 	const auth: ProviderAuth = {};
-	if (saved.authorization.type === "token") {
+	if (
+		saved.authorization.type === "token" ||
+		saved.authorization.type === "mtls"
+	) {
 		auth.apiKey = {
-			name: "GigaChat connection access token",
+			name:
+				saved.authorization.type === "mtls"
+					? "GigaChat connection client certificate"
+					: "GigaChat connection access token",
 			async login({ signal }) {
 				signal.throwIfAborted();
 				if (loginCredential?.type !== "api_key")
 					throw new ConnectionError(
 						"GIGACHAT_AUTH_ERROR",
-						"Use /gigachat to enter a GigaChat access token securely.",
+						"Use /gigachat to configure GigaChat authorization securely.",
 					);
 				return structuredClone(loginCredential);
 			},
@@ -342,10 +367,19 @@ export function createConnectionProvider(
 					(entry) => entry.gigachatConnection.id === saved.id,
 				);
 				const current = currentCredential(credential, saved);
-				if (current.type !== "api_key") throw stale();
+				if (
+					current.type !== "api_key" ||
+					current.gigachatConnection.authorization.type !==
+						saved.authorization.type
+				)
+					throw stale();
 				return {
 					auth: {
-						apiKey: current.env?.GIGACHAT_ACCESS_TOKEN,
+						// Native Pi accepts header-based auth for keyless providers.
+						// No dummy API key or Authorization header is needed for mTLS.
+						...(saved.authorization.type === "mtls"
+							? { headers: {} }
+							: { apiKey: current.env?.GIGACHAT_ACCESS_TOKEN }),
 						baseUrl: endpoint,
 					},
 					source: saved.name,
@@ -391,6 +425,11 @@ export function createConnectionProvider(
 		if (!current || model.provider !== saved.id) throw stale();
 		return streamSimpleGigaChat(current, context, {
 			...options,
+			mtls:
+				saved.authorization.type === "mtls"
+					? saved.authorization.materials
+					: undefined,
+			apiKey: saved.authorization.type === "mtls" ? undefined : options.apiKey,
 			temperature: options.temperature ?? current.temperature,
 			// These legacy overrides must not redirect a connection or its selected Model ID.
 			env: {

@@ -26,12 +26,17 @@ import {
 	GIGACHAT_CONNECTION_DEFAULTS,
 	GIGACHAT_DEFAULT_BASE_URL,
 } from "./models.js";
+import { importMtlsMaterials } from "./mtls.js";
 
 const AUTH_LABELS: Record<Connection["authorization"]["type"], string> = {
 	token: "Токен",
 	credentials: "Авторизационный ключ",
+	mtls: "Сертификаты (mTLS)",
 };
 const scopes = ["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"];
+const authModes = Object.keys(
+	AUTH_LABELS,
+) as Connection["authorization"]["type"][];
 const defaultTokenUrl = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
 
 class FormError extends Error {}
@@ -314,6 +319,10 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						: (credential.env?.GIGACHAT_ACCESS_TOKEN ?? "");
 				const probes = await discoverModels(draft.baseUrl, token, {
 					signal,
+					mtls:
+						draft.authorization.type === "mtls"
+							? draft.authorization.materials
+							: undefined,
 					progress: (completed, total, probe) =>
 						update(
 							`Проверка моделей: ${completed}/${total}${probe ? ` · ${probe.model.id}: ${probe.status === "available" ? "доступна" : probe.reason}` : ""}`,
@@ -364,6 +373,10 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					? old.authorization.scope
 					: scopes[0],
 			secret: "",
+			caPath: "",
+			certPath: "",
+			keyPath: "",
+			passphrase: "",
 		};
 		for (;;) {
 			const fields: FormField[] = [
@@ -387,19 +400,40 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					value: values.tokenUrl,
 					placeholder: defaultTokenUrl,
 				});
-			fields.push({
-				id: "secret",
-				label:
-					mode === "token"
-						? "Токен доступа (скрытый ввод)"
-						: "Авторизационный ключ (скрытый ввод)",
-				value: values.secret,
-				secret: true,
-				placeholder:
-					old?.authorization.type === mode
-						? "Пусто — сохранить текущий секрет"
-						: undefined,
-			});
+			if (mode === "mtls") {
+				const retained = old?.authorization.type === "mtls";
+				for (const [id, label] of [
+					["caPath", "Путь к PEM CA"],
+					["certPath", "Путь к PEM сертификату клиента"],
+					["keyPath", "Путь к PEM приватному ключу"],
+				])
+					fields.push({
+						id,
+						label,
+						value: values[id],
+						placeholder: retained
+							? "Все три пути пусты — сохранить импортированный набор"
+							: "Обязательный путь к файлу",
+					});
+				fields.push({
+					id: "passphrase",
+					label: "Пароль PEM ключа (необязательно, скрытый ввод)",
+					secret: true,
+				});
+			} else
+				fields.push({
+					id: "secret",
+					label:
+						mode === "token"
+							? "Токен доступа (скрытый ввод)"
+							: "Авторизационный ключ (скрытый ввод)",
+					value: values.secret,
+					secret: true,
+					placeholder:
+						old?.authorization.type === mode
+							? "Пусто — сохранить текущий секрет"
+							: undefined,
+				});
 			const entered = await showForm(
 				ctx,
 				`${previous ? "Изменить" : "Добавить"} подключение · ${AUTH_LABELS[mode]}`,
@@ -434,6 +468,8 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					);
 				await store.assertAvailable(id, old?.id);
 				const url = baseUrl(values.url.trim() || GIGACHAT_DEFAULT_BASE_URL);
+				if (mode === "mtls" && new URL(url).protocol !== "https:")
+					throw new FormError("Для mTLS API URL должен использовать HTTPS.");
 				const tokenUrl =
 					mode === "credentials"
 						? values.tokenUrl.trim() ||
@@ -456,6 +492,58 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						scope: values.scope,
 					};
 				}
+				if (mode === "mtls") {
+					const paths = {
+						caPath: values.caPath.trim(),
+						certPath: values.certPath.trim(),
+						keyPath: values.keyPath.trim(),
+					};
+					const count = Object.values(paths).filter(Boolean).length;
+					if (count !== 0 && count !== 3)
+						throw new FormError(
+							"Для импорта укажите все три пути: CA, сертификат и ключ.",
+						);
+					if (count === 0) {
+						if (old?.authorization.type !== "mtls")
+							throw new FormError(
+								"Укажите пути к CA, сертификату и приватному ключу.",
+							);
+						if (values.passphrase)
+							throw new FormError(
+								"Пароль используется только при импорте: укажите все три пути.",
+							);
+						authorization = old.authorization;
+					} else {
+						if (
+							!(await ctx.ui.confirm(
+								"Импорт приватного ключа mTLS",
+								"Приватный ключ будет расшифрован и сохранён в plaintext (открытом виде) в auth.json. Его защита зависит от файловых прав auth.json. Пароль не сохраняется. Исходные PEM файлы после сохранения не нужны. Продолжить?",
+							))
+						)
+							return;
+						const imported = await runProgress(
+							ctx,
+							"Импорт сертификатов mTLS",
+							async (signal) => {
+								try {
+									return await importMtlsMaterials(
+										{
+											...paths,
+											passphrase: values.passphrase || undefined,
+										},
+										signal,
+									);
+								} finally {
+									values.passphrase = "";
+									entered.passphrase = "";
+								}
+							},
+						);
+						if (!imported) return;
+						if ("error" in imported) throw imported.error;
+						authorization = { type: "mtls", materials: imported.value };
+					}
+				}
 				const draft: Connection = {
 					id,
 					revision: randomBytes(12).toString("hex"),
@@ -467,9 +555,12 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				const sameAuthorization =
 					old?.authorization.type === authorization.type &&
 					(authorization.type === "token" ||
-						(old.authorization.type === "credentials" &&
-							old.authorization.tokenUrl === authorization.tokenUrl &&
-							old.authorization.scope === authorization.scope));
+						(authorization.type === "mtls"
+							? old.authorization.type === "mtls" &&
+								old.authorization.materials === authorization.materials
+							: old.authorization.type === "credentials" &&
+								old.authorization.tokenUrl === authorization.tokenUrl &&
+								old.authorization.scope === authorization.scope));
 				const changedEndpointOrSecret =
 					!old ||
 					old.baseUrl !== draft.baseUrl ||
@@ -482,11 +573,16 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					const secret =
 						values.secret.trim() ||
 						(old?.authorization.type === mode ? oldSecret : "");
-					if (!secret)
+					if (mode !== "mtls" && !secret)
 						throw new FormError(
 							"Введите секрет выбранного способа авторизации.",
 						);
-					credential = await verifyAndChoose(ctx, draft, secret, previous);
+					credential = await verifyAndChoose(
+						ctx,
+						draft,
+						mode === "mtls" ? "" : secret,
+						previous,
+					);
 				}
 				if (!credential) return;
 				if (await persist(ctx, credential, old?.id)) {
@@ -500,6 +596,9 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						: describeDiscoveryError(error),
 					"error",
 				);
+			} finally {
+				values.passphrase = "";
+				entered.passphrase = "";
 			}
 		}
 	}
@@ -628,19 +727,16 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 			],
 		);
 		if (action === "Изменить подключение") {
-			const options = [
-				AUTH_LABELS[connection.authorization.type],
-				AUTH_LABELS[
-					connection.authorization.type === "token" ? "credentials" : "token"
-				],
+			const modes = [
+				connection.authorization.type,
+				...authModes.filter((mode) => mode !== connection.authorization.type),
 			];
-			const mode = await ctx.ui.select("Авторизация", options);
-			if (mode)
-				await configure(
-					ctx,
-					mode === AUTH_LABELS.token ? "token" : "credentials",
-					record,
-				);
+			const selected = await ctx.ui.select(
+				"Авторизация",
+				modes.map((mode) => AUTH_LABELS[mode]),
+			);
+			const mode = modes.find((mode) => AUTH_LABELS[mode] === selected);
+			if (mode) await configure(ctx, mode, record);
 		} else if (action === "Параметры моделей")
 			await editModelParameters(ctx, record);
 		else if (action === "Обновить каталог и выбор моделей") {
@@ -718,6 +814,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				const options = [
 					AUTH_LABELS.token,
 					AUTH_LABELS.credentials,
+					AUTH_LABELS.mtls,
 					...(records.length ? ["Управление подключениями"] : []),
 				];
 				const choice = await ctx.ui.select(
@@ -725,11 +822,10 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					options,
 				);
 				if (choice === "Управление подключениями") await manage(ctx);
-				else if (choice)
-					await configure(
-						ctx,
-						choice === AUTH_LABELS.token ? "token" : "credentials",
-					);
+				else {
+					const mode = authModes.find((mode) => AUTH_LABELS[mode] === choice);
+					if (mode) await configure(ctx, mode);
+				}
 			} catch (error) {
 				ctx.ui.notify(describeDiscoveryError(error), "error");
 			} finally {

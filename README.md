@@ -22,6 +22,13 @@ conversations, Pi tools, and JSON or SSE responses.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Release 0.7.2
+
+- Added **Сертификаты (mTLS)** as a third authorization mode in `/gigachat` creation and editing, with certificate-only catalog discovery, JSON/SSE generation, and native summaries.
+- Import CA, client certificate, and private key from PEM paths, including password-protected keys. Saved connections no longer depend on the source files; explicit reimport replaces the full set only after successful checks.
+- Server CA and hostname verification are mandatory, scoped to the imported CA bundle. No OAuth token or `Authorization` header is used, and client identity is not supplied to the proxy's TLS endpoint.
+- **Security:** importing stores an unencrypted private-key copy in `auth.json`, protected by file permissions. The wizard explicitly requests confirmation; the import password is not saved.
+
 ## Release 0.7.1
 
 - Migrated the native provider to Pi **1.3.0**. Pi 0.85.1 is no longer supported by this release.
@@ -93,7 +100,7 @@ under its original MIT license.
 With Pi 1.3.0 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.7.1
+pi install npm:@dev-sergeev/pi-gigachat@0.7.2
 pi
 ```
 
@@ -302,9 +309,11 @@ This is the model setup path for the Pi extension. The programmatic
 `gigachatProvider` export supplies transport and authentication but no models;
 library callers must supply their own model definitions.
 
-1. Run `/gigachat` and choose **Токен** (access token) or
-   **Авторизационный ключ** (renewable authorization key).
-2. Enter a connection name, the API root URL, and the secret in the masked field.
+1. Run `/gigachat` and choose **Токен** (access token),
+   **Авторизационный ключ** (renewable authorization key), or
+   **Сертификаты (mTLS)** ([certificate setup](#certificates-mtls)).
+2. Enter a connection name and the API root URL. Token and authorization-key
+   modes accept their secret in a masked field.
    Authorization-key mode also accepts the token endpoint URL. For a nonstandard
    API server this URL is required; the standard server uses its usual endpoint
    when the field is empty. **Ctrl+O** exposes the scope setting:
@@ -396,8 +405,52 @@ until an explicit model selection.
 
 No environment variables or manual configuration-file edits are required for
 connection setup or authorization. The server must be reachable and its TLS
-certificate trusted; the existing [certificate and proxy settings](#certificates-and-proxy)
-still apply to transport.
+certificate trusted. Token and authorization-key connections use the existing
+[certificate settings](#certificates-and-proxy); mTLS connections use their
+imported CA bundle. The existing proxy settings apply to all three modes.
+
+### Certificates (mTLS)
+
+Choose **Сертификаты (mTLS)** to authenticate with a client certificate instead
+of a token. This mode never exchanges OAuth tokens or sends an `Authorization`
+header. The API root must use **HTTPS**.
+
+Enter paths to all three PEM files:
+
+- **Путь к PEM CA**: the trusted CA bundle for the API server.
+- **Путь к PEM сертификату клиента**: the client certificate, followed by any
+  intermediate certificates needed by the server.
+- **Путь к PEM приватному ключу**: the matching private key.
+
+Absolute paths, paths relative to Pi's current working directory, and `~/` paths
+are supported. For an encrypted PEM key, enter its password in the masked
+**Пароль PEM ключа** field; leave it empty for an unencrypted key. DER and
+PKCS#12/PFX files are not accepted; prepare PEM files before importing.
+
+**Import creates an unencrypted copy of the private key in `auth.json`.**
+The wizard requests confirmation before import. The key is decrypted during
+import, and the password is not saved. Protect `auth.json` and its backups:
+file permissions are its protection, not encryption or an OS keychain.
+
+Once saved, the connection uses its imported copy, so the original files can
+be moved or removed. Replacing their contents does not rotate the saved
+certificate. To rotate it, open **Управление подключениями** → **Изменить
+подключение** → **Сертификаты (mTLS)** and provide all three paths again.
+For an ordinary edit, leave all three paths empty to retain the current
+materials without access to the original files. Partial replacements are
+rejected. Failed imports or model checks leave the previous saved connection
+unchanged.
+
+Server certificate and hostname verification are mandatory. Only the imported
+CA bundle is trusted for this connection; system CAs and `NODE_EXTRA_CA_CERTS`
+are not added to it. There is no equivalent of `curl -k`, and redirects are
+rejected rather than presenting the client identity to a redirected endpoint.
+The client certificate applies to the API server, not the proxy's own TLS
+connection or other saved connections.
+
+Catalog discovery, model probes, generation, and summaries use the connection's
+certificate identity. As with other modes, the server must provide `GET /models`
+and successful generation probes before a new connection can be saved.
 
 ## Authentication and renewal
 
@@ -431,7 +484,7 @@ per-request `env.GIGACHAT_BASE_URL` can override that address.
 
 ## Certificates and proxy
 
-For an API requiring the Russian Trusted Root CA, follow the official
+For token and authorization-key connections requiring the Russian Trusted Root CA, follow the official
 [certificate instructions](https://developers.sber.ru/docs/ru/gigachat/certificates)
 and add this before launching pi:
 
@@ -442,6 +495,8 @@ NODE_EXTRA_CA_CERTS=/absolute/path/to/trusted-ca-bundle.pem
 The launch command above sets it before Node starts. TLS verification remains
 enabled. Optional `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables route both
 OAuth and chat traffic, including SSE. Include the proxy CA in the trusted bundle if it intercepts TLS.
+For an HTTPS proxy, Node must trust the proxy's own CA separately from the
+imported mTLS CA bundle.
 
 ## Context and tools
 

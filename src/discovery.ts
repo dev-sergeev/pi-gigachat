@@ -7,6 +7,7 @@ import type {
 } from "./connection-types.js";
 import { GigaChatHttpError, object, request, serial } from "./http.js";
 import { GIGACHAT_CONNECTION_DEFAULTS } from "./models.js";
+import { GigaChatMtlsError } from "./mtls.js";
 
 class DiscoveryError extends Error {
 	constructor(readonly code: "INVALID_URL" | "INVALID_RESPONSE") {
@@ -137,11 +138,13 @@ export async function discoverModels(
 	} catch {
 		throw new DiscoveryError("INVALID_URL");
 	}
-	const headers = {
-		Authorization: `Bearer ${apiKey}`,
-		"Content-Type": "application/json",
+	const headers = new Headers({ "Content-Type": "application/json" });
+	if (!options.mtls) headers.set("Authorization", `Bearer ${apiKey}`);
+	const transport = {
+		signal: options.signal,
+		maxRetries: 0,
+		mtls: options.mtls,
 	};
-	const transport = { signal: options.signal, maxRetries: 0 };
 	const models = await request(
 		`${root}/models`,
 		{ method: "GET", headers },
@@ -198,6 +201,7 @@ export async function discoverModels(
 /** Display only trusted diagnostics: never echo server bodies or parser input. */
 export function describeDiscoveryError(error: unknown): string {
 	if (error instanceof DiscoveryError) return error.message;
+	if (error instanceof GigaChatMtlsError) return error.message;
 	if (error instanceof GigaChatHttpError) {
 		const status = error.status;
 		const detail =

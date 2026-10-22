@@ -22,6 +22,7 @@ import {
 import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { createParser } from "eventsource-parser";
 import { baseUrl } from "./auth.js";
+import type { MtlsMaterials } from "./connection-types.js";
 import { environment, headers, object, request, serial } from "./http.js";
 import {
 	convertFunctions,
@@ -44,6 +45,7 @@ function emptyUsage(): AssistantMessage["usage"] {
 }
 
 export type GigaChatStreamOptions = Omit<SimpleStreamOptions, "reasoning"> & {
+	mtls?: MtlsMaterials;
 	reasoning?: ModelThinkingLevel;
 	stream?: boolean;
 	extraBody?: Record<string, unknown>;
@@ -119,7 +121,7 @@ export function streamSimpleGigaChat(
 	context: TranscriptContext,
 	options: GigaChatStreamOptions = {},
 ): AssistantMessageEventStream {
-	if (!options.apiKey)
+	if (!options.apiKey && !options.mtls)
 		throw new Error(
 			"GigaChat access token is required; use /gigachat in Pi or gigachatProvider with createModels()",
 		);
@@ -178,7 +180,9 @@ export function streamSimpleGigaChat(
 							{
 								"Content-Type": "application/json",
 								Accept: streaming ? "text/event-stream" : "application/json",
-								Authorization: `Bearer ${options.apiKey}`,
+								...(!options.mtls && {
+									Authorization: `Bearer ${options.apiKey}`,
+								}),
 								"User-Agent": "pi-gigachat",
 								"Cache-Control": "no-store",
 								...(options.sessionId && options.cacheRetention !== "none"

@@ -5,6 +5,8 @@ import type {
 } from "@earendil-works/pi-ai";
 import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { EnvHttpProxyAgent, fetch } from "undici";
+import type { MtlsMaterials } from "./connection-types.js";
+import { GigaChatMtlsError } from "./mtls.js";
 
 export function object(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -148,12 +150,15 @@ export async function request<T>(
 		StreamOptions,
 		"signal" | "timeoutMs" | "env" | "fetch" | "maxRetries"
 	> & {
+		mtls?: MtlsMaterials;
 		canRetry?: () => boolean;
 		recover422?: (init: RequestInit) => RequestInit;
 	},
 	consume: (response: Response) => Promise<T>,
 	observe?: (response: Response) => void | Promise<void>,
 ): Promise<T> {
+	if (options.mtls && new URL(url).protocol !== "https:")
+		throw new GigaChatMtlsError("GigaChat mTLS requires an HTTPS endpoint.");
 	const env = environment(options);
 	const timeout =
 		options.timeoutMs ?? Number(env.GIGACHAT_TIMEOUT ?? 300) * 1000;
@@ -180,10 +185,14 @@ export async function request<T>(
 		env[name.toLowerCase()] ??
 		env[name] ??
 		"";
+	const originTls = options.mtls
+		? { ...options.mtls, rejectUnauthorized: true }
+		: undefined;
 	const dispatcher = new EnvHttpProxyAgent({
 		httpProxy: proxy("HTTP_PROXY"),
 		httpsProxy: proxy("HTTPS_PROXY"),
 		noProxy: proxy("NO_PROXY"),
+		...(originTls && { connect: originTls, requestTls: originTls }),
 	});
 	try {
 		const send = options.fetch ?? (fetch as unknown as typeof globalThis.fetch);
@@ -198,8 +207,13 @@ export async function request<T>(
 			let observing = false;
 			let delay = 0;
 			try {
+				const requestHeaders = options.mtls
+					? new Headers(currentInit.headers)
+					: undefined;
+				requestHeaders?.delete("Authorization");
 				response = await send(url, {
 					...currentInit,
+					...(options.mtls && { headers: requestHeaders, redirect: "error" }),
 					signal: attemptSignal,
 					dispatcher,
 				} as RequestInit);
@@ -226,6 +240,25 @@ export async function request<T>(
 					options.canRetry?.() === false ||
 					(!recover422 && !transient(error))
 				) {
+					if (
+						options.mtls &&
+						!response &&
+						error instanceof Error &&
+						error.name !== "TimeoutError"
+					) {
+						const cause = object(error.cause) ? error.cause : error;
+						const code =
+							object(cause) && typeof cause.code === "string" ? cause.code : "";
+						const detail =
+							code === "ERR_TLS_CERT_ALTNAME_INVALID"
+								? "server hostname verification failed"
+								: /CERT|ISSUER|SELF_SIGNED|VERIFY_LEAF/.test(code)
+									? "server certificate verification failed against the imported CA"
+									: /TLS|SSL/.test(code)
+										? "TLS handshake failed; check the client certificate and key"
+										: "connection failed; check the network, proxy and TLS materials";
+						throw new GigaChatMtlsError(`GigaChat mTLS ${detail}.`);
+					}
 					if (
 						error instanceof Error &&
 						error.message === "fetch failed" &&
