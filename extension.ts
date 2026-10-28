@@ -303,8 +303,8 @@ async function request(url, init, options, consume, observe) {
       } catch (caught) {
         if (signal.aborted) throw signal.reason;
         const error = attemptSignal.aborted ? attemptSignal.reason : caught;
-        const recover422 = error instanceof GigaChatHttpError && error.status === 422 ? options.recover422 : void 0;
-        if (maxRetries === 0 || observing || options.canRetry?.() === false || !recover422 && !transient(error)) {
+        const recover422 = error instanceof GigaChatHttpError && error.status === 422 && options.retry422 !== false ? options.recover422 : void 0;
+        if (maxRetries === 0 || observing || options.canRetry?.() === false || error instanceof GigaChatHttpError && error.status === 422 && options.retry422 === false || !recover422 && !transient(error)) {
           if (options.mtls && !response && error instanceof Error && error.name !== "TimeoutError") {
             const cause = object(error.cause) ? error.cause : error;
             const code = object(cause) && typeof cause.code === "string" ? cause.code : "";
@@ -316,6 +316,8 @@ async function request(url, init, options, consume, observe) {
               `GigaChat connection failed: ${error.cause.message}`,
               { cause: error }
             );
+          if (error instanceof GigaChatHttpError && error.status === 422 && options.retry422 === false)
+            throw retryFailure(error, "HTTP 422 retries disabled");
           throw error;
         }
         if (retries >= maxRetries)
@@ -425,7 +427,7 @@ import {
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
 
-// src/stream.ts
+// src/openai-stream.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import {
   calculateCost,
@@ -437,7 +439,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { createParser } from "eventsource-parser";
 
-// src/messages.ts
+// src/openai-messages.ts
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 
 // node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
@@ -598,8 +600,7 @@ function transformMessages(messages, model, normalizeToolCallId) {
   return result;
 }
 
-// src/messages.ts
-var STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
+// src/openai-messages.ts
 function convertMessages(model, context, additionalSystemPrompt) {
   const messages = [];
   const transformedMessages = transformMessages(
@@ -608,6 +609,581 @@ function convertMessages(model, context, additionalSystemPrompt) {
   );
   const systemPrompt = [
     getCurrentSystemPrompt(context.messages),
+    additionalSystemPrompt?.trim()
+  ].filter(Boolean).join("\n\n");
+  if (systemPrompt)
+    messages.push({ role: "system", content: systemPrompt.toWellFormed() });
+  const pendingCallIds = /* @__PURE__ */ new Set();
+  const orphanResults = [];
+  for (const message of transformedMessages) {
+    if (message.role !== "toolResult") {
+      for (const orphan of orphanResults) messages.push(orphan);
+      orphanResults.length = 0;
+      pendingCallIds.clear();
+    }
+    if (message.role === "user") {
+      const content = typeof message.content === "string" ? message.content.toWellFormed() : message.content.filter((item) => item.type === "text").map((item) => item.text.toWellFormed()).join("\n");
+      if (content) messages.push({ role: "user", content });
+    } else if (message.role === "assistant") {
+      const thinking = message.content.filter((item) => item.type === "thinking" && !item.redacted).map((item) => item.type === "thinking" ? item.thinking : "").join("");
+      const text = message.content.filter((item) => item.type === "text").map((item) => item.text).join("");
+      const content = (thinking ? `${thinking}${text ? `
+
+${text}` : ""}` : text).toWellFormed();
+      const tool_calls = message.content.filter((item) => item.type === "toolCall").map((call) => {
+        pendingCallIds.add(call.id);
+        return {
+          id: call.id,
+          type: "function",
+          function: {
+            name: call.name,
+            arguments: JSON.stringify(call.arguments)
+          }
+        };
+      });
+      messages.push({
+        role: "assistant",
+        content,
+        ...tool_calls.length ? { tool_calls } : {}
+      });
+    } else if (message.role === "toolResult") {
+      const content = toolResultText(message);
+      if (pendingCallIds.delete(message.toolCallId)) {
+        messages.push({
+          role: "tool",
+          tool_call_id: message.toolCallId,
+          content
+        });
+      } else {
+        orphanResults.push({
+          role: "user",
+          content: `Tool result (${message.toolName}):
+${content}`
+        });
+      }
+    }
+  }
+  for (const orphan of orphanResults) messages.push(orphan);
+  return messages;
+}
+function toolResultText(message) {
+  const text = message.content.filter((item) => item.type === "text").map((item) => item.text.toWellFormed()).join("\n") || "(no content)";
+  return message.isError ? `Error: ${text}` : text;
+}
+function convertTools(tools) {
+  return tools.map(({ name, description, parameters }) => ({
+    type: "function",
+    function: { name, description, parameters }
+  }));
+}
+
+// src/openai-stream.ts
+function emptyUsage() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+  };
+}
+function payload(model, context, options) {
+  const env = environment(options);
+  const mode = env.GIGACHAT_STREAM ?? "false";
+  if (mode !== "true" && mode !== "false")
+    throw new Error("GIGACHAT_STREAM must be true or false");
+  const additionalSystemPrompt = env.GIGACHAT_SYSTEM_PROMPT;
+  let extra;
+  try {
+    extra = JSON.parse(env.GIGACHAT_EXTRA_BODY || "{}");
+  } catch {
+    throw new Error("GIGACHAT_EXTRA_BODY must be a JSON object");
+  }
+  if (!object(extra))
+    throw new Error("GIGACHAT_EXTRA_BODY must be a JSON object");
+  const maxTokens = options.maxTokens ?? model.maxTokens;
+  if (!Number.isFinite(maxTokens) || maxTokens < 1)
+    throw new Error("GigaChat maxTokens must be positive");
+  const tools = getCurrentTools(context.messages);
+  const choice = options.toolChoice ?? options.functionCall ?? (tools.length ? "auto" : "none");
+  const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
+  const reasoningEffort = model.reasoning ? model.thinkingLevelMap?.[thinkingLevel] ?? thinkingLevel : void 0;
+  return {
+    model: model.id,
+    messages: convertMessages(model, context, additionalSystemPrompt),
+    max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
+    tool_choice: typeof choice === "object" && "name" in choice ? { type: "function", function: { name: choice.name } } : choice,
+    ...tools.length ? { tools: convertTools(tools) } : {},
+    temperature: options.temperature,
+    top_p: options.topP,
+    response_format: options.responseFormat?.type === "json_schema" ? {
+      type: "json_schema",
+      json_schema: {
+        name: "response",
+        schema: options.responseFormat.schema,
+        ...options.responseFormat.strict !== void 0 && {
+          strict: options.responseFormat.strict
+        }
+      }
+    } : options.responseFormat,
+    reasoning_effort: reasoningEffort,
+    ...model.samplingParams,
+    ...options.samplingParams,
+    ...extra,
+    ...options.extraBody,
+    stream: options.stream ?? mode === "true"
+  };
+}
+function streamSimpleOpenAI(model, context, options = {}) {
+  if (!options.apiKey && !options.mtls)
+    throw new Error(
+      "GigaChat access token or mTLS is required; use /gigachat in Pi"
+    );
+  const stream = createAssistantMessageEventStream();
+  const output = {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    stopReason: "pending",
+    timestamp: Date.now(),
+    usage: emptyUsage()
+  };
+  const signal = options.signal ?? new AbortController().signal;
+  (async () => {
+    try {
+      let body = payload(model, context, options);
+      const streaming = body.stream;
+      const modified = await options.onPayload?.(body, model);
+      if (modified !== void 0) {
+        if (!object(modified))
+          throw new Error("GigaChat onPayload must return a JSON object");
+        body = modified;
+      }
+      body = { ...body, stream: streaming };
+      delete body.reasoning;
+      delete body.reasoning_content;
+      if (Array.isArray(body.messages)) {
+        const messages = body.messages;
+        let cleaned = messages;
+        for (let i = 0; i < messages.length; i++) {
+          const message = messages[i];
+          if (!object(message) || !Object.hasOwn(message, "reasoning_content") && !Object.hasOwn(message, "reasoning") && !Object.hasOwn(message, "reasoning_effort"))
+            continue;
+          if (cleaned === messages) cleaned = messages.slice();
+          const copy = { ...message };
+          if (copy.role === "assistant") {
+            const reasoning = [copy.reasoning_content, copy.reasoning].filter(
+              (value) => typeof value === "string" && value.length > 0
+            ).join("\n\n");
+            if (reasoning) {
+              const content = copy.content;
+              copy.content = Array.isArray(content) ? [
+                {
+                  type: "text",
+                  text: `${reasoning}${content.length ? "\n\n" : ""}`
+                },
+                ...content
+              ] : `${reasoning}${typeof content === "string" && content ? `
+
+${content}` : ""}`;
+            }
+          }
+          delete copy.reasoning_content;
+          delete copy.reasoning;
+          delete copy.reasoning_effort;
+          cleaned[i] = copy;
+        }
+        body.messages = cleaned;
+      }
+      let observerFailed = false;
+      stream.push({ type: "start", partial: output });
+      await request(
+        // Native auth already applied the saved or ambient endpoint to the
+        // model. Only an explicit request override may replace it here.
+        `${baseUrl(options.env?.GIGACHAT_BASE_URL || model.baseUrl)}/chat/completions`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+          headers: headers(
+            {
+              "Content-Type": "application/json",
+              Accept: streaming ? "text/event-stream" : "application/json",
+              Authorization: options.mtls ? null : `Bearer ${options.apiKey}`,
+              "User-Agent": "pi-gigachat",
+              "Cache-Control": "no-store",
+              ...options.sessionId && options.cacheRetention !== "none" ? { "X-Session-ID": options.sessionId } : {}
+            },
+            model.headers,
+            options.headers
+          )
+        },
+        {
+          ...options,
+          retry422: false,
+          canRetry: () => !observerFailed && output.content.length === 0
+        },
+        async (response) => {
+          output.stopReason = "pending";
+          delete output.rawStopReason;
+          output.usage = emptyUsage();
+          const consume = completionConsumer(output, stream, model);
+          const observe = async (chunk) => {
+            signal.throwIfAborted();
+            try {
+              if (options.onProviderStreamEvent)
+                await raceWithAbortSignal(
+                  Promise.resolve().then(
+                    () => options.onProviderStreamEvent?.(chunk, model)
+                  ),
+                  signal
+                );
+            } catch (error) {
+              signal.throwIfAborted();
+              observerFailed = true;
+              throw new Error(
+                `GigaChat out of budget for automatic observer retries (disabled): ${error instanceof Error ? error.message : String(error)}`,
+                { cause: error }
+              );
+            }
+            signal.throwIfAborted();
+            consume.add(chunk, Boolean(streaming));
+          };
+          if (streaming) await readSSE(response, observe);
+          else {
+            if (!response.headers.get("content-type")?.includes("application/json"))
+              throw new Error("Expected a GigaChat JSON response");
+            await observe(await response.json());
+          }
+          consume.finish();
+        },
+        (response) => options.onResponse?.(
+          {
+            status: response.status,
+            headers: Object.fromEntries(response.headers)
+          },
+          model
+        )
+      );
+      signal.throwIfAborted();
+      if (output.stopReason !== "stop" && output.stopReason !== "length" && output.stopReason !== "toolUse")
+        throw new Error(
+          `GigaChat finished with reason: ${output.rawStopReason ?? output.stopReason}`
+        );
+      stream.push({ type: "done", reason: output.stopReason, message: output });
+    } catch (error) {
+      output.stopReason = signal.aborted ? "aborted" : "error";
+      output.errorMessage = error instanceof Error ? error.message : String(error);
+      stream.push({ type: "error", reason: output.stopReason, error: output });
+    } finally {
+      stream.end();
+    }
+  })();
+  return stream;
+}
+function completionConsumer(output, stream, model) {
+  let text;
+  let thinking;
+  const tools = /* @__PURE__ */ new Map();
+  let textClosed = false;
+  let thinkingClosed = false;
+  const closeThinking = () => {
+    if (thinking && !thinkingClosed) {
+      stream.push({
+        type: "thinking_end",
+        contentIndex: output.content.indexOf(thinking),
+        content: thinking.thinking,
+        partial: output
+      });
+      thinkingClosed = true;
+    }
+  };
+  const closeText = () => {
+    if (text && !textClosed) {
+      stream.push({
+        type: "text_end",
+        contentIndex: output.content.indexOf(text),
+        content: text.text,
+        partial: output
+      });
+      textClosed = true;
+    }
+  };
+  const addThinking = (delta) => {
+    closeText();
+    if (!thinking || thinkingClosed) {
+      thinking = {
+        type: "thinking",
+        thinking: "",
+        // Pi preserves signed blocks even when they contain only whitespace.
+        thinkingSignature: "reasoning_content"
+      };
+      thinkingClosed = false;
+      output.content.push(thinking);
+      stream.push({
+        type: "thinking_start",
+        contentIndex: output.content.indexOf(thinking),
+        partial: output
+      });
+    }
+    thinking.thinking += delta;
+    stream.push({
+      type: "thinking_delta",
+      contentIndex: output.content.indexOf(thinking),
+      delta,
+      partial: output
+    });
+  };
+  const addText = (delta) => {
+    closeThinking();
+    if (!text || textClosed) {
+      text = { type: "text", text: "" };
+      textClosed = false;
+      output.content.push(text);
+      stream.push({
+        type: "text_start",
+        contentIndex: output.content.indexOf(text),
+        partial: output
+      });
+    }
+    text.text += delta;
+    stream.push({
+      type: "text_delta",
+      contentIndex: output.content.indexOf(text),
+      delta,
+      partial: output
+    });
+  };
+  return {
+    add(chunk, streaming) {
+      if (!object(chunk) || !Array.isArray(chunk.choices))
+        throw new Error("Invalid GigaChat completion: missing choices");
+      if (object(chunk.usage)) {
+        const usage = output.usage;
+        const cached = object(chunk.usage.prompt_tokens_details) ? Number(chunk.usage.prompt_tokens_details.cached_tokens ?? 0) : 0;
+        usage.input = Number(chunk.usage.prompt_tokens ?? 0) - cached;
+        usage.output = Number(chunk.usage.completion_tokens ?? 0);
+        usage.cacheRead = cached;
+        usage.totalTokens = usage.input + usage.cacheRead + usage.output;
+        calculateCost(model, usage);
+      }
+      if (streaming && chunk.choices.length === 0 && object(chunk.usage))
+        return;
+      const choice = chunk.choices[0];
+      const message = object(choice) ? choice[streaming ? "delta" : "message"] : void 0;
+      if (!object(message))
+        throw new Error(
+          "Invalid GigaChat completion: missing message or delta"
+        );
+      if (message.content != null && typeof message.content !== "string")
+        throw new Error("Invalid GigaChat content");
+      if (message.reasoning_content != null && typeof message.reasoning_content !== "string")
+        throw new Error("Invalid GigaChat reasoning_content");
+      if (message.reasoning_content)
+        addThinking(message.reasoning_content);
+      if (message.content) addText(message.content);
+      if (message.tool_calls != null) {
+        if (!Array.isArray(message.tool_calls))
+          throw new Error("Invalid GigaChat tool_calls");
+        for (const [position, call] of message.tool_calls.entries()) {
+          if (!object(call)) throw new Error("Invalid GigaChat tool call");
+          const index = streaming ? call.index : position;
+          if (typeof index !== "number" || !Number.isInteger(index) || index < 0)
+            throw new Error("Invalid GigaChat tool call index");
+          let state = tools.get(index);
+          if (!state) {
+            closeThinking();
+            closeText();
+            const tool = {
+              type: "toolCall",
+              id: typeof call.id === "string" && call.id ? call.id : `gigachat_${randomUUID2()}`,
+              name: "",
+              arguments: {}
+            };
+            state = { tool, argumentsJson: "" };
+            tools.set(index, state);
+            output.content.push(tool);
+            stream.push({
+              type: "toolcall_start",
+              contentIndex: output.content.indexOf(tool),
+              partial: output
+            });
+          }
+          if (typeof call.id === "string" && call.id) state.tool.id = call.id;
+          if (call.function != null) {
+            if (!object(call.function))
+              throw new Error("Invalid GigaChat tool function");
+            if (typeof call.function.name === "string")
+              state.tool.name += call.function.name;
+            if (call.function.arguments !== void 0) {
+              if (typeof call.function.arguments !== "string")
+                throw new Error("Invalid GigaChat tool arguments");
+              const delta = call.function.arguments;
+              state.argumentsJson += delta;
+              state.tool.arguments = parseStreamingJson(
+                state.argumentsJson
+              );
+              stream.push({
+                type: "toolcall_delta",
+                contentIndex: output.content.indexOf(state.tool),
+                delta,
+                partial: output
+              });
+            }
+          }
+        }
+      }
+      if (choice.finish_reason != null && choice.finish_reason !== "") {
+        output.rawStopReason = choice.finish_reason;
+        switch (choice.finish_reason) {
+          case "stop":
+            output.stopReason = "stop";
+            break;
+          case "length":
+            output.stopReason = "length";
+            break;
+          case "tool_calls":
+            output.stopReason = "toolUse";
+            break;
+          case "content_filter":
+            output.stopReason = "error";
+            break;
+          default:
+            throw new Error(`GigaChat finish_reason: ${choice.finish_reason}`);
+        }
+      }
+    },
+    finish() {
+      if (output.stopReason === "pending")
+        throw new Error("Incomplete GigaChat response: missing finish_reason");
+      if (output.stopReason === "toolUse" && tools.size === 0)
+        throw new Error("Invalid GigaChat completion: missing tool_calls");
+      closeThinking();
+      closeText();
+      for (const { tool, argumentsJson } of tools.values()) {
+        if (!tool.name) throw new Error("Invalid GigaChat tool call name");
+        Object.assign(tool, parseToolCallArguments(argumentsJson));
+        stream.push({
+          type: "toolcall_end",
+          contentIndex: output.content.indexOf(tool),
+          toolCall: tool,
+          partial: output
+        });
+      }
+    }
+  };
+}
+async function readSSE(response, consume) {
+  if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body)
+    throw new Error("Expected a GigaChat SSE response");
+  let done = false;
+  const events = [];
+  const parser = createParser({
+    onEvent(event) {
+      events.push(event.data);
+    }
+  });
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  try {
+    while (!done) {
+      const next = await reader.read();
+      if (next.done) break;
+      parser.feed(decoder.decode(next.value, { stream: true }));
+      for (const event of events) {
+        if (event === "[DONE]") {
+          done = true;
+          break;
+        }
+        await consume(JSON.parse(event));
+      }
+      events.length = 0;
+    }
+    parser.feed(decoder.decode());
+    for (const event of events) {
+      if (event === "[DONE]") {
+        done = true;
+        break;
+      }
+      await consume(JSON.parse(event));
+    }
+    if (!done)
+      throw new Error("Incomplete GigaChat SSE response: missing [DONE]");
+  } finally {
+    await reader.cancel().catch(() => {
+    });
+    reader.releaseLock();
+  }
+}
+
+// src/protocols.ts
+var GIGACHAT_PROTOCOLS = {
+  v1: {
+    label: "GigaChat V1",
+    api: GIGACHAT_API,
+    baseUrl: GIGACHAT_DEFAULT_BASE_URL
+  },
+  v2: {
+    label: "GigaChat V2",
+    api: "gigachat-v2-extension-api",
+    baseUrl: "https://api.giga.chat/v2"
+  },
+  openai: {
+    label: "OpenAI-compatible",
+    api: "openai-completions",
+    baseUrl: GIGACHAT_DEFAULT_BASE_URL
+  }
+};
+function defaultModelsUrl(baseUrl2, protocol = "v1") {
+  const root = baseUrl(baseUrl2);
+  switch (protocol) {
+    case "v1":
+      return `${root}/models`;
+    case "v2":
+      return new URL("/v1/models", root).href;
+    case "openai":
+      return new URL("/gc/models", root).href;
+    default:
+      throw new Error("Unknown GigaChat protocol.");
+  }
+}
+function thinkingLevelMapForProtocol(protocol) {
+  return protocol === "v2" ? {
+    off: "off",
+    minimal: null,
+    low: null,
+    medium: "medium",
+    high: null,
+    xhigh: null,
+    max: null
+  } : { ...GIGACHAT_CONNECTION_DEFAULTS.thinkingLevelMap };
+}
+
+// src/stream.ts
+import { randomUUID as randomUUID3 } from "node:crypto";
+import {
+  calculateCost as calculateCost2,
+  clampThinkingLevel as clampThinkingLevel2,
+  createAssistantMessageEventStream as createAssistantMessageEventStream2,
+  getCurrentTools as getCurrentTools2,
+  parseStreamingJson as parseStreamingJson2,
+  parseToolCallArguments as parseToolCallArguments2
+} from "@earendil-works/pi-ai";
+import { createParser as createParser2 } from "eventsource-parser";
+
+// src/messages.ts
+import { getCurrentSystemPrompt as getCurrentSystemPrompt2 } from "@earendil-works/pi-ai";
+var STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
+function convertMessages2(model, context, additionalSystemPrompt) {
+  const messages = [];
+  const transformedMessages = transformMessages(
+    context.messages.filter((message) => message.role !== "system"),
+    model
+  );
+  const systemPrompt = [
+    getCurrentSystemPrompt2(context.messages),
     additionalSystemPrompt?.trim()
   ].filter(Boolean).join("\n\n");
   if (systemPrompt) {
@@ -662,7 +1238,7 @@ ${text}` : ""}` : text;
             role: "function",
             name: call.name,
             content: JSON.stringify({
-              result: result ? toolResultText(result) : "No result provided",
+              result: result ? toolResultText2(result) : "No result provided",
               ...result?.isError || !result ? { isError: true } : {}
             })
           });
@@ -687,10 +1263,10 @@ function unmatchedToolResult(message) {
   return {
     role: "user",
     content: `Tool result (${message.toolName}):
-${toolResultText(message)}`
+${toolResultText2(message)}`
   };
 }
-function toolResultText(message) {
+function toolResultText2(message) {
   const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n") || "(no content)";
   return message.isError ? `Error: ${text}` : text;
 }
@@ -707,7 +1283,7 @@ function sanitizeSurrogates(text) {
 
 // src/stream.ts
 var DEFAULT_SYSTEM_PROMPT = "Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.";
-function emptyUsage() {
+function emptyUsage2() {
   return {
     input: 0,
     output: 0,
@@ -717,7 +1293,7 @@ function emptyUsage() {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
   };
 }
-function payload(model, context, options) {
+function payload2(model, context, options) {
   const env = environment(options);
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
@@ -734,11 +1310,11 @@ function payload(model, context, options) {
   const maxTokens = options.maxTokens ?? model.maxTokens;
   if (!Number.isFinite(maxTokens) || maxTokens < 1)
     throw new Error("GigaChat maxTokens must be positive");
-  const thinkingLevel = clampThinkingLevel(model, options.reasoning ?? "off");
-  const tools = getCurrentTools(context.messages);
+  const thinkingLevel = clampThinkingLevel2(model, options.reasoning ?? "off");
+  const tools = getCurrentTools2(context.messages);
   return {
     model: model.id,
-    messages: convertMessages(model, context, additionalSystemPrompt),
+    messages: convertMessages2(model, context, additionalSystemPrompt),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     function_call: options.toolChoice ?? options.functionCall ?? (tools.length ? "auto" : "none"),
     ...tools.length ? { functions: convertFunctions(tools) } : {},
@@ -762,7 +1338,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
     throw new Error(
       "GigaChat access token is required; use /gigachat in Pi or gigachatProvider with createModels()"
     );
-  const stream = createAssistantMessageEventStream();
+  const stream = createAssistantMessageEventStream2();
   const output = {
     role: "assistant",
     content: [],
@@ -771,12 +1347,12 @@ function streamSimpleGigaChat(model, context, options = {}) {
     model: model.id,
     stopReason: "pending",
     timestamp: Date.now(),
-    usage: emptyUsage()
+    usage: emptyUsage2()
   };
   const signal = options.signal ?? new AbortController().signal;
   (async () => {
     try {
-      let body = payload(model, context, options);
+      let body = payload2(model, context, options);
       const streaming = body.stream;
       const modified = await options.onPayload?.(body, model);
       if (modified !== void 0) {
@@ -845,8 +1421,8 @@ function streamSimpleGigaChat(model, context, options = {}) {
           async (response) => {
             output.stopReason = "pending";
             delete output.rawStopReason;
-            output.usage = emptyUsage();
-            const consume = completionConsumer(output, stream, model);
+            output.usage = emptyUsage2();
+            const consume = completionConsumer2(output, stream, model);
             const observe = async (chunk) => {
               signal.throwIfAborted();
               try {
@@ -864,7 +1440,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
               signal.throwIfAborted();
               consume.add(chunk, Boolean(streaming));
             };
-            if (streaming) await readSSE(response, observe);
+            if (streaming) await readSSE2(response, observe);
             else {
               if (!response.headers.get("content-type")?.includes("application/json"))
                 throw new Error("Expected a GigaChat JSON response");
@@ -897,7 +1473,7 @@ function streamSimpleGigaChat(model, context, options = {}) {
   })();
   return stream;
 }
-function completionConsumer(output, stream, model) {
+function completionConsumer2(output, stream, model) {
   let text;
   let thinking;
   let tool;
@@ -983,7 +1559,7 @@ function completionConsumer(output, stream, model) {
         usage.output = Number(chunk.usage.completion_tokens ?? 0);
         usage.cacheRead = Number(chunk.usage.precached_prompt_tokens ?? 0);
         usage.totalTokens = usage.input + usage.cacheRead + usage.output;
-        calculateCost(model, usage);
+        calculateCost2(model, usage);
       }
       if (streaming && chunk.choices.length === 0 && object(chunk.usage))
         return;
@@ -1013,7 +1589,7 @@ function completionConsumer(output, stream, model) {
           closeText();
           tool = {
             type: "toolCall",
-            id: `gigachat_${randomUUID2()}`,
+            id: `gigachat_${randomUUID3()}`,
             name: "",
             arguments: {}
           };
@@ -1031,7 +1607,7 @@ function completionConsumer(output, stream, model) {
             throw new Error("Invalid GigaChat function arguments");
           const delta = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments);
           argumentsJson = typeof call.arguments === "string" ? argumentsJson + delta : delta;
-          tool.arguments = parseStreamingJson(argumentsJson);
+          tool.arguments = parseStreamingJson2(argumentsJson);
           stream.push({
             type: "toolcall_delta",
             contentIndex: output.content.indexOf(tool),
@@ -1068,7 +1644,7 @@ function completionConsumer(output, stream, model) {
       closeText();
       if (tool) {
         if (!tool.name) throw new Error("Invalid GigaChat function_call name");
-        Object.assign(tool, parseToolCallArguments(argumentsJson));
+        Object.assign(tool, parseToolCallArguments2(argumentsJson));
         if (signature) tool.thoughtSignature = signature;
         stream.push({
           type: "toolcall_end",
@@ -1080,12 +1656,12 @@ function completionConsumer(output, stream, model) {
     }
   };
 }
-async function readSSE(response, consume) {
+async function readSSE2(response, consume) {
   if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body)
     throw new Error("Expected a GigaChat SSE response");
   let done = false;
   const events = [];
-  const parser = createParser({
+  const parser = createParser2({
     onEvent(event) {
       events.push(event.data);
     }
@@ -1116,6 +1692,592 @@ async function readSSE(response, consume) {
     }
     if (!done)
       throw new Error("Incomplete GigaChat SSE response: missing [DONE]");
+  } finally {
+    await reader.cancel().catch(() => {
+    });
+    reader.releaseLock();
+  }
+}
+
+// src/v2-stream.ts
+import {
+  calculateCost as calculateCost3,
+  clampThinkingLevel as clampThinkingLevel3,
+  createAssistantMessageEventStream as createAssistantMessageEventStream3,
+  getCurrentTools as getCurrentTools3,
+  parseStreamingJson as parseStreamingJson3,
+  parseToolCallArguments as parseToolCallArguments3
+} from "@earendil-works/pi-ai";
+import { createParser as createParser3 } from "eventsource-parser";
+
+// src/v2-messages.ts
+import { getCurrentSystemPrompt as getCurrentSystemPrompt3 } from "@earendil-works/pi-ai";
+var V2_STATE_SIGNATURE_PREFIX = "gigachat:v2:tool_state_id:";
+function convertV2Messages(model, context, additionalSystemPrompt) {
+  const messages = [];
+  const history = transformMessages(
+    context.messages.filter((message) => message.role !== "system"),
+    model
+  );
+  const systemPrompt = [
+    getCurrentSystemPrompt3(context.messages),
+    additionalSystemPrompt?.trim()
+  ].filter(Boolean).join("\n\n");
+  if (systemPrompt)
+    messages.push({
+      role: "system",
+      content: [{ text: systemPrompt.toWellFormed() }]
+    });
+  const pending = /* @__PURE__ */ new Map();
+  for (const message of history) {
+    if (message.role === "user") {
+      pending.clear();
+      const text = typeof message.content === "string" ? message.content : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+      if (typeof message.content === "string" || text)
+        messages.push({
+          role: "user",
+          content: [{ text: text.toWellFormed() }]
+        });
+      continue;
+    }
+    if (message.role === "assistant") {
+      pending.clear();
+      const content = [];
+      let state;
+      const reasoning = message.content.filter((part) => part.type === "thinking" && !part.redacted).map((part) => part.type === "thinking" ? part.thinking : "").join("");
+      if (reasoning)
+        messages.push({
+          role: "reasoning",
+          content: [{ text: reasoning.toWellFormed() }]
+        });
+      for (const part of message.content) {
+        let signature;
+        if (part.type === "text") {
+          content.push({ text: part.text.toWellFormed() });
+          signature = part.textSignature;
+        } else if (part.type === "toolCall") {
+          content.push({
+            function_call: {
+              id: part.id,
+              name: part.name,
+              arguments: JSON.parse(JSON.stringify(part.arguments))
+            }
+          });
+          pending.set(part.id, part.name);
+          signature = part.thoughtSignature;
+        }
+        if (signature?.startsWith(V2_STATE_SIGNATURE_PREFIX))
+          state = signature.slice(V2_STATE_SIGNATURE_PREFIX.length);
+      }
+      if (content.length || state)
+        messages.push({
+          role: "assistant",
+          content,
+          ...state && { tool_state_id: state }
+        });
+      continue;
+    }
+    const result = message;
+    const name = pending.get(result.toolCallId);
+    pending.delete(result.toolCallId);
+    if (name === void 0) {
+      messages.push({
+        role: "user",
+        content: [
+          {
+            text: `Tool result (${result.toolName}):
+${toolResultText3(result)}`.toWellFormed()
+          }
+        ]
+      });
+    } else {
+      const content = {
+        function_result: {
+          id: result.toolCallId,
+          name,
+          result: JSON.stringify({
+            result: toolResultText3(result),
+            ...result.isError && { isError: true }
+          })
+        }
+      };
+      const previous = messages.at(-1);
+      if (previous?.role === "tool") previous.content.push(content);
+      else messages.push({ role: "tool", content: [content] });
+    }
+  }
+  return messages;
+}
+function toolResultText3(message) {
+  const text = message.content.filter((part) => part.type === "text").map((part) => part.text.toWellFormed()).join("\n") || "(no content)";
+  return message.isError ? `Error: ${text}` : text;
+}
+function convertV2Functions(tools) {
+  return tools.map(({ name, description, parameters }) => ({
+    name,
+    description,
+    parameters: JSON.parse(JSON.stringify(parameters))
+  }));
+}
+
+// src/v2-stream.ts
+function emptyUsage3() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+  };
+}
+function payload3(model, context, options) {
+  const env = environment(options);
+  const mode = env.GIGACHAT_STREAM ?? "false";
+  if (mode !== "true" && mode !== "false")
+    throw new Error("GIGACHAT_STREAM must be true or false");
+  let extra;
+  try {
+    extra = JSON.parse(env.GIGACHAT_EXTRA_BODY || "{}");
+  } catch {
+    throw new Error("GIGACHAT_EXTRA_BODY must be a JSON object");
+  }
+  if (!object(extra))
+    throw new Error("GIGACHAT_EXTRA_BODY must be a JSON object");
+  const maxTokens = options.maxTokens ?? model.maxTokens;
+  if (!Number.isFinite(maxTokens) || maxTokens < 1)
+    throw new Error("GigaChat maxTokens must be positive");
+  const tools = getCurrentTools3(context.messages);
+  const choice = options.toolChoice ?? options.functionCall ?? (tools.length ? "auto" : "none");
+  const thinkingLevel = clampThinkingLevel3(model, options.reasoning ?? "off");
+  const reasoning = model.reasoning && thinkingLevel !== "off";
+  const body = {
+    model: model.id,
+    messages: convertV2Messages(model, context, env.GIGACHAT_SYSTEM_PROMPT),
+    ...tools.length ? {
+      tools: [{ functions: { specifications: convertV2Functions(tools) } }]
+    } : {},
+    tool_config: typeof choice === "string" ? { mode: choice } : { mode: "forced", function_name: choice.name },
+    model_options: {
+      max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
+      temperature: options.temperature,
+      top_p: options.topP,
+      repetition_penalty: options.repetitionPenalty,
+      response_format: options.responseFormat,
+      ...tools.length && { parallel_tool_calls: true },
+      ...reasoning && { reasoning: { effort: "medium" } },
+      ...model.samplingParams,
+      ...options.samplingParams
+    },
+    ...options.profanityCheck !== void 0 && {
+      disable_filter: !options.profanityCheck
+    },
+    ...extra,
+    ...options.extraBody,
+    stream: options.stream ?? mode === "true"
+  };
+  if (!reasoning && object(body.model_options)) {
+    body.model_options = { ...body.model_options };
+    delete body.model_options.reasoning;
+  }
+  return body;
+}
+function streamSimpleGigaChatV2(model, context, options = {}) {
+  if (!options.apiKey && !options.mtls)
+    throw new Error("GigaChat access token is required; use /gigachat in Pi");
+  const stream = createAssistantMessageEventStream3();
+  const output = {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    stopReason: "pending",
+    timestamp: Date.now(),
+    usage: emptyUsage3()
+  };
+  const signal = options.signal ?? new AbortController().signal;
+  (async () => {
+    try {
+      let body = payload3(model, context, options);
+      const streaming = Boolean(body.stream);
+      const modified = await options.onPayload?.(body, model);
+      if (modified !== void 0) {
+        if (!object(modified))
+          throw new Error("GigaChat onPayload must return a JSON object");
+        body = modified;
+      }
+      body.stream = streaming;
+      if ((!model.reasoning || !options.reasoning || options.reasoning === "off") && object(body.model_options)) {
+        body.model_options = { ...body.model_options };
+        delete body.model_options.reasoning;
+      }
+      let observerFailed = false;
+      stream.push({ type: "start", partial: output });
+      await serial(
+        signal,
+        () => request(
+          `${baseUrl(options.env?.GIGACHAT_BASE_URL || model.baseUrl)}/chat/completions`,
+          {
+            method: "POST",
+            body: JSON.stringify(body),
+            headers: headers(
+              {
+                "Content-Type": "application/json",
+                Accept: streaming ? "text/event-stream" : "application/json",
+                ...!options.mtls && {
+                  Authorization: `Bearer ${options.apiKey}`
+                },
+                "User-Agent": "pi-gigachat",
+                "Cache-Control": "no-store",
+                ...options.sessionId && options.cacheRetention !== "none" ? { "X-Session-ID": options.sessionId } : {}
+              },
+              model.headers,
+              options.headers
+            )
+          },
+          {
+            ...options,
+            retry422: false,
+            canRetry: () => !observerFailed && output.content.length === 0
+          },
+          async (response) => {
+            output.stopReason = "pending";
+            delete output.rawStopReason;
+            output.usage = emptyUsage3();
+            const consumer = completionConsumer3(output, stream, model);
+            const observe = async (chunk, event) => {
+              signal.throwIfAborted();
+              try {
+                if (options.onProviderStreamEvent)
+                  await raceWithAbortSignal(
+                    Promise.resolve().then(
+                      () => options.onProviderStreamEvent?.(chunk, model)
+                    ),
+                    signal
+                  );
+              } catch (error) {
+                observerFailed = true;
+                throw error;
+              }
+              signal.throwIfAborted();
+              consumer.add(chunk, event);
+            };
+            if (streaming) await readSSE3(response, observe);
+            else {
+              if (!response.headers.get("content-type")?.includes("application/json"))
+                throw new Error("Expected a GigaChat V2 JSON response");
+              await observe(await response.json());
+            }
+            consumer.finish();
+          },
+          (response) => options.onResponse?.(
+            {
+              status: response.status,
+              headers: Object.fromEntries(response.headers)
+            },
+            model
+          )
+        )
+      );
+      signal.throwIfAborted();
+      if (output.stopReason !== "stop" && output.stopReason !== "length" && output.stopReason !== "toolUse")
+        throw new Error(
+          `GigaChat V2 finished with reason: ${output.rawStopReason ?? output.stopReason}`
+        );
+      stream.push({ type: "done", reason: output.stopReason, message: output });
+    } catch (error) {
+      output.stopReason = signal.aborted ? "aborted" : "error";
+      output.errorMessage = error instanceof Error ? error.message : String(error);
+      stream.push({ type: "error", reason: output.stopReason, error: output });
+    } finally {
+      stream.end();
+    }
+  })();
+  return stream;
+}
+function completionConsumer3(output, stream, model) {
+  const content = /* @__PURE__ */ new Map();
+  const tools = /* @__PURE__ */ new Map();
+  const states = [];
+  const appendText = (state, text, snapshot) => {
+    const block = state.block;
+    if (block.type === "toolCall")
+      throw new Error("Invalid GigaChat V2 text position");
+    if (snapshot) {
+      const previous = (block.type === "text" ? block.text : block.thinking) + state.pendingSurrogate;
+      if (!text.startsWith(previous))
+        throw new Error("Inconsistent GigaChat V2 final text");
+      text = text.slice(previous.length);
+    }
+    let delta = state.pendingSurrogate + text;
+    state.pendingSurrogate = "";
+    const last = delta.charCodeAt(delta.length - 1);
+    if (last >= 55296 && last <= 56319) {
+      state.pendingSurrogate = delta.slice(-1);
+      delta = delta.slice(0, -1);
+    }
+    delta = delta.toWellFormed();
+    if (!delta) return;
+    if (block.type === "text") {
+      block.text += delta;
+      stream.push({
+        type: "text_delta",
+        contentIndex: state.index,
+        delta,
+        partial: output
+      });
+    } else {
+      block.thinking += delta;
+      stream.push({
+        type: "thinking_delta",
+        contentIndex: state.index,
+        delta,
+        partial: output
+      });
+    }
+  };
+  const create = (key, block) => {
+    const state = {
+      block,
+      index: output.content.length,
+      argumentsJson: "",
+      pendingSurrogate: ""
+    };
+    content.set(key, state);
+    states.push(state);
+    output.content.push(block);
+    if (block.type === "text")
+      stream.push({
+        type: "text_start",
+        contentIndex: state.index,
+        partial: output
+      });
+    else if (block.type === "thinking")
+      stream.push({
+        type: "thinking_start",
+        contentIndex: state.index,
+        partial: output
+      });
+    else
+      stream.push({
+        type: "toolcall_start",
+        contentIndex: state.index,
+        partial: output
+      });
+    return state;
+  };
+  return {
+    add(chunk, event) {
+      if (!object(chunk)) throw new Error("Invalid GigaChat V2 completion");
+      const snapshot = event !== "response.message.delta";
+      if (object(chunk.usage)) {
+        const usage = output.usage;
+        const details = object(chunk.usage.input_tokens_details) ? chunk.usage.input_tokens_details : {};
+        usage.cacheRead = Number(details.cached_tokens ?? 0);
+        usage.input = Number(chunk.usage.input_tokens ?? 0) - usage.cacheRead;
+        usage.output = Number(chunk.usage.output_tokens ?? 0);
+        usage.totalTokens = Number(
+          chunk.usage.total_tokens ?? usage.input + usage.cacheRead + usage.output
+        );
+        calculateCost3(model, usage);
+      }
+      if (chunk.messages !== void 0 && !Array.isArray(chunk.messages))
+        throw new Error("Invalid GigaChat V2 messages");
+      if (!Array.isArray(chunk.messages) && event !== "response.message.done")
+        throw new Error("Invalid GigaChat V2 completion: missing messages");
+      if (Array.isArray(chunk.messages))
+        for (const [messageIndex, message] of chunk.messages.entries()) {
+          if (!object(message) || !Array.isArray(message.content))
+            throw new Error("Invalid GigaChat V2 message");
+          if (message.role !== "assistant" && message.role !== "reasoning")
+            throw new Error(
+              `Unsupported GigaChat V2 response role: ${message.role}`
+            );
+          const messageKey = `${message.role}:${typeof message.message_id === "string" ? message.message_id : messageIndex}`;
+          const signature = typeof message.tool_state_id === "string" ? V2_STATE_SIGNATURE_PREFIX + message.tool_state_id : void 0;
+          for (const [partIndex, part] of message.content.entries()) {
+            if (!object(part)) throw new Error("Invalid GigaChat V2 content");
+            const key = `${messageKey}:${partIndex}`;
+            if (part.text !== void 0) {
+              if (typeof part.text !== "string")
+                throw new Error("Invalid GigaChat V2 text");
+              const kind = message.role === "reasoning" ? "thinking" : "text";
+              const state = content.get(key) ?? create(
+                key,
+                kind === "thinking" ? {
+                  type: "thinking",
+                  thinking: "",
+                  thinkingSignature: "gigachat:v2:reasoning"
+                } : { type: "text", text: "" }
+              );
+              if (state.block.type !== kind)
+                throw new Error("Inconsistent GigaChat V2 content type");
+              appendText(state, part.text, snapshot);
+              if (signature && state.block.type === "text")
+                state.block.textSignature = signature;
+            }
+            if (part.function_call !== void 0) {
+              if (message.role !== "assistant" || !object(part.function_call))
+                throw new Error("Invalid GigaChat V2 function_call");
+              const call = part.function_call;
+              if (call.id !== void 0 && typeof call.id !== "string")
+                throw new Error("Invalid GigaChat V2 function_call id");
+              const id = typeof call.id === "string" ? call.id : void 0;
+              let state = id ? tools.get(id) : content.get(key);
+              if (!state) {
+                if (!id)
+                  throw new Error(
+                    "Invalid GigaChat V2 function_call: missing id"
+                  );
+                state = create(key, {
+                  type: "toolCall",
+                  id,
+                  name: "",
+                  arguments: {}
+                });
+                tools.set(id, state);
+              }
+              const tool = state.block;
+              if (tool.type !== "toolCall")
+                throw new Error("Inconsistent GigaChat V2 function position");
+              if (call.name !== void 0) {
+                if (typeof call.name !== "string" || tool.name && tool.name !== call.name)
+                  throw new Error("Invalid GigaChat V2 function_call name");
+                tool.name = call.name;
+              }
+              if (call.arguments !== void 0) {
+                if (typeof call.arguments !== "string" && !object(call.arguments))
+                  throw new Error("Invalid GigaChat V2 function arguments");
+                const delta = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments);
+                state.argumentsJson = typeof call.arguments === "string" && !snapshot ? state.argumentsJson + delta : delta;
+                tool.arguments = parseStreamingJson3(state.argumentsJson);
+                stream.push({
+                  type: "toolcall_delta",
+                  contentIndex: state.index,
+                  delta,
+                  partial: output
+                });
+              }
+              if (signature) tool.thoughtSignature = signature;
+            }
+          }
+          if (signature)
+            for (const [key, state] of content) {
+              if (!key.startsWith(`${messageKey}:`)) continue;
+              if (state.block.type === "text")
+                state.block.textSignature = signature;
+              else if (state.block.type === "toolCall")
+                state.block.thoughtSignature = signature;
+            }
+        }
+      if (chunk.finish_reason != null && chunk.finish_reason !== "") {
+        if (typeof chunk.finish_reason !== "string")
+          throw new Error("Invalid GigaChat V2 finish_reason");
+        output.rawStopReason = chunk.finish_reason;
+        switch (chunk.finish_reason) {
+          case "stop":
+            output.stopReason = "stop";
+            break;
+          case "length":
+            output.stopReason = "length";
+            break;
+          case "function_call":
+            output.stopReason = "toolUse";
+            break;
+          default:
+            throw new Error(
+              `GigaChat V2 finish_reason: ${chunk.finish_reason}`
+            );
+        }
+      }
+    },
+    finish() {
+      if (output.stopReason === "pending")
+        throw new Error(
+          "Incomplete GigaChat V2 response: missing finish_reason"
+        );
+      if (output.stopReason === "toolUse" && !tools.size)
+        throw new Error(
+          "Invalid GigaChat V2 completion: missing function_call"
+        );
+      for (const state of states) {
+        const block = state.block;
+        if (block.type === "toolCall") {
+          if (!block.name)
+            throw new Error("Invalid GigaChat V2 function_call name");
+          Object.assign(block, parseToolCallArguments3(state.argumentsJson));
+          stream.push({
+            type: "toolcall_end",
+            contentIndex: state.index,
+            toolCall: block,
+            partial: output
+          });
+        } else {
+          if (state.pendingSurrogate) {
+            state.pendingSurrogate = "";
+            appendText(state, "\uFFFD", false);
+          }
+          if (block.type === "text")
+            stream.push({
+              type: "text_end",
+              contentIndex: state.index,
+              content: block.text,
+              partial: output
+            });
+          else
+            stream.push({
+              type: "thinking_end",
+              contentIndex: state.index,
+              content: block.thinking,
+              partial: output
+            });
+        }
+      }
+    }
+  };
+}
+async function readSSE3(response, consume) {
+  if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body)
+    throw new Error("Expected a GigaChat V2 SSE response");
+  let done = false;
+  const events = [];
+  const parser = createParser3({
+    onEvent(event) {
+      events.push({ event: event.event ?? "", data: event.data });
+    }
+  });
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  const drain = async () => {
+    for (const event of events) {
+      if (event.event !== "response.message.delta" && event.event !== "response.message.done")
+        throw new Error(
+          `Unsupported GigaChat V2 SSE event: ${event.event || "(unnamed)"}`
+        );
+      await consume(JSON.parse(event.data), event.event);
+      if (event.event === "response.message.done") {
+        done = true;
+        break;
+      }
+    }
+    events.length = 0;
+  };
+  try {
+    while (!done) {
+      const next = await reader.read();
+      if (next.done) break;
+      parser.feed(decoder.decode(next.value, { stream: true }));
+      await drain();
+    }
+    if (!done) {
+      parser.feed(decoder.decode());
+      await drain();
+    }
+    if (!done)
+      throw new Error(
+        "Incomplete GigaChat V2 SSE response: missing response.message.done"
+      );
   } finally {
     await reader.cancel().catch(() => {
     });
@@ -1174,11 +2336,13 @@ function httpUrl(value) {
   }
 }
 function validConnection(value) {
-  if (!object(value) || !ownedId(value.id) || !nonempty(value.revision) || !nonempty(value.name) || !httpUrl(value.baseUrl) || !object(value.authorization) || !Array.isArray(value.models))
+  if (!object(value) || !ownedId(value.id) || !nonempty(value.revision) || !nonempty(value.name) || !httpUrl(value.baseUrl) || value.protocol !== void 0 && value.protocol !== "v1" && value.protocol !== "v2" && value.protocol !== "openai" || value.modelsUrl !== void 0 && !httpUrl(value.modelsUrl) || !object(value.authorization) || !Array.isArray(value.models))
     return false;
   if (value.authorization.type === "mtls") {
     const materials = value.authorization.materials;
-    if (new URL(value.baseUrl).protocol !== "https:" || !object(materials) || !nonempty(materials.ca) || !nonempty(materials.cert) || !nonempty(materials.key))
+    if (new URL(value.baseUrl).protocol !== "https:" || new URL(
+      value.modelsUrl ?? defaultModelsUrl(value.baseUrl, value.protocol ?? "v1")
+    ).protocol !== "https:" || !object(materials) || !nonempty(materials.ca) || !nonempty(materials.cert) || !nonempty(materials.key))
       return false;
   } else if (value.authorization.type !== "token") {
     if (value.authorization.type !== "credentials" || !httpUrl(value.authorization.tokenUrl) || !nonempty(value.authorization.scope))
@@ -1255,6 +2419,7 @@ async function prepareConnectionCredential(connection, secret, signal, previous)
       "Invalid GigaChat connection configuration."
     );
   const saved = structuredClone(connection);
+  saved.protocol ??= "v1";
   if (saved.authorization.type === "mtls")
     return { type: "api_key", gigachatConnection: saved };
   const normalized = secret.trim().replace(
@@ -1285,17 +2450,23 @@ function createConnectionProvider(connection, store, loginCredential) {
     );
   const saved = structuredClone(connection);
   const endpoint = baseUrl(saved.baseUrl);
+  const protocol = saved.protocol ?? "v1";
+  const api = GIGACHAT_PROTOCOLS[protocol].api;
+  const adapter = protocol === "v2" ? streamSimpleGigaChatV2 : protocol === "openai" ? streamSimpleOpenAI : streamSimpleGigaChat;
   if (loginCredential) currentCredential(loginCredential, saved);
-  const models = saved.models.map((model) => ({
-    ...model,
-    name: `${model.name} \u2014 ${saved.name}`,
-    api: GIGACHAT_API,
-    provider: saved.id,
-    baseUrl: endpoint,
-    input: ["text"],
-    // Unknown USD prices; zero is not a free-tier claim.
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-  }));
+  const models = saved.models.map(
+    (model) => ({
+      ...model,
+      name: `${model.name} \u2014 ${saved.name}`,
+      ...protocol === "v2" && model.reasoning ? { thinkingLevelMap: thinkingLevelMapForProtocol(protocol) } : {},
+      api,
+      provider: saved.id,
+      baseUrl: endpoint,
+      input: ["text"],
+      // Unknown USD prices; zero is not a free-tier claim.
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    })
+  );
   const selected = new Map(models.map((model) => [model.id, model]));
   const auth = {};
   if (saved.authorization.type === "token" || saved.authorization.type === "mtls") {
@@ -1367,7 +2538,7 @@ function createConnectionProvider(connection, store, loginCredential) {
   const stream = (model, context, options = {}) => {
     const current = selected.get(model.id);
     if (!current || model.provider !== saved.id) throw stale();
-    return streamSimpleGigaChat(current, context, {
+    return adapter(current, context, {
       ...options,
       mtls: saved.authorization.type === "mtls" ? saved.authorization.materials : void 0,
       apiKey: saved.authorization.type === "mtls" ? void 0 : options.apiKey,
@@ -1500,6 +2671,7 @@ var ConnectionStore = class {
   async save(credential, interaction, previousId) {
     if (!validCredential(credential)) throw storageError();
     const saved = structuredClone(credential);
+    saved.gigachatConnection.protocol ??= "v1";
     return this.write(async () => {
       await this.list(interaction.signal);
       await this.withData(async (data) => {
@@ -1547,7 +2719,7 @@ import { stripVTControlCharacters } from "node:util";
 var DiscoveryError = class extends Error {
   constructor(code) {
     super(
-      code === "INVALID_URL" ? "GigaChat server URL must use http(s)." : "GigaChat returned an invalid response."
+      code === "INVALID_URL" ? "GigaChat server URL must use http(s)." : code === "INVALID_PROTOCOL" ? "Unknown GigaChat API protocol." : "GigaChat returned an invalid response."
     );
     this.code = code;
   }
@@ -1574,7 +2746,7 @@ async function readJson(response) {
     throw error;
   }
 }
-function catalog(value) {
+function catalog(value, protocol) {
   if (!object(value) || !Array.isArray(value.data))
     throw new DiscoveryError("INVALID_RESPONSE");
   const seen = /* @__PURE__ */ new Set();
@@ -1583,7 +2755,7 @@ function catalog(value) {
     if (!object(item) || typeof item.id !== "string" || !item.id.trim() || /[\p{Cc}\p{Cf}]/u.test(item.id) || seen.has(item.id))
       continue;
     seen.add(item.id);
-    const reasoning = typeof item.reasoning === "boolean" ? item.reasoning : GIGACHAT_CONNECTION_DEFAULTS.reasoning;
+    const reasoning = protocol !== "v2" && (typeof item.reasoning === "boolean" ? item.reasoning : GIGACHAT_CONNECTION_DEFAULTS.reasoning);
     models.push({
       id: item.id,
       name: displayName(item.name, item.id),
@@ -1599,9 +2771,7 @@ function catalog(value) {
       ) ?? GIGACHAT_CONNECTION_DEFAULTS.maxTokens,
       reasoning,
       ...reasoning ? {
-        thinkingLevelMap: {
-          ...GIGACHAT_CONNECTION_DEFAULTS.thinkingLevelMap
-        }
+        thinkingLevelMap: thinkingLevelMapForProtocol(protocol)
       } : {}
     });
   }
@@ -1609,25 +2779,71 @@ function catalog(value) {
     throw new DiscoveryError("INVALID_RESPONSE");
   return models;
 }
-function validateCompletion(value) {
+function validateCompletion(value, protocol) {
+  if (protocol === "v2") {
+    validateV2Completion(value);
+    return;
+  }
   const choice = object(value) && Array.isArray(value.choices) ? value.choices[0] : void 0;
   const message = object(choice) ? choice.message : void 0;
-  if (!object(choice) || !object(message) || message.role !== "assistant" || message.content !== null && typeof message.content !== "string" || message.reasoning_content != null && typeof message.reasoning_content !== "string")
+  if (!object(choice) || !object(message) || message.role !== "assistant" || message.content !== null && typeof message.content !== "string" && !(protocol === "openai" && message.content === void 0) || message.reasoning_content != null && typeof message.reasoning_content !== "string" || protocol === "openai" && message.reasoning != null && typeof message.reasoning !== "string")
     throw new DiscoveryError("INVALID_RESPONSE");
+  if (protocol === "openai") {
+    const calls = message.tool_calls;
+    if (calls !== void 0 && (!Array.isArray(calls) || !calls.every(
+      (call) => object(call) && typeof call.id === "string" && call.id.length > 0 && call.type === "function" && object(call.function) && typeof call.function.name === "string" && call.function.name.length > 0 && typeof call.function.arguments === "string"
+    )) || message.content === void 0 && !Array.isArray(calls))
+      throw new DiscoveryError("INVALID_RESPONSE");
+    if (choice.finish_reason === "stop" || choice.finish_reason === "length" || choice.finish_reason === "content_filter" || choice.finish_reason === "tool_calls" && Array.isArray(calls) && calls.length > 0)
+      return;
+    throw new DiscoveryError("INVALID_RESPONSE");
+  }
   if (choice.finish_reason === "stop" || choice.finish_reason === "length")
     return;
   if (choice.finish_reason === "function_call" && object(message.function_call) && typeof message.function_call.name === "string" && message.function_call.name.length > 0 && (typeof message.function_call.arguments === "string" || object(message.function_call.arguments)))
     return;
   throw new DiscoveryError("INVALID_RESPONSE");
 }
+function validateV2Completion(value) {
+  if (!object(value) || !Array.isArray(value.messages) || value.messages.length === 0)
+    throw new DiscoveryError("INVALID_RESPONSE");
+  let assistant = false;
+  let calls = 0;
+  for (const message of value.messages) {
+    if (!object(message) || !["assistant", "reasoning"].includes(String(message.role)) || !Array.isArray(message.content))
+      throw new DiscoveryError("INVALID_RESPONSE");
+    assistant ||= message.role === "assistant";
+    for (const part of message.content) {
+      if (!object(part)) throw new DiscoveryError("INVALID_RESPONSE");
+      if (typeof part.text === "string") continue;
+      const call = part.function_call;
+      if (message.role !== "assistant" || !object(call) || typeof call.name !== "string" || call.name.length === 0 || !(typeof call.arguments === "string" || object(call.arguments)))
+        throw new DiscoveryError("INVALID_RESPONSE");
+      calls++;
+    }
+  }
+  if (!assistant || !(value.finish_reason === "stop" || value.finish_reason === "length" || value.finish_reason === "function_call" && calls > 0))
+    throw new DiscoveryError("INVALID_RESPONSE");
+}
 async function discoverModels(baseUrl2, apiKey, options) {
   options.signal.throwIfAborted();
+  const protocol = options.protocol === void 0 ? "v1" : options.protocol;
+  if (protocol !== "v1" && protocol !== "v2" && protocol !== "openai")
+    throw new DiscoveryError("INVALID_PROTOCOL");
   let root;
+  let modelsUrl;
   try {
     root = baseUrl(baseUrl2);
+    modelsUrl = options.modelsUrl === void 0 ? defaultModelsUrl(root, protocol) : options.modelsUrl;
+    if (!["http:", "https:"].includes(new URL(modelsUrl).protocol))
+      throw new DiscoveryError("INVALID_URL");
   } catch {
     throw new DiscoveryError("INVALID_URL");
   }
+  if (options.mtls && (new URL(root).protocol !== "https:" || new URL(modelsUrl).protocol !== "https:"))
+    throw new GigaChatMtlsError(
+      "GigaChat certificate authorization requires HTTPS for generation and the model catalog."
+    );
   const headers2 = new Headers({ "Content-Type": "application/json" });
   if (!options.mtls) headers2.set("Authorization", `Bearer ${apiKey}`);
   const transport = {
@@ -1636,26 +2852,31 @@ async function discoverModels(baseUrl2, apiKey, options) {
     mtls: options.mtls
   };
   const models = await request(
-    `${root}/models`,
+    modelsUrl,
     { method: "GET", headers: headers2 },
     transport,
-    async (response) => catalog(await readJson(response))
+    async (response) => catalog(await readJson(response), protocol)
   );
   options.signal.throwIfAborted();
   const probeTransport = { ...transport, timeoutMs: 5e3 };
-  const consumeProbe = async (response) => validateCompletion(await readJson(response));
-  const probes = [];
+  const consumeProbe = async (response) => validateCompletion(await readJson(response), protocol);
+  let completed = 0;
   options.progress?.(0, models.length);
-  for (const model of models) {
+  const probeModel = async (model) => {
     options.signal.throwIfAborted();
-    const probe = await serial(options.signal, async () => {
+    const work = async () => {
       const init = {
         method: "POST",
         headers: headers2,
         body: JSON.stringify({
           model: model.id,
-          messages: [{ role: "user", content: "Hi" }],
-          max_tokens: 1,
+          messages: [
+            {
+              role: "user",
+              content: protocol === "v2" ? [{ text: "Hi" }] : "Hi"
+            }
+          ],
+          ...protocol === "v2" ? { model_options: { max_tokens: 1 } } : { max_tokens: 1 },
           stream: false
         })
       };
@@ -1678,11 +2899,16 @@ async function discoverModels(baseUrl2, apiKey, options) {
             };
         }
       }
-    });
+    };
+    const probe = await (protocol === "openai" ? work() : serial(options.signal, work));
     options.signal.throwIfAborted();
-    probes.push(probe);
-    options.progress?.(probes.length, models.length, probe);
-  }
+    options.progress?.(++completed, models.length, probe);
+    return probe;
+  };
+  const probes = [];
+  if (protocol === "openai")
+    probes.push(...await Promise.all(models.map(probeModel)));
+  else for (const model of models) probes.push(await probeModel(model));
   options.signal.throwIfAborted();
   return probes;
 }
@@ -2005,6 +3231,9 @@ var authModes = Object.keys(
 var defaultTokenUrl = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
 var FormError = class extends Error {
 };
+function terminalText(value) {
+  return stripVTControlCharacters2(value).replace(/[\p{Cc}\p{Cf}]/gu, " ").trim();
+}
 async function registerGigaChatCommand(pi) {
   const store = new ConnectionStore();
   const registered = /* @__PURE__ */ new Map();
@@ -2192,12 +3421,21 @@ async function registerGigaChatCommand(pi) {
       return false;
     }
     ctx.ui.notify(
-      `\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \xAB${connection.name}\xBB \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E. \u041C\u043E\u0434\u0435\u043B\u0438: ${connection.models.map((model) => model.id).join(", ")}. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043C\u043E\u0434\u0435\u043B\u044C \u0447\u0435\u0440\u0435\u0437 /model.`,
+      terminalText(
+        `\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \xAB${connection.name}\xBB \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E. \u041C\u043E\u0434\u0435\u043B\u0438: ${connection.models.map((model) => model.id).join(", ")}. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043C\u043E\u0434\u0435\u043B\u044C \u0447\u0435\u0440\u0435\u0437 /model.`
+      ),
       "info"
     );
     return true;
   }
   async function verifyAndChoose(ctx, draft, secret, previous) {
+    if (draft.modelsUrl && new URL(draft.modelsUrl).origin !== new URL(draft.baseUrl).origin && !await ctx.ui.confirm(
+      "\u041A\u0430\u0442\u0430\u043B\u043E\u0433 \u043C\u043E\u0434\u0435\u043B\u0435\u0439 \u043D\u0430 \u0434\u0440\u0443\u0433\u043E\u043C \u0441\u0435\u0440\u0432\u0435\u0440\u0435",
+      terminalText(
+        `\u041A\u0430\u0442\u0430\u043B\u043E\u0433 ${new URL(draft.modelsUrl).origin} \u0438 \u0433\u0435\u043D\u0435\u0440\u0430\u0446\u0438\u044F ${new URL(draft.baseUrl).origin} \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u044E\u0442 \u043E\u0434\u043D\u0443 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044E. ${draft.authorization.type === "mtls" ? "\u041A\u043B\u0438\u0435\u043D\u0442\u0441\u043A\u0438\u0439 \u0441\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442 \u0431\u0443\u0434\u0435\u0442 \u043F\u0440\u0435\u0434\u044A\u044F\u0432\u043B\u0435\u043D" : "\u0422\u043E\u043A\u0435\u043D \u0434\u043E\u0441\u0442\u0443\u043F\u0430 \u0431\u0443\u0434\u0435\u0442 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D"} \u0442\u0430\u043A\u0436\u0435 \u0441\u0435\u0440\u0432\u0435\u0440\u0443 \u043A\u0430\u0442\u0430\u043B\u043E\u0433\u0430. \u041F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0439\u0442\u0435 \u0442\u043E\u043B\u044C\u043A\u043E \u0435\u0441\u043B\u0438 \u0434\u043E\u0432\u0435\u0440\u044F\u0435\u0442\u0435 \u043E\u0431\u043E\u0438\u043C \u0441\u0435\u0440\u0432\u0435\u0440\u0430\u043C.`
+      )
+    ))
+      return void 0;
     const checked = await runProgress(
       ctx,
       "\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F GigaChat",
@@ -2214,6 +3452,8 @@ async function registerGigaChatCommand(pi) {
         const token = credential.type === "oauth" ? credential.access : credential.env?.GIGACHAT_ACCESS_TOKEN ?? "";
         const probes = await discoverModels(draft.baseUrl, token, {
           signal,
+          protocol: draft.protocol,
+          modelsUrl: draft.modelsUrl,
           mtls: draft.authorization.type === "mtls" ? draft.authorization.materials : void 0,
           progress: (completed, total, probe) => update(
             `\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043C\u043E\u0434\u0435\u043B\u0435\u0439: ${completed}/${total}${probe ? ` \xB7 ${probe.model.id}: ${probe.status === "available" ? "\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430" : probe.reason}` : ""}`
@@ -2232,11 +3472,11 @@ async function registerGigaChatCommand(pi) {
         "\u041D\u0435\u0442 \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\u043D\u044B\u0445 \u043C\u043E\u0434\u0435\u043B\u0435\u0439. \u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E."
       );
     }
-    const models = await chooseModels(
-      ctx,
-      checked.value.probes,
-      previous?.gigachatConnection.models
+    const switchingToV2 = draft.protocol === "v2" && (previous?.gigachatConnection.protocol ?? "v1") !== "v2";
+    const initialModels = previous?.gigachatConnection.models.map(
+      (model) => switchingToV2 ? { ...model, reasoning: false, thinkingLevelMap: void 0 } : model
     );
+    const models = await chooseModels(ctx, checked.value.probes, initialModels);
     if (!models) return void 0;
     checked.value.credential.gigachatConnection.models = models;
     return checked.value.credential;
@@ -2244,9 +3484,11 @@ async function registerGigaChatCommand(pi) {
   async function configure(ctx, mode, previous) {
     const old = previous?.gigachatConnection;
     const oldSecret = previous?.type === "oauth" ? previous.refresh : previous?.env?.GIGACHAT_ACCESS_TOKEN ?? "";
+    let protocol = old?.protocol ?? "v1";
     let values = {
       name: old?.name ?? "",
-      url: old?.baseUrl ?? "",
+      url: old?.baseUrl ?? GIGACHAT_PROTOCOLS[protocol].baseUrl,
+      modelsUrl: old?.modelsUrl ?? "",
       tokenUrl: old?.authorization.type === "credentials" ? old.authorization.tokenUrl : "",
       scope: old?.authorization.type === "credentials" ? old.authorization.scope : scopes2[0],
       secret: "",
@@ -2262,12 +3504,6 @@ async function registerGigaChatCommand(pi) {
           label: "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F",
           value: values.name,
           placeholder: "LDBR"
-        },
-        {
-          id: "url",
-          label: "API URL (\u043A\u043E\u0440\u0435\u043D\u044C, \u0431\u0435\u0437 /models \u0438 /chat/completions)",
-          value: values.url,
-          placeholder: GIGACHAT_DEFAULT_BASE_URL
         }
       ];
       if (mode === "credentials")
@@ -2319,7 +3555,7 @@ async function registerGigaChatCommand(pi) {
       if (!entered) return;
       values = { ...values, ...entered };
       try {
-        const name = stripVTControlCharacters2(values.name).replace(/[\p{Cc}\p{Cf}]/gu, " ").trim();
+        const name = terminalText(values.name);
         if (!name) throw new FormError("\u0423\u043A\u0430\u0436\u0438\u0442\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F.");
         const renamed = !old || name !== old.name;
         if (renamed && !/^[A-Za-z0-9_-]+$/.test(values.name))
@@ -2332,27 +3568,7 @@ async function registerGigaChatCommand(pi) {
             `\u0418\u0434\u0435\u043D\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u043E\u0440 \u043F\u0440\u043E\u0432\u0430\u0439\u0434\u0435\u0440\u0430 \xAB${id}\xBB \u0443\u0436\u0435 \u0437\u0430\u043D\u044F\u0442. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0440\u0443\u0433\u043E\u0435 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F.`
           );
         await store.assertAvailable(id, old?.id);
-        const url = baseUrl(values.url.trim() || GIGACHAT_DEFAULT_BASE_URL);
-        if (mode === "mtls" && new URL(url).protocol !== "https:")
-          throw new FormError("\u0414\u043B\u044F mTLS API URL \u0434\u043E\u043B\u0436\u0435\u043D \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C HTTPS.");
-        const tokenUrl = mode === "credentials" ? values.tokenUrl.trim() || (url === GIGACHAT_DEFAULT_BASE_URL ? defaultTokenUrl : "") : "";
-        if (mode === "credentials" && !tokenUrl)
-          throw new FormError(
-            "\u0414\u043B\u044F \u043D\u0435\u0441\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 URL \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u044F \u0442\u043E\u043A\u0435\u043D\u043E\u0432."
-          );
         let authorization = { type: "token" };
-        if (mode === "credentials") {
-          const endpoint = new URL(tokenUrl);
-          if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:")
-            throw new FormError(
-              "URL \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u044F \u0442\u043E\u043A\u0435\u043D\u043E\u0432 \u0434\u043E\u043B\u0436\u0435\u043D \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C HTTP \u0438\u043B\u0438 HTTPS."
-            );
-          authorization = {
-            type: "credentials",
-            tokenUrl: endpoint.href,
-            scope: values.scope
-          };
-        }
         if (mode === "mtls") {
           const paths = {
             caPath: values.caPath.trim(),
@@ -2403,25 +3619,96 @@ async function registerGigaChatCommand(pi) {
             authorization = { type: "mtls", materials: imported.value };
           }
         }
+        const secret = values.secret.trim() || (old?.authorization.type === mode ? oldSecret : "");
+        if (mode !== "mtls" && !secret)
+          throw new FormError("\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0441\u0435\u043A\u0440\u0435\u0442 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0441\u043F\u043E\u0441\u043E\u0431\u0430 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u0438.");
+        const protocols = [
+          protocol,
+          ...["v1", "v2", "openai"].filter(
+            (candidate) => candidate !== protocol
+          )
+        ];
+        const selected = await ctx.ui.select(
+          "\u041F\u0440\u043E\u0442\u043E\u043A\u043E\u043B API",
+          protocols.map((candidate) => GIGACHAT_PROTOCOLS[candidate].label)
+        );
+        const nextProtocol = protocols.find(
+          (candidate) => GIGACHAT_PROTOCOLS[candidate].label === selected
+        );
+        if (!nextProtocol) return;
+        if (nextProtocol !== protocol && (values.url.trim() || GIGACHAT_PROTOCOLS[protocol].baseUrl).replace(
+          /\/+$/,
+          ""
+        ) === GIGACHAT_PROTOCOLS[protocol].baseUrl)
+          values.url = GIGACHAT_PROTOCOLS[nextProtocol].baseUrl;
+        protocol = nextProtocol;
+        const endpoints = await showForm(
+          ctx,
+          `\u0410\u0434\u0440\u0435\u0441\u0430 \xB7 ${GIGACHAT_PROTOCOLS[protocol].label}`,
+          [
+            {
+              id: "url",
+              label: "\u041E\u0441\u043D\u043E\u0432\u043D\u043E\u0439 endpoint (\u043A\u043E\u0440\u0435\u043D\u044C, \u0431\u0435\u0437 /chat/completions)",
+              value: values.url,
+              placeholder: GIGACHAT_PROTOCOLS[protocol].baseUrl
+            },
+            {
+              id: "modelsUrl",
+              label: "\u041F\u043E\u043B\u043D\u044B\u0439 URL \u043A\u0430\u0442\u0430\u043B\u043E\u0433\u0430 (\u043F\u0443\u0441\u0442\u043E \u2014 \u043F\u043E \u043F\u0440\u043E\u0442\u043E\u043A\u043E\u043B\u0443)",
+              value: values.modelsUrl,
+              placeholder: "\u041F\u0443\u0441\u0442\u043E \u2014 \u043A\u0430\u0442\u0430\u043B\u043E\u0433 \u043D\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0435 \u043E\u0441\u043D\u043E\u0432\u043D\u043E\u0433\u043E endpoint \u043F\u043E \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u043C\u0443 \u043F\u0440\u043E\u0442\u043E\u043A\u043E\u043B\u0443"
+            }
+          ]
+        );
+        if (!endpoints) return;
+        values = { ...values, ...endpoints };
+        const url = baseUrl(
+          values.url.trim() || GIGACHAT_PROTOCOLS[protocol].baseUrl
+        );
+        const modelsUrl = values.modelsUrl.trim() || void 0;
+        const catalog2 = new URL(modelsUrl ?? defaultModelsUrl(url, protocol));
+        if (!["https:", "http:"].includes(catalog2.protocol))
+          throw new FormError(
+            "URL \u043A\u0430\u0442\u0430\u043B\u043E\u0433\u0430 \u043C\u043E\u0434\u0435\u043B\u0435\u0439 \u0434\u043E\u043B\u0436\u0435\u043D \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C HTTP \u0438\u043B\u0438 HTTPS."
+          );
+        if (mode === "mtls" && (new URL(url).protocol !== "https:" || catalog2.protocol !== "https:"))
+          throw new FormError(
+            "\u0414\u043B\u044F mTLS \u043E\u0441\u043D\u043E\u0432\u043D\u043E\u0439 endpoint \u0438 \u043A\u0430\u0442\u0430\u043B\u043E\u0433 \u0434\u043E\u043B\u0436\u043D\u044B \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C HTTPS."
+          );
+        if (mode === "credentials") {
+          const preset = url === GIGACHAT_PROTOCOLS[protocol].baseUrl;
+          const tokenUrl = values.tokenUrl.trim() || (preset ? defaultTokenUrl : "");
+          if (!tokenUrl)
+            throw new FormError(
+              "\u0414\u043B\u044F \u043D\u0435\u0441\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 URL \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u044F \u0442\u043E\u043A\u0435\u043D\u043E\u0432."
+            );
+          const endpoint = new URL(tokenUrl);
+          if (!["https:", "http:"].includes(endpoint.protocol))
+            throw new FormError(
+              "URL \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u044F \u0442\u043E\u043A\u0435\u043D\u043E\u0432 \u0434\u043E\u043B\u0436\u0435\u043D \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C HTTP \u0438\u043B\u0438 HTTPS."
+            );
+          authorization = {
+            type: "credentials",
+            tokenUrl: endpoint.href,
+            scope: values.scope
+          };
+        }
         const draft = {
           id,
           revision: randomBytes2(12).toString("hex"),
           name,
           baseUrl: url,
+          protocol,
+          modelsUrl,
           authorization,
           models: old?.models ?? []
         };
         const sameAuthorization = old?.authorization.type === authorization.type && (authorization.type === "token" || (authorization.type === "mtls" ? old.authorization.type === "mtls" && old.authorization.materials === authorization.materials : old.authorization.type === "credentials" && old.authorization.tokenUrl === authorization.tokenUrl && old.authorization.scope === authorization.scope));
-        const changedEndpointOrSecret = !old || old.baseUrl !== draft.baseUrl || !sameAuthorization || Boolean(values.secret.trim());
+        const changedEndpointOrSecret = !old || old.baseUrl !== draft.baseUrl || (old.protocol ?? "v1") !== draft.protocol || old.modelsUrl !== draft.modelsUrl || !sameAuthorization || Boolean(values.secret.trim());
         let credential;
         if (previous && !changedEndpointOrSecret && !renamed)
           credential = { ...previous, gigachatConnection: draft };
         else {
-          const secret = values.secret.trim() || (old?.authorization.type === mode ? oldSecret : "");
-          if (mode !== "mtls" && !secret)
-            throw new FormError(
-              "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0441\u0435\u043A\u0440\u0435\u0442 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0441\u043F\u043E\u0441\u043E\u0431\u0430 \u0430\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u0438."
-            );
           credential = await verifyAndChoose(
             ctx,
             draft,
@@ -2448,7 +3735,7 @@ async function registerGigaChatCommand(pi) {
   async function editModelParameters(ctx, record) {
     const connection = record.gigachatConnection;
     const labels = connection.models.map(
-      (model2) => `${model2.id} \u2014 ${model2.name}`
+      (model2) => terminalText(`${model2.id} \u2014 ${model2.name}`)
     );
     const selected = await ctx.ui.select("\u041F\u0430\u0440\u0430\u043C\u0435\u0442\u0440\u044B \u043C\u043E\u0434\u0435\u043B\u0438", labels);
     const index = labels.indexOf(selected ?? "");
@@ -2461,21 +3748,25 @@ async function registerGigaChatCommand(pi) {
       reasoning: model.reasoning ? "\u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F" : "\u041D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F"
     };
     for (; ; ) {
-      const entered = await showForm(ctx, `\u041F\u0430\u0440\u0430\u043C\u0435\u0442\u0440\u044B \xB7 ${model.id}`, [
-        { id: "context", label: "\u041B\u0438\u043C\u0438\u0442 \u043A\u043E\u043D\u0442\u0435\u043A\u0441\u0442\u0430", value: values.context },
-        { id: "output", label: "\u041B\u0438\u043C\u0438\u0442 \u043E\u0442\u0432\u0435\u0442\u0430", value: values.output },
-        {
-          id: "temperature",
-          label: "\u0422\u0435\u043C\u043F\u0435\u0440\u0430\u0442\u0443\u0440\u0430 (\u043F\u0443\u0441\u0442\u043E \u2014 \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E)",
-          value: values.temperature
-        },
-        {
-          id: "reasoning",
-          label: "Reasoning",
-          value: values.reasoning,
-          choices: ["\u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F", "\u041D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F"]
-        }
-      ]);
+      const entered = await showForm(
+        ctx,
+        terminalText(`\u041F\u0430\u0440\u0430\u043C\u0435\u0442\u0440\u044B \xB7 ${model.id}`),
+        [
+          { id: "context", label: "\u041B\u0438\u043C\u0438\u0442 \u043A\u043E\u043D\u0442\u0435\u043A\u0441\u0442\u0430", value: values.context },
+          { id: "output", label: "\u041B\u0438\u043C\u0438\u0442 \u043E\u0442\u0432\u0435\u0442\u0430", value: values.output },
+          {
+            id: "temperature",
+            label: "\u0422\u0435\u043C\u043F\u0435\u0440\u0430\u0442\u0443\u0440\u0430 (\u043F\u0443\u0441\u0442\u043E \u2014 \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E)",
+            value: values.temperature
+          },
+          {
+            id: "reasoning",
+            label: connection.protocol === "v2" ? "Reasoning (\u044F\u0432\u043D\u043E\u0435 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435, \u0442\u043E\u043B\u044C\u043A\u043E medium)" : "Reasoning",
+            value: values.reasoning,
+            choices: ["\u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F", "\u041D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F"]
+          }
+        ]
+      );
       if (!entered) return;
       values = {
         context: entered.context,
@@ -2507,7 +3798,7 @@ async function registerGigaChatCommand(pi) {
         maxTokens,
         temperature,
         reasoning,
-        thinkingLevelMap: reasoning ? model.thinkingLevelMap ?? GIGACHAT_CONNECTION_DEFAULTS.thinkingLevelMap : void 0
+        thinkingLevelMap: reasoning ? connection.protocol === "v2" ? thinkingLevelMapForProtocol("v2") : model.thinkingLevelMap ?? thinkingLevelMapForProtocol(connection.protocol ?? "v1") : void 0
       };
       const models = connection.models.slice();
       models[index] = edited;
@@ -2527,20 +3818,24 @@ async function registerGigaChatCommand(pi) {
     const labels = [];
     for (const record2 of records) {
       const connection2 = record2.gigachatConnection;
-      const label = `${connection2.name} \xB7 ${connection2.baseUrl}`;
+      const label = terminalText(
+        `${connection2.name} \xB7 ${GIGACHAT_PROTOCOLS[connection2.protocol ?? "v1"].label} \xB7 ${connection2.baseUrl}`
+      );
       labels.push(label);
       counts.set(label, (counts.get(label) ?? 0) + 1);
     }
     for (let index = 0; index < labels.length; index++) {
       if (counts.get(labels[index]) !== 1)
-        labels[index] += ` \xB7 #${records[index].gigachatConnection.id.slice(CONNECTION_PROVIDER_PREFIX.length)}`;
+        labels[index] += ` \xB7 #${terminalText(records[index].gigachatConnection.id.slice(CONNECTION_PROVIDER_PREFIX.length))}`;
     }
     const selected = await ctx.ui.select("\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F GigaChat", labels);
     const record = records[labels.indexOf(selected ?? "")];
     if (!record) return;
     const connection = record.gigachatConnection;
     const action = await ctx.ui.select(
-      `\xAB${connection.name}\xBB \xB7 ${connection.models.length} \u043C\u043E\u0434\u0435\u043B\u0435\u0439`,
+      terminalText(
+        `\xAB${connection.name}\xBB \xB7 ${GIGACHAT_PROTOCOLS[connection.protocol ?? "v1"].label} \xB7 ${connection.models.length} \u043C\u043E\u0434\u0435\u043B\u0435\u0439`
+      ),
       [
         "\u0418\u0437\u043C\u0435\u043D\u0438\u0442\u044C \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435",
         "\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u043A\u0430\u0442\u0430\u043B\u043E\u0433 \u0438 \u0432\u044B\u0431\u043E\u0440 \u043C\u043E\u0434\u0435\u043B\u0435\u0439",
@@ -2579,7 +3874,9 @@ async function registerGigaChatCommand(pi) {
     } else if (action === "\u0423\u0434\u0430\u043B\u0438\u0442\u044C \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435") {
       if (!await ctx.ui.confirm(
         "\u0423\u0434\u0430\u043B\u0438\u0442\u044C \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435?",
-        `\xAB${connection.name}\xBB: \u0431\u0443\u0434\u0443\u0442 \u0443\u0434\u0430\u043B\u0435\u043D\u044B \u0441\u0435\u043A\u0440\u0435\u0442 \u0438 \u0432\u0441\u0435 ${connection.models.length} \u043C\u043E\u0434\u0435\u043B\u0438. \u0410\u043A\u0442\u0438\u0432\u043D\u0430\u044F \u043E\u043F\u0435\u0440\u0430\u0446\u0438\u044F \u044D\u0442\u043E\u0433\u043E \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F \u0431\u0443\u0434\u0435\u0442 \u043F\u0440\u0435\u0440\u0432\u0430\u043D\u0430. \u0414\u0440\u0443\u0433\u043E\u0439 \u0441\u0435\u0440\u0432\u0435\u0440 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438 \u043D\u0435 \u0432\u044B\u0431\u0438\u0440\u0430\u0435\u0442\u0441\u044F.`
+        terminalText(
+          `\xAB${connection.name}\xBB: \u0431\u0443\u0434\u0443\u0442 \u0443\u0434\u0430\u043B\u0435\u043D\u044B \u0441\u0435\u043A\u0440\u0435\u0442 \u0438 \u0432\u0441\u0435 ${connection.models.length} \u043C\u043E\u0434\u0435\u043B\u0438. \u0410\u043A\u0442\u0438\u0432\u043D\u0430\u044F \u043E\u043F\u0435\u0440\u0430\u0446\u0438\u044F \u044D\u0442\u043E\u0433\u043E \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F \u0431\u0443\u0434\u0435\u0442 \u043F\u0440\u0435\u0440\u0432\u0430\u043D\u0430. \u0414\u0440\u0443\u0433\u043E\u0439 \u0441\u0435\u0440\u0432\u0435\u0440 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438 \u043D\u0435 \u0432\u044B\u0431\u0438\u0440\u0430\u0435\u0442\u0441\u044F.`
+        )
       ))
         return;
       const result = await runProgress(
@@ -2602,7 +3899,9 @@ async function registerGigaChatCommand(pi) {
         ctx.ui.notify(describeDiscoveryError(result.error), "error");
       else if (result)
         ctx.ui.notify(
-          `\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \xAB${connection.name}\xBB \u0443\u0434\u0430\u043B\u0435\u043D\u043E. \u0415\u0441\u043B\u0438 \u0435\u0433\u043E \u043C\u043E\u0434\u0435\u043B\u044C \u0431\u044B\u043B\u0430 \u0432\u044B\u0431\u0440\u0430\u043D\u0430, \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0438\u043B\u0438 \u0434\u043E\u0431\u0430\u0432\u044C\u0442\u0435 \u0434\u0440\u0443\u0433\u0443\u044E \u0447\u0435\u0440\u0435\u0437 /model \u0438\u043B\u0438 /gigachat.`,
+          terminalText(
+            `\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \xAB${connection.name}\xBB \u0443\u0434\u0430\u043B\u0435\u043D\u043E. \u0415\u0441\u043B\u0438 \u0435\u0433\u043E \u043C\u043E\u0434\u0435\u043B\u044C \u0431\u044B\u043B\u0430 \u0432\u044B\u0431\u0440\u0430\u043D\u0430, \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0438\u043B\u0438 \u0434\u043E\u0431\u0430\u0432\u044C\u0442\u0435 \u0434\u0440\u0443\u0433\u0443\u044E \u0447\u0435\u0440\u0435\u0437 /model \u0438\u043B\u0438 /gigachat.`
+          ),
           "info"
         );
     }

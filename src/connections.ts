@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import type {
+	Api,
 	AuthInteraction,
 	Credential,
 	Model,
@@ -27,8 +28,14 @@ import type {
 	ConnectionModel,
 } from "./connection-types.js";
 import { GigaChatHttpError, object } from "./http.js";
-import { GIGACHAT_API } from "./models.js";
+import { streamSimpleOpenAI } from "./openai-stream.js";
+import {
+	defaultModelsUrl,
+	GIGACHAT_PROTOCOLS,
+	thinkingLevelMapForProtocol,
+} from "./protocols.js";
 import { streamSimpleGigaChat } from "./stream.js";
+import { streamSimpleGigaChatV2 } from "./v2-stream.js";
 
 export const CONNECTION_PROVIDER_PREFIX = "gigachat-";
 
@@ -113,6 +120,11 @@ function validConnection(value: unknown): value is Connection {
 		!nonempty(value.revision) ||
 		!nonempty(value.name) ||
 		!httpUrl(value.baseUrl) ||
+		(value.protocol !== undefined &&
+			value.protocol !== "v1" &&
+			value.protocol !== "v2" &&
+			value.protocol !== "openai") ||
+		(value.modelsUrl !== undefined && !httpUrl(value.modelsUrl)) ||
 		!object(value.authorization) ||
 		!Array.isArray(value.models)
 	)
@@ -121,6 +133,10 @@ function validConnection(value: unknown): value is Connection {
 		const materials = value.authorization.materials;
 		if (
 			new URL(value.baseUrl).protocol !== "https:" ||
+			new URL(
+				value.modelsUrl ??
+					defaultModelsUrl(value.baseUrl, value.protocol ?? "v1"),
+			).protocol !== "https:" ||
 			!object(materials) ||
 			!nonempty(materials.ca) ||
 			!nonempty(materials.cert) ||
@@ -271,6 +287,7 @@ export async function prepareConnectionCredential(
 			"Invalid GigaChat connection configuration.",
 		);
 	const saved = structuredClone(connection);
+	saved.protocol ??= "v1";
 	if (saved.authorization.type === "mtls")
 		return { type: "api_key", gigachatConnection: saved };
 	const normalized = secret
@@ -314,7 +331,7 @@ export function createConnectionProvider(
 	connection: Connection,
 	store: ConnectionStore,
 	loginCredential?: ConnectionCredential,
-): Provider<typeof GIGACHAT_API> {
+): Provider<Api> {
 	if (!validConnection(connection))
 		throw new ConnectionError(
 			"GIGACHAT_AUTH_ERROR",
@@ -322,18 +339,30 @@ export function createConnectionProvider(
 		);
 	const saved = structuredClone(connection);
 	const endpoint = baseUrl(saved.baseUrl);
+	const protocol = saved.protocol ?? "v1";
+	const api = GIGACHAT_PROTOCOLS[protocol].api;
+	const adapter =
+		protocol === "v2"
+			? streamSimpleGigaChatV2
+			: protocol === "openai"
+				? streamSimpleOpenAI
+				: streamSimpleGigaChat;
 	if (loginCredential) currentCredential(loginCredential, saved);
-	const models: (Model<typeof GIGACHAT_API> & ConnectionModel)[] =
-		saved.models.map((model) => ({
+	const models: (Model<Api> & ConnectionModel)[] = saved.models.map(
+		(model) => ({
 			...model,
 			name: `${model.name} — ${saved.name}`,
-			api: GIGACHAT_API,
+			...(protocol === "v2" && model.reasoning
+				? { thinkingLevelMap: thinkingLevelMapForProtocol(protocol) }
+				: {}),
+			api,
 			provider: saved.id,
 			baseUrl: endpoint,
 			input: ["text"],
 			// Unknown USD prices; zero is not a free-tier claim.
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		}));
+		}),
+	);
 	const selected = new Map(models.map((model) => [model.id, model]));
 	const auth: ProviderAuth = {};
 	if (
@@ -423,7 +452,7 @@ export function createConnectionProvider(
 	) => {
 		const current = selected.get(model.id);
 		if (!current || model.provider !== saved.id) throw stale();
-		return streamSimpleGigaChat(current, context, {
+		return adapter(current, context, {
 			...options,
 			mtls:
 				saved.authorization.type === "mtls"
@@ -588,6 +617,7 @@ export class ConnectionStore {
 	): Promise<void> {
 		if (!validCredential(credential)) throw storageError();
 		const saved = structuredClone(credential);
+		saved.gigachatConnection.protocol ??= "v1";
 		return this.write(async () => {
 			await this.list(interaction.signal);
 			await this.withData(async (data) => {

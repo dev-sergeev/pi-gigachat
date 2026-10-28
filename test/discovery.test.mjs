@@ -74,6 +74,128 @@ test('deduplicates exact Model IDs before serial one-token probes and accepts tr
   });
 });
 
+for (const protocol of ['v1', 'v2', 'openai']) {
+  test(`${protocol} uses its catalog route independently from the generation endpoint and preserves an explicit full catalog URL`, async () => {
+    await withServer((req, res) => {
+      if (req.method === 'GET') return json(res, { data: [{ id: 'one', reasoning: true }] });
+      json(res, protocol === 'v2'
+        ? { messages: [{ role: 'assistant', content: [{ text: '' }] }], finish_reason: 'length' }
+        : completion());
+    }, async ({ baseUrl, requests }) => {
+      const root = protocol === 'v2' ? baseUrl.replace('/v1', '/custom/v2') : baseUrl + '/custom';
+      const options = { protocol, signal: new AbortController().signal };
+      const probes = await discoverModels(root, secret, options);
+      assert.equal(probes[0].status, 'available');
+      if (protocol === 'v2') {
+        assert.equal(probes[0].model.reasoning, false, 'V2 reasoning requires an explicit model edit');
+        assert.equal(probes[0].model.thinkingLevelMap, undefined);
+      }
+      assert.equal(requests[0].url,
+        { v1: '/v1/custom/models', v2: '/v1/models', openai: '/gc/models' }[protocol]);
+      assert.equal(requests[1].url, new URL(root).pathname + '/chat/completions');
+      assert.deepEqual(requests[1].body, protocol === 'v2'
+        ? { model: 'one', messages: [{ role: 'user', content: [{ text: 'Hi' }] }], model_options: { max_tokens: 1 }, stream: false }
+        : { model: 'one', messages: [{ role: 'user', content: 'Hi' }], max_tokens: 1, stream: false });
+      const custom = new URL('/independent/catalog?exact=1', baseUrl).href;
+      const overridden = await discoverModels(root, secret, { ...options, modelsUrl: custom });
+      assert.equal(overridden[0].status, 'available');
+      assert.equal(requests[2].url, '/independent/catalog?exact=1');
+      assert.equal(requests[3].url, requests[1].url);
+      for (const request of requests) assert.equal(request.headers.authorization, `Bearer ${secret}`);
+    });
+  });
+}
+
+test('explicit catalogs may use another trusted origin with the same connection authorization', async () => {
+  await withServer((_req, res) => json(res, { data: [{ id: 'remote-catalog-model' }] }), async catalogServer => {
+    await withServer((_req, res) => json(res, completion()), async generationServer => {
+      const modelsUrl = catalogServer.baseUrl + '/catalog?keep=query';
+      const probes = await discoverModels(generationServer.baseUrl, secret, {
+        protocol: 'openai', modelsUrl, signal: new AbortController().signal,
+      });
+      assert.equal(probes[0].status, 'available');
+      assert.deepEqual(catalogServer.requests.map(request => request.url), ['/v1/catalog?keep=query']);
+      assert.deepEqual(generationServer.requests.map(request => request.url), ['/v1/chat/completions']);
+      assert.equal(catalogServer.requests[0].headers.authorization, `Bearer ${secret}`);
+      assert.equal(generationServer.requests[0].headers.authorization, `Bearer ${secret}`);
+    });
+  });
+});
+
+test('unknown protocols, invalid full catalog URLs and either insecure mTLS endpoint reject before HTTP', async () => {
+  await withServer((_req, res) => json(res, { data: [] }), async ({ baseUrl, requests }) => {
+    const mtls = { ca: 'synthetic-ca', cert: 'synthetic-cert', key: 'synthetic-key' };
+    for (const options of [
+      { protocol: 'unknown' },
+      { modelsUrl: 'file:///models' },
+      { modelsUrl: '/relative/models' },
+      { modelsUrl: '' },
+      { protocol: 'v1', mtls, modelsUrl: 'https://catalog.invalid/models' },
+      { protocol: 'v2', mtls },
+      { protocol: 'openai', mtls },
+    ]) {
+      await assert.rejects(discoverModels(baseUrl, secret, { ...options, signal: new AbortController().signal }));
+    }
+    await assert.rejects(discoverModels('https://generation.invalid/v2', secret, {
+      protocol: 'v2', mtls, modelsUrl: baseUrl + '/catalog', signal: new AbortController().signal,
+    }), /HTTPS/);
+    assert.equal(requests.length, 0);
+  });
+});
+
+test('OpenAI probes retain parallel execution and accept modern multiple tool calls while rejecting malformed calls', async () => {
+  let active = 0;
+  let peak = 0;
+  await withServer(async (req, res) => {
+    if (req.method === 'GET') return json(res, { data: [{ id: 'one' }, { id: 'two' }, { id: 'malformed' }] });
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    active--;
+    json(res, { choices: [{ finish_reason: 'tool_calls', message: {
+      role: 'assistant', content: null,
+      tool_calls: [
+        { id: 'call-one', type: 'function', function: { name: 'read', arguments: '{}' } },
+        { id: 'call-two', type: 'function', function: { name: 'read',
+          arguments: req.body.model === 'malformed' ? {} : '{"path":"other"}' } },
+      ],
+    } }] });
+  }, async ({ baseUrl, requests }) => {
+    const probes = await discoverModels(baseUrl, secret, { protocol: 'openai', signal: new AbortController().signal });
+    assert.deepEqual(probes.map(probe => probe.status), ['available', 'available', 'unavailable']);
+    assert(peak > 1, 'OpenAI-compatible servers must not inherit the V1 single-generation queue');
+    assert.equal(requests.filter(request => request.body?.model === 'malformed').length, 3);
+  });
+});
+
+test('V2 probes serialize and validate native messages and finish reasons rather than V1 choices', async () => {
+  let active = 0;
+  let peak = 0;
+  const ids = ['native', 'v1-envelope', 'missing-finish', 'invalid-content', 'valid-calls'];
+  await withServer(async (req, res) => {
+    if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active--;
+    const responses = {
+      native: { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' },
+      'v1-envelope': completion(),
+      'missing-finish': { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }] },
+      'invalid-content': { messages: [{ role: 'assistant', content: 'OK' }], finish_reason: 'stop' },
+      'valid-calls': { messages: [{ role: 'assistant', content: [
+        { function_call: { id: 'one', name: 'read', arguments: { path: 'one' } } },
+        { function_call: { id: 'two', name: 'read', arguments: { path: 'two' } } },
+      ] }], finish_reason: 'function_call' },
+    };
+    json(res, responses[req.body.model]);
+  }, async ({ baseUrl }) => {
+    const probes = await discoverModels(baseUrl.replace('/v1', '/v2'), secret, { protocol: 'v2', signal: new AbortController().signal });
+    assert.deepEqual(probes.map(probe => probe.status), ['available', 'unavailable', 'unavailable', 'unavailable', 'available']);
+    assert.equal(peak, 1);
+  });
+});
+
 test('discovery defaults missing or invalid metadata while preserving explicit server limits and reasoning', async () => {
   const cases = [
     { id: 'missing-metadata', expected: [262144, 64000, true] },

@@ -3,18 +3,24 @@ import { baseUrl as normalizeBaseUrl } from "./auth.js";
 import type {
 	ConnectionModel,
 	DiscoveryOptions,
+	GigaChatProtocol,
 	ModelProbe,
 } from "./connection-types.js";
 import { GigaChatHttpError, object, request, serial } from "./http.js";
 import { GIGACHAT_CONNECTION_DEFAULTS } from "./models.js";
 import { GigaChatMtlsError } from "./mtls.js";
+import { defaultModelsUrl, thinkingLevelMapForProtocol } from "./protocols.js";
 
 class DiscoveryError extends Error {
-	constructor(readonly code: "INVALID_URL" | "INVALID_RESPONSE") {
+	constructor(
+		readonly code: "INVALID_URL" | "INVALID_RESPONSE" | "INVALID_PROTOCOL",
+	) {
 		super(
 			code === "INVALID_URL"
 				? "GigaChat server URL must use http(s)."
-				: "GigaChat returned an invalid response.",
+				: code === "INVALID_PROTOCOL"
+					? "Unknown GigaChat API protocol."
+					: "GigaChat returned an invalid response.",
 		);
 	}
 }
@@ -47,7 +53,10 @@ async function readJson(response: Response): Promise<unknown> {
 	}
 }
 
-function catalog(value: unknown): ConnectionModel[] {
+function catalog(
+	value: unknown,
+	protocol: GigaChatProtocol,
+): ConnectionModel[] {
 	if (!object(value) || !Array.isArray(value.data))
 		throw new DiscoveryError("INVALID_RESPONSE");
 	const seen = new Set<string>();
@@ -62,10 +71,12 @@ function catalog(value: unknown): ConnectionModel[] {
 		)
 			continue;
 		seen.add(item.id);
+		// V2 reasoning is opt-in per selected model, never inferred from a catalog.
 		const reasoning =
-			typeof item.reasoning === "boolean"
+			protocol !== "v2" &&
+			(typeof item.reasoning === "boolean"
 				? item.reasoning
-				: GIGACHAT_CONNECTION_DEFAULTS.reasoning;
+				: GIGACHAT_CONNECTION_DEFAULTS.reasoning);
 		models.push({
 			id: item.id,
 			name: displayName(item.name, item.id),
@@ -84,9 +95,7 @@ function catalog(value: unknown): ConnectionModel[] {
 			reasoning,
 			...(reasoning
 				? {
-						thinkingLevelMap: {
-							...GIGACHAT_CONNECTION_DEFAULTS.thinkingLevelMap,
-						},
+						thinkingLevelMap: thinkingLevelMapForProtocol(protocol),
 					}
 				: {}),
 		});
@@ -96,7 +105,11 @@ function catalog(value: unknown): ConnectionModel[] {
 	return models;
 }
 
-function validateCompletion(value: unknown): void {
+function validateCompletion(value: unknown, protocol: GigaChatProtocol): void {
+	if (protocol === "v2") {
+		validateV2Completion(value);
+		return;
+	}
 	const choice =
 		object(value) && Array.isArray(value.choices)
 			? value.choices[0]
@@ -106,11 +119,46 @@ function validateCompletion(value: unknown): void {
 		!object(choice) ||
 		!object(message) ||
 		message.role !== "assistant" ||
-		(message.content !== null && typeof message.content !== "string") ||
+		(message.content !== null &&
+			typeof message.content !== "string" &&
+			!(protocol === "openai" && message.content === undefined)) ||
 		(message.reasoning_content != null &&
-			typeof message.reasoning_content !== "string")
+			typeof message.reasoning_content !== "string") ||
+		(protocol === "openai" &&
+			message.reasoning != null &&
+			typeof message.reasoning !== "string")
 	)
 		throw new DiscoveryError("INVALID_RESPONSE");
+	if (protocol === "openai") {
+		const calls = message.tool_calls;
+		if (
+			(calls !== undefined &&
+				(!Array.isArray(calls) ||
+					!calls.every(
+						(call) =>
+							object(call) &&
+							typeof call.id === "string" &&
+							call.id.length > 0 &&
+							call.type === "function" &&
+							object(call.function) &&
+							typeof call.function.name === "string" &&
+							call.function.name.length > 0 &&
+							typeof call.function.arguments === "string",
+					))) ||
+			(message.content === undefined && !Array.isArray(calls))
+		)
+			throw new DiscoveryError("INVALID_RESPONSE");
+		if (
+			choice.finish_reason === "stop" ||
+			choice.finish_reason === "length" ||
+			choice.finish_reason === "content_filter" ||
+			(choice.finish_reason === "tool_calls" &&
+				Array.isArray(calls) &&
+				calls.length > 0)
+		)
+			return;
+		throw new DiscoveryError("INVALID_RESPONSE");
+	}
 	if (choice.finish_reason === "stop" || choice.finish_reason === "length")
 		return;
 	if (
@@ -125,6 +173,49 @@ function validateCompletion(value: unknown): void {
 	throw new DiscoveryError("INVALID_RESPONSE");
 }
 
+function validateV2Completion(value: unknown): void {
+	if (
+		!object(value) ||
+		!Array.isArray(value.messages) ||
+		value.messages.length === 0
+	)
+		throw new DiscoveryError("INVALID_RESPONSE");
+	let assistant = false;
+	let calls = 0;
+	for (const message of value.messages) {
+		if (
+			!object(message) ||
+			!["assistant", "reasoning"].includes(String(message.role)) ||
+			!Array.isArray(message.content)
+		)
+			throw new DiscoveryError("INVALID_RESPONSE");
+		assistant ||= message.role === "assistant";
+		for (const part of message.content) {
+			if (!object(part)) throw new DiscoveryError("INVALID_RESPONSE");
+			if (typeof part.text === "string") continue;
+			const call = part.function_call;
+			if (
+				message.role !== "assistant" ||
+				!object(call) ||
+				typeof call.name !== "string" ||
+				call.name.length === 0 ||
+				!(typeof call.arguments === "string" || object(call.arguments))
+			)
+				throw new DiscoveryError("INVALID_RESPONSE");
+			calls++;
+		}
+	}
+	if (
+		!assistant ||
+		!(
+			value.finish_reason === "stop" ||
+			value.finish_reason === "length" ||
+			(value.finish_reason === "function_call" && calls > 0)
+		)
+	)
+		throw new DiscoveryError("INVALID_RESPONSE");
+}
+
 /** Enumerate the catalog, then check each exact ID with up to three paid probes. */
 export async function discoverModels(
 	baseUrl: string,
@@ -132,12 +223,31 @@ export async function discoverModels(
 	options: DiscoveryOptions,
 ): Promise<ModelProbe[]> {
 	options.signal.throwIfAborted();
+	const protocol = options.protocol === undefined ? "v1" : options.protocol;
+	if (protocol !== "v1" && protocol !== "v2" && protocol !== "openai")
+		throw new DiscoveryError("INVALID_PROTOCOL");
 	let root: string;
+	let modelsUrl: string;
 	try {
 		root = normalizeBaseUrl(baseUrl);
+		modelsUrl =
+			options.modelsUrl === undefined
+				? defaultModelsUrl(root, protocol)
+				: options.modelsUrl;
+		if (!["http:", "https:"].includes(new URL(modelsUrl).protocol))
+			throw new DiscoveryError("INVALID_URL");
 	} catch {
 		throw new DiscoveryError("INVALID_URL");
 	}
+	// Reject both URLs before making even the first request with a client certificate.
+	if (
+		options.mtls &&
+		(new URL(root).protocol !== "https:" ||
+			new URL(modelsUrl).protocol !== "https:")
+	)
+		throw new GigaChatMtlsError(
+			"GigaChat certificate authorization requires HTTPS for generation and the model catalog.",
+		);
 	const headers = new Headers({ "Content-Type": "application/json" });
 	if (!options.mtls) headers.set("Authorization", `Bearer ${apiKey}`);
 	const transport = {
@@ -146,27 +256,34 @@ export async function discoverModels(
 		mtls: options.mtls,
 	};
 	const models = await request(
-		`${root}/models`,
+		modelsUrl,
 		{ method: "GET", headers },
 		transport,
-		async (response) => catalog(await readJson(response)),
+		async (response) => catalog(await readJson(response), protocol),
 	);
 	options.signal.throwIfAborted();
 	const probeTransport = { ...transport, timeoutMs: 5000 };
 	const consumeProbe = async (response: Response) =>
-		validateCompletion(await readJson(response));
-	const probes: ModelProbe[] = [];
+		validateCompletion(await readJson(response), protocol);
+	let completed = 0;
 	options.progress?.(0, models.length);
-	for (const model of models) {
+	const probeModel = async (model: ConnectionModel): Promise<ModelProbe> => {
 		options.signal.throwIfAborted();
-		const probe = await serial<ModelProbe>(options.signal, async () => {
+		const work = async (): Promise<ModelProbe> => {
 			const init = {
 				method: "POST",
 				headers,
 				body: JSON.stringify({
 					model: model.id,
-					messages: [{ role: "user", content: "Hi" }],
-					max_tokens: 1,
+					messages: [
+						{
+							role: "user",
+							content: protocol === "v2" ? [{ text: "Hi" }] : "Hi",
+						},
+					],
+					...(protocol === "v2"
+						? { model_options: { max_tokens: 1 } }
+						: { max_tokens: 1 }),
 					stream: false,
 				}),
 			};
@@ -189,11 +306,18 @@ export async function discoverModels(
 						};
 				}
 			}
-		});
+		};
+		const probe = await (protocol === "openai"
+			? work()
+			: serial(options.signal, work));
 		options.signal.throwIfAborted();
-		probes.push(probe);
-		options.progress?.(probes.length, models.length, probe);
-	}
+		options.progress?.(++completed, models.length, probe);
+		return probe;
+	};
+	const probes: ModelProbe[] = [];
+	if (protocol === "openai")
+		probes.push(...(await Promise.all(models.map(probeModel))));
+	else for (const model of models) probes.push(await probeModel(model));
 	options.signal.throwIfAborted();
 	return probes;
 }

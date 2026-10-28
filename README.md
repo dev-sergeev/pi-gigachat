@@ -19,8 +19,21 @@ The package has no built-in models and does not change Pi's saved default
 provider or model. Use `/gigachat` to add a server connection and select models
 from its catalog, then choose one through `/model`. The adapter supports text
 conversations, Pi tools, and JSON or SSE responses.
+Saved connections can use **GigaChat V1**, **GigaChat V2**, or
+**OpenAI-compatible Chat Completions**, with shared token, authorization-key, and
+mTLS support. The programmatic exports remain V1; protocol selection belongs to
+saved Pi connections.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
+
+## Release 0.7.3
+
+- Unified the OpenAI-compatible adapter into this package and the single `/gigachat` command.
+- Added a per-connection **Протокол API** step after authentication data, before generation/catalog addresses. V1 is the default; existing connections without a protocol remain V1.
+- Added native V2 JSON and named-SSE responses, multiple correlated Pi tool calls, and explicitly enabled `medium` reasoning.
+- Added independent full catalog URLs, protocol-specific defaults, and a consent warning before using the same authorization on another catalog origin.
+- Token, authorization-key, and mTLS authorization now apply to all three protocols. Changing protocol preserves provider identity and checks models before replacing the saved connection.
+- Preserved OpenAI concurrent requests and multiple tool calls without V1's single-tool instruction or HTTP 422 recovery. Explicit native tool choice wins over legacy options; terminal 422 failures cannot be replayed by Pi's outer retry loop.
 
 ## Release 0.7.2
 
@@ -312,32 +325,40 @@ library callers must supply their own model definitions.
 1. Run `/gigachat` and choose **Токен** (access token),
    **Авторизационный ключ** (renewable authorization key), or
    **Сертификаты (mTLS)** ([certificate setup](#certificates-mtls)).
-2. Enter a connection name and the API root URL. Token and authorization-key
-   modes accept their secret in a masked field.
-   Authorization-key mode also accepts the token endpoint URL. For a nonstandard
-   API server this URL is required; the standard server uses its usual endpoint
-   when the field is empty. **Ctrl+O** exposes the scope setting:
-   `GIGACHAT_API_PERS` by default, or `GIGACHAT_API_B2B` / `GIGACHAT_API_CORP`.
-   This wizard accepts an authorization key, not a username/password pair.
-3. The extension reads `GET <API URL>/models`, removes duplicate Model IDs within
-   this connection, and checks each unique model sequentially with a simple
-   non-streaming generation using `max_tokens: 1`. Each model gets up to three
+2. Enter a connection name and authentication data. Token and authorization-key
+   modes accept their secret in a masked field. Authorization-key mode also
+   accepts the token endpoint URL; it is required for a nonstandard API server.
+   The standard server uses its usual endpoint when this field is empty.
+   **Ctrl+O** exposes the scope setting: `GIGACHAT_API_PERS` by default, or
+   `GIGACHAT_API_B2B` / `GIGACHAT_API_CORP`. This wizard accepts an authorization
+   key, not a username/password pair.
+3. Choose **Протокол API**: **GigaChat V1**, **GigaChat V2**, or
+   **OpenAI-compatible**. V1 is preselected for a new connection; editing
+   preselects the connection's saved protocol.
+4. Enter the generation API root and, optionally, a full model-catalog URL.
+   Leave the catalog field empty for the selected protocol's default below.
+   Generation appends `/chat/completions` to its root; an explicit catalog URL
+   is used as entered, without appending any path.
+5. The extension obtains authorization, reads the catalog, removes duplicate
+   Model IDs within this connection, and checks each unique model with a simple
+   non-streaming generation using a one-token output budget. V1/V2 probes are
+   sequential; OpenAI probes can run concurrently. Each model gets up to three
    attempts, stopping on the first valid response. Every attempt has a fixed
    five-second timeout covering both response headers and the complete body;
    time spent waiting in the generation queue is not part of that timeout.
-4. Use **Space** to select successful models, **Ctrl+A** to select all successful
+6. Use **Space** to select successful models, **Ctrl+A** to select all successful
    models, and **Enter** to save. Failed models remain visible with a reason but
    cannot be selected. An empty successful set is never saved.
-5. Open the normal `/model` picker and select an added model. It is available
+7. Open the normal `/model` picker and select an added model. It is available
    immediately, without restarting Pi or creating a named provider manually.
 
 The discovery generations can be billed, including repeat attempts. Any failed
 probe is retried immediately without backoff or `Retry-After` waits. After three
 failures, the model is unavailable for selection in the current check; the
 displayed reason describes the last failure. Cancellation stops the active
-request and prevents further attempts. Thirty models exhausting all three
-timeouts require about 7.5 minutes of request time, excluding queue waits and
-catalog/authentication requests.
+request and prevents further attempts. For sequential V1/V2 probes, thirty
+models exhausting all three timeouts require about 7.5 minutes of request time,
+excluding queue waits and catalog/authentication requests.
 
 A one-token output budget does not prove tool compatibility, reasoning support,
 or the server's maximum output budget. Failed checks do not replace an existing
@@ -408,6 +429,43 @@ connection setup or authorization. The server must be reachable and its TLS
 certificate trusted. Token and authorization-key connections use the existing
 [certificate settings](#certificates-and-proxy); mTLS connections use their
 imported CA bundle. The existing proxy settings apply to all three modes.
+
+### Protocols and model catalogs
+
+| Protocol | Default generation root | Default catalog URL |
+| --- | --- | --- |
+| GigaChat V1 | `https://api.giga.chat/v1` | `<generation root>/models` |
+| GigaChat V2 | `https://api.giga.chat/v2` | `/v1/models` at the generation origin |
+| OpenAI-compatible | `https://api.giga.chat/v1` | `/gc/models` at the generation origin |
+
+Use the URL of your OpenAI-compatible gateway in OpenAI mode: a preset does not
+guarantee that a particular server implements that protocol. Catalog and chat
+endpoints may use different paths or origins. An explicitly configured
+cross-origin catalog requires confirmation before requests, because it uses the
+same access token or client certificate as generation. For mTLS both addresses
+must use HTTPS and the imported CA bundle.
+
+Changing protocol without renaming keeps the provider ID and does not rewrite
+saved sessions. Only standard generation presets are changed automatically;
+custom generation roots and explicit catalog URLs are retained for review.
+Protocol or catalog changes trigger discovery and generation checks before the
+new connection replaces the old one. Cancelling or failing those checks leaves
+the saved connection unchanged.
+
+V2 preserves native multiple tool calls, including repeated calls to the same
+Pi tool with distinct call IDs and correlated results. JSON and named SSE are
+supported; JSON remains the default. V2 reasoning is **off by default** and must
+be enabled explicitly under **Параметры моделей** for a supporting model/server.
+Its supported controls are **off / medium**, not the V1/OpenAI level set.
+Files, multimodal uploads and GigaChat's built-in image/3D tools are not added.
+
+When migrating from `pi-gigachat-openai`, disable that separate extension before
+loading this package: both use the same saved provider namespace. Every legacy
+record without a protocol is interpreted as V1, including records created by
+the old OpenAI package. Edit those connections through `/gigachat` and select
+**OpenAI-compatible** before using them; saved IDs, credentials and explicit
+catalog URLs are retained.
+
 
 ### Certificates (mTLS)
 

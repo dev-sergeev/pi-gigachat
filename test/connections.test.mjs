@@ -14,6 +14,7 @@ const signal = () => new AbortController().signal;
 const interaction = () => ({ signal: signal(), prompt: async () => { throw new Error('Unexpected native secret prompt'); }, notify() {} });
 const connection = (id, baseUrl, changes = {}) => ({
   id: 'gigachat-' + id, revision: 'revision-1', name: id, baseUrl,
+  protocol: 'v1',
   authorization: { type: 'token' },
   models: [{ id: 'shared-model', name: 'Shared model', contextWindow: 32000, maxTokens: 1000, reasoning: false }],
   ...changes,
@@ -58,6 +59,99 @@ test('new case-sensitive provider IDs and unchanged legacy names restore without
     const saved = JSON.parse(await readFile(authPath, 'utf8'));
     for (const [id, credential] of Object.entries(unrelated)) assert.deepEqual(saved[id], credential);
   }));
+});
+
+test('legacy connections remain V1 without rewriting storage and normalize only when edited', async () => {
+  await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
+    const legacy = connection('legacy-protocol', baseUrl, { modelsUrl: baseUrl + '/old-openai-catalog' });
+    delete legacy.protocol;
+    const credential = { type: 'api_key', env: { GIGACHAT_ACCESS_TOKEN: 'legacy-token' }, gigachatConnection: legacy };
+    const before = JSON.stringify({ [legacy.id]: credential });
+    await writeFile(authPath, before);
+    const store = new ConnectionStore(authPath);
+    const restored = await store.list();
+    assert.deepEqual(restored, [credential]);
+    assert.equal(await readFile(authPath, 'utf8'), before);
+    const models = await runtime(authPath, [restored[0].gigachatConnection]);
+    assert.equal(models.getModel(legacy.id, 'shared-model').api, 'gigachat-extension-api');
+    successful(await send(models, legacy));
+    assert.equal(typeof requests[0].body.messages[0].content, 'string');
+    assert.equal(requests[0].body.functions, undefined);
+    const edited = await prepareConnectionCredential({ ...legacy, revision: 'edited' }, 'legacy-token', signal(), credential);
+    await store.save(edited, interaction(), legacy.id);
+    assert.equal((await store.list())[0].gigachatConnection.protocol, 'v1');
+    assert.equal((await store.list())[0].gigachatConnection.id, legacy.id);
+  }));
+});
+
+test('invalid protocols, explicit catalogs and insecure mTLS endpoints cannot replace a saved connection', async () => {
+  await withStorage(async authPath => {
+    const original = connection('valid', 'https://example.invalid/v1');
+    const store = new ConnectionStore(authPath);
+    const credential = await prepareConnectionCredential(original, 'original-token', signal());
+    await store.save(credential, interaction());
+    const before = await readFile(authPath, 'utf8');
+    const materials = { ca: 'synthetic-ca', cert: 'synthetic-cert', key: 'synthetic-key' };
+    for (const invalid of [
+      { protocol: 'unknown' },
+      { modelsUrl: 'file:///models' },
+      { modelsUrl: '' },
+      { authorization: { type: 'mtls', materials }, modelsUrl: 'http://catalog.invalid/models' },
+      { authorization: { type: 'mtls', materials }, baseUrl: 'http://generation.invalid/v2', protocol: 'v2' },
+    ]) {
+      const changed = { ...original, revision: 'invalid-edit', ...invalid };
+      await assert.rejects(prepareConnectionCredential(changed, 'replacement-token', signal(), credential));
+      await assert.rejects(store.save({ ...credential, gigachatConnection: changed }, interaction(), original.id));
+      assert.equal(await readFile(authPath, 'utf8'), before);
+    }
+  });
+});
+
+test('changing protocol keeps provider identity, routes each native API and rejects stale history model handles', async () => {
+  await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
+    const store = new ConnectionStore(authPath);
+    const entry = connection('protocol-edit', baseUrl);
+    let previous;
+    let oldRuntime;
+    for (const [index, protocol] of ['v1', 'openai', 'v2'].entries()) {
+      const changed = { ...entry, protocol, revision: 'protocol-' + index,
+        baseUrl: protocol === 'v2' ? baseUrl.replace('/v1', '/v2') : baseUrl,
+        models: entry.models.map(model => protocol === 'v2' ? { ...model, reasoning: true,
+          thinkingLevelMap: { off: 'off', low: 'low', medium: 'medium', high: 'high' } } : model) };
+      const credential = await prepareConnectionCredential(changed, 'token-' + protocol, signal(), previous);
+      await store.save(credential, interaction(), previous ? entry.id : undefined);
+      if (oldRuntime) {
+        const count = requests.length;
+        const stale = await send(oldRuntime, entry);
+        assert.equal(stale.stopReason, 'error');
+        assert.equal(requests.length, count);
+      }
+      const models = await runtime(authPath, [changed]);
+      assert.equal(models.getModel(entry.id, 'shared-model').api,
+        { v1: 'gigachat-extension-api', v2: 'gigachat-v2-extension-api', openai: 'openai-completions' }[protocol]);
+      if (protocol === 'v2') assert.deepEqual(models.getModel(entry.id, 'shared-model').thinkingLevelMap,
+        { off: 'off', minimal: null, low: null, medium: 'medium', high: null, xhigh: null, max: null });
+      successful(await send(models, changed, 'shared-model', {
+        ...(protocol === 'v2' ? { reasoning: 'medium' } : {}),
+        env: { GIGACHAT_BASE_URL: 'http://invalid.example', GIGACHAT_ACCESS_TOKEN: 'unrelated', GIGACHAT_EXTRA_BODY: '{"model":"wrong"}' },
+      }));
+      assert.equal((await store.list())[0].gigachatConnection.id, entry.id);
+      previous = credential;
+      oldRuntime = models;
+    }
+    assert.deepEqual(requests.map(request => request.url),
+      ['/v1/chat/completions', '/v1/chat/completions', '/v2/chat/completions']);
+    assert.deepEqual(requests.map(request => request.headers.authorization),
+      ['Bearer token-v1', 'Bearer token-openai', 'Bearer token-v2']);
+    assert.deepEqual(requests.map(request => request.body.model), ['shared-model', 'shared-model', 'shared-model']);
+    assert.equal(typeof requests[0].body.messages.at(-1).content, 'string');
+    assert.equal(typeof requests[1].body.messages.at(-1).content, 'string');
+    assert.deepEqual(requests[2].body.messages.at(-1).content, [{ text: 'Hello' }]);
+    assert.equal(requests[2].body.model_options.reasoning.effort, 'medium');
+  }, (request, res) => json(res, request.url.startsWith('/v2/')
+    ? { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop',
+      usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 } }
+    : completion())));
 });
 
 test('occupied IDs reject new and renamed connections without overwriting any credential', async () => {
@@ -135,15 +229,18 @@ test('rename replaces the old credential and restores only the new provider iden
   });
 });
 
-test('failure saving a renamed credential leaves the original credential usable', async t => {
+for (const edit of ['rename', 'protocol']) {
+test(`failure saving a ${edit} edit leaves the original credential usable`, async t => {
   await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
     const store = new ConnectionStore(authPath);
     const original = connection('original', baseUrl);
-    const renamed = { ...original, id: 'gigachat-LDBR', name: 'LDBR', revision: 'renamed-revision' };
+    const changed = edit === 'rename'
+      ? { ...original, id: 'gigachat-LDBR', name: 'LDBR', revision: 'renamed-revision' }
+      : { ...original, protocol: 'v2', revision: 'protocol-revision' };
     const prior = await prepareConnectionCredential(original, 'original-token', signal());
     await store.save(prior, interaction());
     const before = await readFile(authPath, 'utf8');
-    const next = await prepareConnectionCredential(renamed, 'renamed-token', signal(), prior);
+    const next = await prepareConnectionCredential(changed, 'replacement-token', signal(), prior);
     let attempted = false;
     t.mock.method(ModelRuntime.prototype, 'login', async () => {
       attempted = true;
@@ -158,6 +255,7 @@ test('failure saving a renamed credential leaves the original credential usable'
     assert.equal(requests[0].headers.authorization, 'Bearer original-token');
   }));
 });
+}
 
 // All requests cross native credential storage and provider dispatch, not a mock auth adapter.
 test('same named server and Model ID remain independent across native save and restart', async () => {

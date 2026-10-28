@@ -153,6 +153,7 @@ export async function request<T>(
 		mtls?: MtlsMaterials;
 		canRetry?: () => boolean;
 		recover422?: (init: RequestInit) => RequestInit;
+		retry422?: boolean;
 	},
 	consume: (response: Response) => Promise<T>,
 	observe?: (response: Response) => void | Promise<void>,
@@ -231,13 +232,18 @@ export async function request<T>(
 				if (signal.aborted) throw signal.reason;
 				const error = attemptSignal.aborted ? attemptSignal.reason : caught;
 				const recover422 =
-					error instanceof GigaChatHttpError && error.status === 422
+					error instanceof GigaChatHttpError &&
+					error.status === 422 &&
+					options.retry422 !== false
 						? options.recover422
 						: undefined;
 				if (
 					maxRetries === 0 ||
 					observing ||
 					options.canRetry?.() === false ||
+					(error instanceof GigaChatHttpError &&
+						error.status === 422 &&
+						options.retry422 === false) ||
 					(!recover422 && !transient(error))
 				) {
 					if (
@@ -268,6 +274,12 @@ export async function request<T>(
 							`GigaChat connection failed: ${error.cause.message}`,
 							{ cause: error },
 						);
+					if (
+						error instanceof GigaChatHttpError &&
+						error.status === 422 &&
+						options.retry422 === false
+					)
+						throw retryFailure(error, "HTTP 422 retries disabled");
 					throw error;
 				}
 				if (retries >= maxRetries)

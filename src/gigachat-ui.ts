@@ -12,6 +12,7 @@ import type {
 	Connection,
 	ConnectionCredential,
 	ConnectionModel,
+	GigaChatProtocol,
 } from "./connection-types.js";
 import {
 	CONNECTION_PROVIDER_PREFIX,
@@ -22,11 +23,12 @@ import {
 import { describeDiscoveryError, discoverModels } from "./discovery.js";
 import type { FormField } from "./gigachat-dialogs.js";
 import { chooseModels, runProgress, showForm } from "./gigachat-dialogs.js";
-import {
-	GIGACHAT_CONNECTION_DEFAULTS,
-	GIGACHAT_DEFAULT_BASE_URL,
-} from "./models.js";
 import { importMtlsMaterials } from "./mtls.js";
+import {
+	defaultModelsUrl,
+	GIGACHAT_PROTOCOLS,
+	thinkingLevelMapForProtocol,
+} from "./protocols.js";
 
 const AUTH_LABELS: Record<Connection["authorization"]["type"], string> = {
 	token: "Токен",
@@ -40,6 +42,12 @@ const authModes = Object.keys(
 const defaultTokenUrl = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
 
 class FormError extends Error {}
+
+function terminalText(value: string): string {
+	return stripVTControlCharacters(value)
+		.replace(/[\p{Cc}\p{Cf}]/gu, " ")
+		.trim();
+}
 
 export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 	const store = new ConnectionStore();
@@ -286,7 +294,9 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 			return false;
 		}
 		ctx.ui.notify(
-			`Подключение «${connection.name}» сохранено. Модели: ${connection.models.map((model) => model.id).join(", ")}. Выберите модель через /model.`,
+			terminalText(
+				`Подключение «${connection.name}» сохранено. Модели: ${connection.models.map((model) => model.id).join(", ")}. Выберите модель через /model.`,
+			),
 			"info",
 		);
 		return true;
@@ -298,6 +308,17 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		secret: string,
 		previous?: ConnectionCredential,
 	): Promise<ConnectionCredential | undefined> {
+		if (
+			draft.modelsUrl &&
+			new URL(draft.modelsUrl).origin !== new URL(draft.baseUrl).origin &&
+			!(await ctx.ui.confirm(
+				"Каталог моделей на другом сервере",
+				terminalText(
+					`Каталог ${new URL(draft.modelsUrl).origin} и генерация ${new URL(draft.baseUrl).origin} используют одну авторизацию. ${draft.authorization.type === "mtls" ? "Клиентский сертификат будет предъявлен" : "Токен доступа будет отправлен"} также серверу каталога. Продолжайте только если доверяете обоим серверам.`,
+				),
+			))
+		)
+			return undefined;
 		const checked = await runProgress(
 			ctx,
 			"Проверка подключения GigaChat",
@@ -319,6 +340,8 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						: (credential.env?.GIGACHAT_ACCESS_TOKEN ?? "");
 				const probes = await discoverModels(draft.baseUrl, token, {
 					signal,
+					protocol: draft.protocol,
+					modelsUrl: draft.modelsUrl,
 					mtls:
 						draft.authorization.type === "mtls"
 							? draft.authorization.materials
@@ -341,11 +364,15 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				"Нет успешно проверенных моделей. Подключение не сохранено.",
 			);
 		}
-		const models = await chooseModels(
-			ctx,
-			checked.value.probes,
-			previous?.gigachatConnection.models,
+		const switchingToV2 =
+			draft.protocol === "v2" &&
+			(previous?.gigachatConnection.protocol ?? "v1") !== "v2";
+		const initialModels = previous?.gigachatConnection.models.map((model) =>
+			switchingToV2
+				? { ...model, reasoning: false, thinkingLevelMap: undefined }
+				: model,
 		);
+		const models = await chooseModels(ctx, checked.value.probes, initialModels);
 		if (!models) return undefined;
 		checked.value.credential.gigachatConnection.models = models;
 		return checked.value.credential;
@@ -361,9 +388,11 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 			previous?.type === "oauth"
 				? previous.refresh
 				: (previous?.env?.GIGACHAT_ACCESS_TOKEN ?? "");
+		let protocol: GigaChatProtocol = old?.protocol ?? "v1";
 		let values: Record<string, string> = {
 			name: old?.name ?? "",
-			url: old?.baseUrl ?? "",
+			url: old?.baseUrl ?? GIGACHAT_PROTOCOLS[protocol].baseUrl,
+			modelsUrl: old?.modelsUrl ?? "",
 			tokenUrl:
 				old?.authorization.type === "credentials"
 					? old.authorization.tokenUrl
@@ -385,12 +414,6 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					label: "Название подключения",
 					value: values.name,
 					placeholder: "LDBR",
-				},
-				{
-					id: "url",
-					label: "API URL (корень, без /models и /chat/completions)",
-					value: values.url,
-					placeholder: GIGACHAT_DEFAULT_BASE_URL,
 				},
 			];
 			if (mode === "credentials")
@@ -452,9 +475,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 			if (!entered) return;
 			values = { ...values, ...entered };
 			try {
-				const name = stripVTControlCharacters(values.name)
-					.replace(/[\p{Cc}\p{Cf}]/gu, " ")
-					.trim();
+				const name = terminalText(values.name);
 				if (!name) throw new FormError("Укажите название подключения.");
 				const renamed = !old || name !== old.name;
 				if (renamed && !/^[A-Za-z0-9_-]+$/.test(values.name))
@@ -467,31 +488,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						`Идентификатор провайдера «${id}» уже занят. Выберите другое название подключения.`,
 					);
 				await store.assertAvailable(id, old?.id);
-				const url = baseUrl(values.url.trim() || GIGACHAT_DEFAULT_BASE_URL);
-				if (mode === "mtls" && new URL(url).protocol !== "https:")
-					throw new FormError("Для mTLS API URL должен использовать HTTPS.");
-				const tokenUrl =
-					mode === "credentials"
-						? values.tokenUrl.trim() ||
-							(url === GIGACHAT_DEFAULT_BASE_URL ? defaultTokenUrl : "")
-						: "";
-				if (mode === "credentials" && !tokenUrl)
-					throw new FormError(
-						"Для нестандартного сервера укажите URL получения токенов.",
-					);
 				let authorization: Connection["authorization"] = { type: "token" };
-				if (mode === "credentials") {
-					const endpoint = new URL(tokenUrl);
-					if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:")
-						throw new FormError(
-							"URL получения токенов должен использовать HTTP или HTTPS.",
-						);
-					authorization = {
-						type: "credentials",
-						tokenUrl: endpoint.href,
-						scope: values.scope,
-					};
-				}
 				if (mode === "mtls") {
 					const paths = {
 						caPath: values.caPath.trim(),
@@ -544,11 +541,97 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 						authorization = { type: "mtls", materials: imported.value };
 					}
 				}
+				const secret =
+					values.secret.trim() ||
+					(old?.authorization.type === mode ? oldSecret : "");
+				if (mode !== "mtls" && !secret)
+					throw new FormError("Введите секрет выбранного способа авторизации.");
+				const protocols: GigaChatProtocol[] = [
+					protocol,
+					...(["v1", "v2", "openai"] as const).filter(
+						(candidate) => candidate !== protocol,
+					),
+				];
+				const selected = await ctx.ui.select(
+					"Протокол API",
+					protocols.map((candidate) => GIGACHAT_PROTOCOLS[candidate].label),
+				);
+				const nextProtocol = protocols.find(
+					(candidate) => GIGACHAT_PROTOCOLS[candidate].label === selected,
+				);
+				if (!nextProtocol) return;
+				if (
+					nextProtocol !== protocol &&
+					(values.url.trim() || GIGACHAT_PROTOCOLS[protocol].baseUrl).replace(
+						/\/+$/,
+						"",
+					) === GIGACHAT_PROTOCOLS[protocol].baseUrl
+				)
+					values.url = GIGACHAT_PROTOCOLS[nextProtocol].baseUrl;
+				protocol = nextProtocol;
+				const endpoints = await showForm(
+					ctx,
+					`Адреса · ${GIGACHAT_PROTOCOLS[protocol].label}`,
+					[
+						{
+							id: "url",
+							label: "Основной endpoint (корень, без /chat/completions)",
+							value: values.url,
+							placeholder: GIGACHAT_PROTOCOLS[protocol].baseUrl,
+						},
+						{
+							id: "modelsUrl",
+							label: "Полный URL каталога (пусто — по протоколу)",
+							value: values.modelsUrl,
+							placeholder:
+								"Пусто — каталог на сервере основного endpoint по выбранному протоколу",
+						},
+					],
+				);
+				if (!endpoints) return;
+				values = { ...values, ...endpoints };
+				const url = baseUrl(
+					values.url.trim() || GIGACHAT_PROTOCOLS[protocol].baseUrl,
+				);
+				const modelsUrl = values.modelsUrl.trim() || undefined;
+				const catalog = new URL(modelsUrl ?? defaultModelsUrl(url, protocol));
+				if (!["https:", "http:"].includes(catalog.protocol))
+					throw new FormError(
+						"URL каталога моделей должен использовать HTTP или HTTPS.",
+					);
+				if (
+					mode === "mtls" &&
+					(new URL(url).protocol !== "https:" || catalog.protocol !== "https:")
+				)
+					throw new FormError(
+						"Для mTLS основной endpoint и каталог должны использовать HTTPS.",
+					);
+				if (mode === "credentials") {
+					const preset = url === GIGACHAT_PROTOCOLS[protocol].baseUrl;
+					const tokenUrl =
+						values.tokenUrl.trim() || (preset ? defaultTokenUrl : "");
+					if (!tokenUrl)
+						throw new FormError(
+							"Для нестандартного сервера укажите URL получения токенов.",
+						);
+					const endpoint = new URL(tokenUrl);
+					if (!["https:", "http:"].includes(endpoint.protocol))
+						throw new FormError(
+							"URL получения токенов должен использовать HTTP или HTTPS.",
+						);
+					authorization = {
+						type: "credentials",
+						tokenUrl: endpoint.href,
+						scope: values.scope,
+					};
+				}
 				const draft: Connection = {
 					id,
 					revision: randomBytes(12).toString("hex"),
 					name,
 					baseUrl: url,
+					protocol,
+					modelsUrl,
 					authorization,
 					models: old?.models ?? [],
 				};
@@ -564,19 +647,14 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				const changedEndpointOrSecret =
 					!old ||
 					old.baseUrl !== draft.baseUrl ||
+					(old.protocol ?? "v1") !== draft.protocol ||
+					old.modelsUrl !== draft.modelsUrl ||
 					!sameAuthorization ||
 					Boolean(values.secret.trim());
 				let credential: ConnectionCredential | undefined;
 				if (previous && !changedEndpointOrSecret && !renamed)
 					credential = { ...previous, gigachatConnection: draft };
 				else {
-					const secret =
-						values.secret.trim() ||
-						(old?.authorization.type === mode ? oldSecret : "");
-					if (mode !== "mtls" && !secret)
-						throw new FormError(
-							"Введите секрет выбранного способа авторизации.",
-						);
 					credential = await verifyAndChoose(
 						ctx,
 						draft,
@@ -608,8 +686,8 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		record: ConnectionCredential,
 	): Promise<void> {
 		const connection = record.gigachatConnection;
-		const labels = connection.models.map(
-			(model) => `${model.id} — ${model.name}`,
+		const labels = connection.models.map((model) =>
+			terminalText(`${model.id} — ${model.name}`),
 		);
 		const selected = await ctx.ui.select("Параметры модели", labels);
 		const index = labels.indexOf(selected ?? "");
@@ -623,21 +701,28 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 			reasoning: model.reasoning ? "Поддерживается" : "Не поддерживается",
 		};
 		for (;;) {
-			const entered = await showForm(ctx, `Параметры · ${model.id}`, [
-				{ id: "context", label: "Лимит контекста", value: values.context },
-				{ id: "output", label: "Лимит ответа", value: values.output },
-				{
-					id: "temperature",
-					label: "Температура (пусто — по умолчанию)",
-					value: values.temperature,
-				},
-				{
-					id: "reasoning",
-					label: "Reasoning",
-					value: values.reasoning,
-					choices: ["Поддерживается", "Не поддерживается"],
-				},
-			]);
+			const entered = await showForm(
+				ctx,
+				terminalText(`Параметры · ${model.id}`),
+				[
+					{ id: "context", label: "Лимит контекста", value: values.context },
+					{ id: "output", label: "Лимит ответа", value: values.output },
+					{
+						id: "temperature",
+						label: "Температура (пусто — по умолчанию)",
+						value: values.temperature,
+					},
+					{
+						id: "reasoning",
+						label:
+							connection.protocol === "v2"
+								? "Reasoning (явное включение, только medium)"
+								: "Reasoning",
+						value: values.reasoning,
+						choices: ["Поддерживается", "Не поддерживается"],
+					},
+				],
+			);
 			if (!entered) return;
 			values = {
 				context: entered.context,
@@ -681,8 +766,10 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				temperature,
 				reasoning,
 				thinkingLevelMap: reasoning
-					? (model.thinkingLevelMap ??
-						GIGACHAT_CONNECTION_DEFAULTS.thinkingLevelMap)
+					? connection.protocol === "v2"
+						? thinkingLevelMapForProtocol("v2")
+						: (model.thinkingLevelMap ??
+							thinkingLevelMapForProtocol(connection.protocol ?? "v1"))
 					: undefined,
 			};
 			const models = connection.models.slice();
@@ -704,21 +791,25 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		const labels: string[] = [];
 		for (const record of records) {
 			const connection = record.gigachatConnection;
-			const label = `${connection.name} · ${connection.baseUrl}`;
+			const label = terminalText(
+				`${connection.name} · ${GIGACHAT_PROTOCOLS[connection.protocol ?? "v1"].label} · ${connection.baseUrl}`,
+			);
 			labels.push(label);
 			counts.set(label, (counts.get(label) ?? 0) + 1);
 		}
 		for (let index = 0; index < labels.length; index++) {
 			if (counts.get(labels[index]) !== 1)
 				labels[index] +=
-					` · #${records[index].gigachatConnection.id.slice(CONNECTION_PROVIDER_PREFIX.length)}`;
+					` · #${terminalText(records[index].gigachatConnection.id.slice(CONNECTION_PROVIDER_PREFIX.length))}`;
 		}
 		const selected = await ctx.ui.select("Подключения GigaChat", labels);
 		const record = records[labels.indexOf(selected ?? "")];
 		if (!record) return;
 		const connection = record.gigachatConnection;
 		const action = await ctx.ui.select(
-			`«${connection.name}» · ${connection.models.length} моделей`,
+			terminalText(
+				`«${connection.name}» · ${GIGACHAT_PROTOCOLS[connection.protocol ?? "v1"].label} · ${connection.models.length} моделей`,
+			),
 			[
 				"Изменить подключение",
 				"Обновить каталог и выбор моделей",
@@ -763,7 +854,9 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 			if (
 				!(await ctx.ui.confirm(
 					"Удалить подключение?",
-					`«${connection.name}»: будут удалены секрет и все ${connection.models.length} модели. Активная операция этого подключения будет прервана. Другой сервер автоматически не выбирается.`,
+					terminalText(
+						`«${connection.name}»: будут удалены секрет и все ${connection.models.length} модели. Активная операция этого подключения будет прервана. Другой сервер автоматически не выбирается.`,
+					),
 				))
 			)
 				return;
@@ -787,7 +880,9 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				ctx.ui.notify(describeDiscoveryError(result.error), "error");
 			else if (result)
 				ctx.ui.notify(
-					`Подключение «${connection.name}» удалено. Если его модель была выбрана, выберите или добавьте другую через /model или /gigachat.`,
+					terminalText(
+						`Подключение «${connection.name}» удалено. Если его модель была выбрана, выберите или добавьте другую через /model или /gigachat.`,
+					),
 					"info",
 				);
 		}

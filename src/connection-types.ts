@@ -4,6 +4,8 @@ import type {
 	ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 
+export type GigaChatProtocol = "v1" | "v2" | "openai";
+
 export interface ConnectionModel {
 	id: string;
 	name: string;
@@ -28,6 +30,10 @@ export interface Connection {
 	revision: string;
 	name: string;
 	baseUrl: string;
+	/** Legacy connections without a protocol use GigaChat V1. */
+	protocol?: GigaChatProtocol;
+	/** Explicit full catalog URL; omission selects the protocol default. */
+	modelsUrl?: string;
 	authorization:
 		| { type: "token" }
 		| { type: "credentials"; tokenUrl: string; scope: string }
@@ -48,6 +54,8 @@ export interface ModelProbe {
 
 export interface DiscoveryOptions {
 	signal: AbortSignal;
+	protocol?: GigaChatProtocol;
+	modelsUrl?: string;
 	mtls?: MtlsMaterials;
 	progress?: (completed: number, total: number, probe?: ModelProbe) => void;
 }
