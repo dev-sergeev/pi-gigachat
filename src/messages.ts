@@ -11,9 +11,21 @@ import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 
 export const STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
+
+export function reasoningInContent(
+	env: Record<string, string | undefined>,
+): boolean {
+	const mode = env.GIGACHAT_REASONING_IN_CONTENT ?? "false";
+	if (mode !== "true" && mode !== "false")
+		throw new Error("GIGACHAT_REASONING_IN_CONTENT must be true or false");
+	return mode === "true";
+}
+
 interface GigaChatMessage {
 	role: "system" | "user" | "assistant" | "function";
 	content: string;
+	reasoning_content?: string;
+	reasoning?: string;
 	name?: string;
 	function_call?: { name: string; arguments: Record<string, unknown> };
 }
@@ -22,6 +34,7 @@ export function convertMessages(
 	model: Model<Api>,
 	context: TranscriptContext,
 	additionalSystemPrompt?: string,
+	inContent = false,
 ): GigaChatMessage[] {
 	const messages: GigaChatMessage[] = [];
 	const transformedMessages = transformMessages(
@@ -70,16 +83,28 @@ export function convertMessages(
 				(item): item is ThinkingContent =>
 					item.type === "thinking" && !item.redacted,
 			);
-			const reasoningText = thinking.map((item) => item.thinking).join("");
+			const reasoningText = inContent
+				? thinking.map((item) => item.thinking).join("")
+				: "";
 			const text = message.content
 				.filter((item) => item.type === "text")
 				.map((item) => sanitizeSurrogates(item.text))
 				.join("");
 			// Only change the outgoing representation; Pi's stored thinking stays
 			// separate so repeated sends never modify or duplicate history.
-			const content = reasoningText
-				? `${sanitizeSurrogates(reasoningText)}${text ? `\n\n${text}` : ""}`
-				: text;
+			const content =
+				inContent && reasoningText
+					? `${sanitizeSurrogates(reasoningText)}${text ? `\n\n${text}` : ""}`
+					: text;
+			const native: { reasoning_content?: string; reasoning?: string } = {};
+			if (!inContent) {
+				for (const item of thinking) {
+					const field = item.thinkingSignature;
+					if (field === "reasoning_content" || field === "reasoning")
+						native[field] =
+							(native[field] ?? "") + sanitizeSurrogates(item.thinking);
+				}
+			}
 			const toolCalls = message.content.filter(
 				(item) => item.type === "toolCall",
 			) as ToolCall[];
@@ -96,6 +121,7 @@ export function convertMessages(
 					messages.push({
 						role: "assistant",
 						content: callIndex === 0 ? content : "",
+						...(callIndex === 0 ? native : {}),
 						function_call: { name: call.name, arguments: call.arguments },
 					});
 					const result = results.get(call.id);
@@ -116,6 +142,7 @@ export function convertMessages(
 				messages.push({
 					role: "assistant",
 					content,
+					...native,
 				});
 			}
 			continue;

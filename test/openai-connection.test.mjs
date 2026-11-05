@@ -54,7 +54,8 @@ for (const streaming of [false, true]) for (const authorization of ['token', 'cr
         for await (const event of stream) events.push(event.type);
         const first = await stream.result();
         assert.equal(first.stopReason, 'toolUse', first.errorMessage);
-        assert.equal(first.content.find(block => block.type === 'thinking').thinking, thought);
+        assert.deepEqual(first.content.find(block => block.type === 'thinking'),
+          { type: 'thinking', thinking: thought, thinkingSignature: 'reasoning_content' });
         const calls = first.content.filter(block => block.type === 'toolCall');
         assert.deepEqual(calls.map(({ id, name, arguments: value }) => ({ id, name, value })), [
           { id: 'read-first', name: 'read', value: args[0] }, { id: 'read-second', name: 'read', value: args[1] },
@@ -74,11 +75,12 @@ for (const streaming of [false, true]) for (const authorization of ['token', 'cr
         assert.deepEqual(chat.map(request => request.headers.authorization), Array(2).fill(authorization === 'token' ? 'Bearer saved-openai-token' : 'Bearer exchanged-openai-token'));
         const messages = chat[1].body.messages;
         assert.deepEqual(messages.map(message => message.role), ['user', 'assistant', 'tool', 'tool', 'user', 'user', 'user']);
-        assert.equal(messages[1].content, `${thought}\n\nReading both`);
+        assert.equal(messages[1].content, 'Reading both');
+        assert.equal(messages[1].reasoning_content, thought);
         assert.deepEqual(messages[1].tool_calls.map(call => call.id), ['read-first', 'read-second']);
         assert.deepEqual(messages.filter(message => message.role === 'tool').map(message => [message.tool_call_id, message.content]),
           [['read-second', 'second result'], ['read-first', 'first result']]);
-        assert(!messages.some(message => Object.hasOwn(message, 'reasoning_content')));
+        assert(!messages.some(message => Object.hasOwn(message, 'reasoning')));
       }, authorization === 'credentials' ? { authorization: { type: 'credentials', tokenUrl: baseUrl + '/oauth', scope: 'GIGACHAT_API_PERS' } } : {});
     }, (request, res, requests) => {
       if (request.url.endsWith('/oauth')) return json(res, { access_token: 'exchanged-openai-token', expires_at: Date.now() + 3600000 });
@@ -95,6 +97,192 @@ for (const streaming of [false, true]) for (const authorization of ['token', 'cr
       res.write(data(chunk({}, 'tool_calls')));
       res.end(data({ choices: [], usage }) + data('[DONE]'));
     });
+  });
+}
+
+for (const field of ['reasoning_content', 'reasoning'])
+for (const streaming of [false, true])
+for (const mode of [undefined, 'false', 'true']) {
+  test(`saved OpenAI ${field} roundtrips without changing history (stream=${streaming}, inContent=${mode ?? 'default'})`, async () => {
+    const thought = ' \nПроверка 🙂𐐀\t ';
+    const answer = ' \nAnswer 🙂\t ';
+    await withServer(async ({ baseUrl, requests }) => withSavedConnection(baseUrl, async ({ models, model }) => {
+      const env = { GIGACHAT_STREAM: String(streaming), ...(mode === undefined ? {} : { GIGACHAT_REASONING_IN_CONTENT: mode }) };
+      const stream = models.streamSimple(model, context, { env, maxRetries: 0 });
+      const thinkingEvents = [];
+      for await (const event of stream) if (event.type.startsWith('thinking')) thinkingEvents.push(event.type);
+      const first = await stream.result();
+      assert.equal(first.stopReason, 'stop', first.errorMessage);
+      assert.deepEqual(first.content, [
+        { type: 'thinking', thinking: thought, thinkingSignature: field }, { type: 'text', text: answer },
+      ]);
+      assert.deepEqual(thinkingEvents, ['thinking_start', 'thinking_delta', 'thinking_end']);
+      const history = { messages: [user('Hello'), JSON.parse(JSON.stringify(first)), user('Continue')] };
+      const saved = structuredClone(history);
+      for (const reasoning of ['off', 'high']) {
+        const next = await models.completeSimple(model, history, { env, reasoning, maxRetries: 0 });
+        assert.equal(next.stopReason, 'stop', next.errorMessage);
+        assert.deepEqual(requests.at(-1).body.messages.find(message => message.role === 'assistant'), mode === 'true'
+          ? { role: 'assistant', content: `${thought}\n\n${answer}` }
+          : { role: 'assistant', content: answer, [field]: thought });
+        assert.equal(requests.at(-1).body.reasoning_effort, reasoning, 'New generation effort must not select the replay representation');
+        assert.deepEqual(history, saved, 'Repeated wire conversion must not accumulate folded reasoning in saved history');
+      }
+      assert.equal(requests.length, 3);
+    }), (request, res, requests) => reply(request, res, requests.length === 1
+      ? completion({ role: 'assistant', content: answer, [field]: thought })
+      : completion()));
+  });
+}
+
+for (const streaming of [false, true]) {
+  test(`OpenAI mixed reasoning retains each field and block boundary (stream=${streaming})`, async () => {
+    const fragments = [
+      { reasoning_content: ' \nA🙂' }, { reasoning_content: '\t ' }, { reasoning: 'B ' },
+      { content: ' Answer ' }, { reasoning_content: 'C' }, { reasoning: ' \n\t ' }, { content: 'tail\n' },
+    ];
+    const expected = streaming ? [
+      { type: 'thinking', thinking: ' \nA🙂\t ', thinkingSignature: 'reasoning_content' },
+      { type: 'thinking', thinking: 'B ', thinkingSignature: 'reasoning' },
+      { type: 'text', text: ' Answer ' },
+      { type: 'thinking', thinking: 'C', thinkingSignature: 'reasoning_content' },
+      { type: 'thinking', thinking: ' \n\t ', thinkingSignature: 'reasoning' },
+      { type: 'text', text: 'tail\n' },
+    ] : [
+      { type: 'thinking', thinking: ' \nA🙂\t C', thinkingSignature: 'reasoning_content' },
+      { type: 'thinking', thinking: 'B  \n\t ', thinkingSignature: 'reasoning' },
+      { type: 'text', text: ' Answer tail\n' },
+    ];
+    await withServer(async ({ baseUrl, requests }) => withSavedConnection(baseUrl, async ({ models, model }) => {
+      const stream = models.streamSimple(model, context, { env: { GIGACHAT_STREAM: String(streaming) }, maxRetries: 0 });
+      const transitions = [];
+      for await (const event of stream) if (event.type === 'thinking_start' || event.type === 'thinking_end')
+        transitions.push([event.type, event.contentIndex]);
+      const first = await stream.result();
+      assert.equal(first.stopReason, 'stop', first.errorMessage);
+      assert.deepEqual(first.content, expected);
+      assert.deepEqual(transitions, streaming
+        ? [['thinking_start', 0], ['thinking_end', 0], ['thinking_start', 1], ['thinking_end', 1],
+          ['thinking_start', 3], ['thinking_end', 3], ['thinking_start', 4], ['thinking_end', 4]]
+        : [['thinking_start', 0], ['thinking_end', 0], ['thinking_start', 1], ['thinking_end', 1]]);
+      const history = { messages: [JSON.parse(JSON.stringify(first)), user('Continue')] };
+      const saved = structuredClone(history);
+      for (const mode of [undefined, 'false', 'true']) {
+        const next = await models.completeSimple(model, history, { maxRetries: 0, env: {
+          GIGACHAT_STREAM: String(streaming), ...(mode === undefined ? {} : { GIGACHAT_REASONING_IN_CONTENT: mode }),
+        } });
+        assert.equal(next.stopReason, 'stop', next.errorMessage);
+        assert.deepEqual(requests.at(-1).body.messages[0], mode === 'true'
+          ? { role: 'assistant', content: `${streaming ? ' \nA🙂\t B C \n\t ' : ' \nA🙂\t CB  \n\t '}\n\n Answer tail\n` }
+          : { role: 'assistant', content: ' Answer tail\n', reasoning_content: ' \nA🙂\t C', reasoning: 'B  \n\t ' });
+        assert.deepEqual(history, saved);
+      }
+    }), (request, res, requests) => {
+      if (requests.length > 1) return reply(request, res, completion());
+      if (!request.body.stream) return json(res, completion({ role: 'assistant',
+        reasoning_content: ' \nA🙂\t C', reasoning: 'B  \n\t ', content: ' Answer tail\n' }));
+      begin(res);
+      for (const delta of fragments) res.write(data(chunk(delta)));
+      end(res);
+    });
+  });
+}
+
+for (const mode of [undefined, 'false', 'true']) {
+  test(`OpenAI replay excludes redacted and foreign thinking without losing answers (inContent=${mode ?? 'default'})`, async () => {
+    await withServer(async ({ baseUrl, requests }) => withSavedConnection(baseUrl, async ({ models, model }) => {
+      const prior = (content, changes = {}) => ({ role: 'assistant', api: model.api, provider: model.provider,
+        model: model.id, content, stopReason: 'stop', timestamp: 0, ...changes });
+      const thinking = [
+        { type: 'thinking', thinking: 'Unsigned\n' },
+        { type: 'thinking', thinking: ' Unknown', thinkingSignature: 'unrecognized-signature' },
+        { type: 'thinking', thinking: ' Native', thinkingSignature: 'reasoning_content' },
+        { type: 'thinking', thinking: ' Other', thinkingSignature: 'reasoning' },
+        { type: 'thinking', thinking: 'REDACTED_SECRET', thinkingSignature: 'reasoning_content', redacted: true },
+        { type: 'thinking', thinking: 'REDACTED_OTHER', thinkingSignature: 'reasoning', redacted: true },
+      ];
+      const history = { messages: [
+        prior([...thinking, { type: 'text', text: ' \nAnswer\t ' }]),
+        ...[{ model: 'another-model' }, { api: 'another-api' }, { provider: 'another-provider' }]
+          .map(changes => prior([...thinking, { type: 'text', text: 'Foreign answer' }], changes)),
+        prior([{ type: 'thinking', thinking: ' \n\t ', thinkingSignature: 'reasoning' }]),
+        prior([{ type: 'thinking', thinking: 'Only thought', thinkingSignature: 'reasoning_content' }, { type: 'text', text: '' }]),
+        prior([{ type: 'thinking', thinking: 'REDACTED_ONLY', thinkingSignature: 'reasoning', redacted: true },
+          { type: 'text', text: 'Redacted answer' }]),
+        user('Continue'),
+      ] };
+      const saved = structuredClone(history);
+      const result = await models.completeSimple(model, history, { maxRetries: 0,
+        env: mode === undefined ? {} : { GIGACHAT_REASONING_IN_CONTENT: mode } });
+      assert.equal(result.stopReason, 'stop', result.errorMessage);
+      const messages = requests[0].body.messages.filter(message => message.role === 'assistant');
+      assert.deepEqual(messages, [
+        mode === 'true'
+          ? { role: 'assistant', content: 'Unsigned\n Unknown Native Other\n\n \nAnswer\t ' }
+          : { role: 'assistant', content: ' \nAnswer\t ', reasoning_content: ' Native', reasoning: ' Other' },
+        ...Array.from({ length: 3 }, () => ({ role: 'assistant', content: 'Foreign answer' })),
+        mode === 'true' ? { role: 'assistant', content: ' \n\t ' } : { role: 'assistant', content: '', reasoning: ' \n\t ' },
+        mode === 'true' ? { role: 'assistant', content: 'Only thought' } : { role: 'assistant', content: '', reasoning_content: 'Only thought' },
+        { role: 'assistant', content: 'Redacted answer' },
+      ]);
+      assert.deepEqual(history, saved);
+    }));
+  });
+}
+
+for (const mode of [undefined, 'false', 'true'])
+for (const replacement of [false, true]) {
+  test(`OpenAI onPayload honors selected reasoning format on copies (inContent=${mode ?? 'default'}, replacement=${replacement})`, async () => {
+    const messages = Object.freeze([
+      Object.freeze({ role: 'assistant', content: ' \nAnswer\t ', reasoning_content: ' Native ', reasoning: ' Other\n', reasoning_effort: 'high' }),
+      Object.freeze({ role: 'assistant', content: Object.freeze([Object.freeze({ type: 'text', text: 'Array answer' })]),
+        reasoning_content: 'Array thought', reasoning: 'More thought', reasoning_effort: 'low' }),
+      Object.freeze({ role: 'assistant', content: '', reasoning_content: 'Only thought', reasoning: '', reasoning_effort: 'high' }),
+      Object.freeze({ role: 'user', content: 'Continue', reasoning_effort: 'high' }),
+    ]);
+    const override = Object.freeze({ messages, reasoning: 'TOP_LEVEL_SECRET', reasoning_content: 'TOP_LEVEL_OTHER' });
+    const saved = structuredClone(override);
+    await withServer(async ({ baseUrl, requests }) => withSavedConnection(baseUrl, async ({ models, model }) => {
+      const history = structuredClone(context);
+      const before = structuredClone(history);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await models.completeSimple(model, history, { maxRetries: 0,
+          env: mode === undefined ? {} : { GIGACHAT_REASONING_IN_CONTENT: mode },
+          onPayload: payload => {
+            if (replacement) return override;
+            Object.assign(payload, override);
+          },
+        });
+        assert.equal(result.stopReason, 'stop', result.errorMessage);
+        const body = requests.at(-1).body;
+        assert(!Object.hasOwn(body, 'reasoning'));
+        assert(!Object.hasOwn(body, 'reasoning_content'));
+        assert.deepEqual(body.messages, mode === 'true' ? [
+          { role: 'assistant', content: ' Native \n\n Other\n\n\n \nAnswer\t ' },
+          { role: 'assistant', content: [{ type: 'text', text: 'Array thought\n\nMore thought\n\n' }, { type: 'text', text: 'Array answer' }] },
+          { role: 'assistant', content: 'Only thought' },
+          { role: 'user', content: 'Continue' },
+        ] : [
+          { role: 'assistant', content: ' \nAnswer\t ', reasoning_content: ' Native ', reasoning: ' Other\n' },
+          { role: 'assistant', content: [{ type: 'text', text: 'Array answer' }], reasoning_content: 'Array thought', reasoning: 'More thought' },
+          { role: 'assistant', content: '', reasoning_content: 'Only thought', reasoning: '' },
+          { role: 'user', content: 'Continue' },
+        ]);
+        assert.deepEqual(override, saved, 'Caller-owned overrides must survive repeated normalization unchanged');
+        assert.deepEqual(history, before);
+      }
+    }));
+  });
+}
+
+for (const value of ['', 'TRUE', 'False', '1', ' true ', 'false ']) {
+  test(`OpenAI rejects nonliteral reasoning switch ${JSON.stringify(value)} before sending`, async () => {
+    await withServer(async ({ baseUrl, requests }) => withSavedConnection(baseUrl, async ({ models, model }) => {
+      const result = await models.completeSimple(model, context, { maxRetries: 0, env: { GIGACHAT_REASONING_IN_CONTENT: value } });
+      assert.equal(result.stopReason, 'error');
+      assert.match(result.errorMessage, /GIGACHAT_REASONING_IN_CONTENT must be true or false/);
+      assert.equal(requests.length, 0);
+    }));
   });
 }
 

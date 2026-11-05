@@ -439,7 +439,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { createParser } from "eventsource-parser";
 
-// src/openai-messages.ts
+// src/messages.ts
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 
 // node_modules/@earendil-works/pi-ai/dist/api/transform-messages.js
@@ -600,8 +600,15 @@ function transformMessages(messages, model, normalizeToolCallId) {
   return result;
 }
 
-// src/openai-messages.ts
-function convertMessages(model, context, additionalSystemPrompt) {
+// src/messages.ts
+var STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
+function reasoningInContent(env) {
+  const mode = env.GIGACHAT_REASONING_IN_CONTENT ?? "false";
+  if (mode !== "true" && mode !== "false")
+    throw new Error("GIGACHAT_REASONING_IN_CONTENT must be true or false");
+  return mode === "true";
+}
+function convertMessages(model, context, additionalSystemPrompt, inContent = false) {
   const messages = [];
   const transformedMessages = transformMessages(
     context.messages.filter((message) => message.role !== "system"),
@@ -609,6 +616,123 @@ function convertMessages(model, context, additionalSystemPrompt) {
   );
   const systemPrompt = [
     getCurrentSystemPrompt(context.messages),
+    additionalSystemPrompt?.trim()
+  ].filter(Boolean).join("\n\n");
+  if (systemPrompt) {
+    messages.push({
+      role: "system",
+      content: sanitizeSurrogates(systemPrompt)
+    });
+  }
+  for (let i = 0; i < transformedMessages.length; i++) {
+    const message = transformedMessages[i];
+    if (message.role === "user") {
+      if (typeof message.content === "string") {
+        messages.push({
+          role: "user",
+          content: sanitizeSurrogates(message.content)
+        });
+      } else {
+        const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n");
+        if (text.length > 0) {
+          messages.push({ role: "user", content: text });
+        }
+      }
+      continue;
+    }
+    if (message.role === "assistant") {
+      const thinking = message.content.filter(
+        (item) => item.type === "thinking" && !item.redacted
+      );
+      const reasoningText = inContent ? thinking.map((item) => item.thinking).join("") : "";
+      const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("");
+      const content = inContent && reasoningText ? `${sanitizeSurrogates(reasoningText)}${text ? `
+
+${text}` : ""}` : text;
+      const native = {};
+      if (!inContent) {
+        for (const item of thinking) {
+          const field = item.thinkingSignature;
+          if (field === "reasoning_content" || field === "reasoning")
+            native[field] = (native[field] ?? "") + sanitizeSurrogates(item.thinking);
+        }
+      }
+      const toolCalls = message.content.filter(
+        (item) => item.type === "toolCall"
+      );
+      if (toolCalls.length > 0) {
+        const results = /* @__PURE__ */ new Map();
+        while (transformedMessages[i + 1]?.role === "toolResult") {
+          const result = transformedMessages[++i];
+          results.set(result.toolCallId, result);
+        }
+        for (const [callIndex, call] of toolCalls.entries()) {
+          messages.push({
+            role: "assistant",
+            content: callIndex === 0 ? content : "",
+            ...callIndex === 0 ? native : {},
+            function_call: { name: call.name, arguments: call.arguments }
+          });
+          const result = results.get(call.id);
+          results.delete(call.id);
+          messages.push({
+            role: "function",
+            name: call.name,
+            content: JSON.stringify({
+              result: result ? toolResultText(result) : "No result provided",
+              ...result?.isError || !result ? { isError: true } : {}
+            })
+          });
+        }
+        for (const result of results.values()) {
+          messages.push(unmatchedToolResult(result));
+        }
+      } else {
+        messages.push({
+          role: "assistant",
+          content,
+          ...native
+        });
+      }
+      continue;
+    }
+    const toolMessage = message;
+    messages.push(unmatchedToolResult(toolMessage));
+  }
+  return messages;
+}
+function unmatchedToolResult(message) {
+  return {
+    role: "user",
+    content: `Tool result (${message.toolName}):
+${toolResultText(message)}`
+  };
+}
+function toolResultText(message) {
+  const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n") || "(no content)";
+  return message.isError ? `Error: ${text}` : text;
+}
+function convertFunctions(tools) {
+  return tools.map(({ name, description, parameters }) => ({
+    name,
+    description,
+    parameters: JSON.parse(JSON.stringify(parameters))
+  }));
+}
+function sanitizeSurrogates(text) {
+  return text.toWellFormed();
+}
+
+// src/openai-messages.ts
+import { getCurrentSystemPrompt as getCurrentSystemPrompt2 } from "@earendil-works/pi-ai";
+function convertMessages2(model, context, additionalSystemPrompt, inContent = false) {
+  const messages = [];
+  const transformedMessages = transformMessages(
+    context.messages.filter((message) => message.role !== "system"),
+    model
+  );
+  const systemPrompt = [
+    getCurrentSystemPrompt2(context.messages),
     additionalSystemPrompt?.trim()
   ].filter(Boolean).join("\n\n");
   if (systemPrompt)
@@ -625,11 +749,23 @@ function convertMessages(model, context, additionalSystemPrompt) {
       const content = typeof message.content === "string" ? message.content.toWellFormed() : message.content.filter((item) => item.type === "text").map((item) => item.text.toWellFormed()).join("\n");
       if (content) messages.push({ role: "user", content });
     } else if (message.role === "assistant") {
-      const thinking = message.content.filter((item) => item.type === "thinking" && !item.redacted).map((item) => item.type === "thinking" ? item.thinking : "").join("");
+      const thinking = message.content.filter(
+        (item) => item.type === "thinking" && !item.redacted
+      );
+      const reasoning = inContent ? thinking.map((item) => item.type === "thinking" ? item.thinking : "").join("") : "";
       const text = message.content.filter((item) => item.type === "text").map((item) => item.text).join("");
-      const content = (thinking ? `${thinking}${text ? `
+      const content = (inContent && reasoning ? `${reasoning}${text ? `
 
 ${text}` : ""}` : text).toWellFormed();
+      const native = {};
+      if (!inContent) {
+        for (const item of thinking) {
+          if (item.type !== "thinking") continue;
+          const field = item.thinkingSignature;
+          if (field === "reasoning_content" || field === "reasoning")
+            native[field] = (native[field] ?? "") + item.thinking.toWellFormed();
+        }
+      }
       const tool_calls = message.content.filter((item) => item.type === "toolCall").map((call) => {
         pendingCallIds.add(call.id);
         return {
@@ -644,10 +780,11 @@ ${text}` : ""}` : text).toWellFormed();
       messages.push({
         role: "assistant",
         content,
+        ...native,
         ...tool_calls.length ? { tool_calls } : {}
       });
     } else if (message.role === "toolResult") {
-      const content = toolResultText(message);
+      const content = toolResultText2(message);
       if (pendingCallIds.delete(message.toolCallId)) {
         messages.push({
           role: "tool",
@@ -666,7 +803,7 @@ ${content}`
   for (const orphan of orphanResults) messages.push(orphan);
   return messages;
 }
-function toolResultText(message) {
+function toolResultText2(message) {
   const text = message.content.filter((item) => item.type === "text").map((item) => item.text.toWellFormed()).join("\n") || "(no content)";
   return message.isError ? `Error: ${text}` : text;
 }
@@ -688,7 +825,7 @@ function emptyUsage() {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
   };
 }
-function payload(model, context, options) {
+function payload(model, context, options, inContent) {
   const env = environment(options);
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
@@ -711,7 +848,12 @@ function payload(model, context, options) {
   const reasoningEffort = model.reasoning ? model.thinkingLevelMap?.[thinkingLevel] ?? thinkingLevel : void 0;
   return {
     model: model.id,
-    messages: convertMessages(model, context, additionalSystemPrompt),
+    messages: convertMessages2(
+      model,
+      context,
+      additionalSystemPrompt,
+      inContent
+    ),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     tool_choice: typeof choice === "object" && "name" in choice ? { type: "function", function: { name: choice.name } } : choice,
     ...tools.length ? { tools: convertTools(tools) } : {},
@@ -754,7 +896,8 @@ function streamSimpleOpenAI(model, context, options = {}) {
   const signal = options.signal ?? new AbortController().signal;
   (async () => {
     try {
-      let body = payload(model, context, options);
+      const inContent = reasoningInContent(environment(options));
+      let body = payload(model, context, options, inContent);
       const streaming = body.stream;
       const modified = await options.onPayload?.(body, model);
       if (modified !== void 0) {
@@ -770,11 +913,11 @@ function streamSimpleOpenAI(model, context, options = {}) {
         let cleaned = messages;
         for (let i = 0; i < messages.length; i++) {
           const message = messages[i];
-          if (!object(message) || !Object.hasOwn(message, "reasoning_content") && !Object.hasOwn(message, "reasoning") && !Object.hasOwn(message, "reasoning_effort"))
+          if (!object(message) || !(inContent && Object.hasOwn(message, "reasoning_content")) && !(inContent && Object.hasOwn(message, "reasoning")) && !Object.hasOwn(message, "reasoning_effort"))
             continue;
           if (cleaned === messages) cleaned = messages.slice();
           const copy = { ...message };
-          if (copy.role === "assistant") {
+          if (inContent && copy.role === "assistant") {
             const reasoning = [copy.reasoning_content, copy.reasoning].filter(
               (value) => typeof value === "string" && value.length > 0
             ).join("\n\n");
@@ -791,8 +934,10 @@ function streamSimpleOpenAI(model, context, options = {}) {
 ${content}` : ""}`;
             }
           }
-          delete copy.reasoning_content;
-          delete copy.reasoning;
+          if (inContent) {
+            delete copy.reasoning_content;
+            delete copy.reasoning;
+          }
           delete copy.reasoning_effort;
           cleaned[i] = copy;
         }
@@ -911,14 +1056,15 @@ function completionConsumer(output, stream, model) {
       textClosed = true;
     }
   };
-  const addThinking = (delta) => {
+  const addThinking = (delta, field) => {
     closeText();
+    if (thinking && thinking.thinkingSignature !== field) closeThinking();
     if (!thinking || thinkingClosed) {
       thinking = {
         type: "thinking",
         thinking: "",
         // Pi preserves signed blocks even when they contain only whitespace.
-        thinkingSignature: "reasoning_content"
+        thinkingSignature: field
       };
       thinkingClosed = false;
       output.content.push(thinking);
@@ -979,10 +1125,14 @@ function completionConsumer(output, stream, model) {
         );
       if (message.content != null && typeof message.content !== "string")
         throw new Error("Invalid GigaChat content");
-      if (message.reasoning_content != null && typeof message.reasoning_content !== "string")
-        throw new Error("Invalid GigaChat reasoning_content");
-      if (message.reasoning_content)
-        addThinking(message.reasoning_content);
+      for (const field of ["reasoning_content", "reasoning"]) {
+        if (message[field] != null && typeof message[field] !== "string")
+          throw new Error(`Invalid GigaChat ${field}`);
+      }
+      for (const field of ["reasoning_content", "reasoning"]) {
+        const value = message[field];
+        if (typeof value === "string" && value) addThinking(value, field);
+      }
       if (message.content) addText(message.content);
       if (message.tool_calls != null) {
         if (!Array.isArray(message.tool_calls))
@@ -1172,116 +1322,6 @@ import {
   parseToolCallArguments as parseToolCallArguments2
 } from "@earendil-works/pi-ai";
 import { createParser as createParser2 } from "eventsource-parser";
-
-// src/messages.ts
-import { getCurrentSystemPrompt as getCurrentSystemPrompt2 } from "@earendil-works/pi-ai";
-var STATE_SIGNATURE_PREFIX = "gigachat:functions_state_id:";
-function convertMessages2(model, context, additionalSystemPrompt) {
-  const messages = [];
-  const transformedMessages = transformMessages(
-    context.messages.filter((message) => message.role !== "system"),
-    model
-  );
-  const systemPrompt = [
-    getCurrentSystemPrompt2(context.messages),
-    additionalSystemPrompt?.trim()
-  ].filter(Boolean).join("\n\n");
-  if (systemPrompt) {
-    messages.push({
-      role: "system",
-      content: sanitizeSurrogates(systemPrompt)
-    });
-  }
-  for (let i = 0; i < transformedMessages.length; i++) {
-    const message = transformedMessages[i];
-    if (message.role === "user") {
-      if (typeof message.content === "string") {
-        messages.push({
-          role: "user",
-          content: sanitizeSurrogates(message.content)
-        });
-      } else {
-        const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n");
-        if (text.length > 0) {
-          messages.push({ role: "user", content: text });
-        }
-      }
-      continue;
-    }
-    if (message.role === "assistant") {
-      const thinking = message.content.filter(
-        (item) => item.type === "thinking" && !item.redacted
-      );
-      const reasoningText = thinking.map((item) => item.thinking).join("");
-      const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("");
-      const content = reasoningText ? `${sanitizeSurrogates(reasoningText)}${text ? `
-
-${text}` : ""}` : text;
-      const toolCalls = message.content.filter(
-        (item) => item.type === "toolCall"
-      );
-      if (toolCalls.length > 0) {
-        const results = /* @__PURE__ */ new Map();
-        while (transformedMessages[i + 1]?.role === "toolResult") {
-          const result = transformedMessages[++i];
-          results.set(result.toolCallId, result);
-        }
-        for (const [callIndex, call] of toolCalls.entries()) {
-          messages.push({
-            role: "assistant",
-            content: callIndex === 0 ? content : "",
-            function_call: { name: call.name, arguments: call.arguments }
-          });
-          const result = results.get(call.id);
-          results.delete(call.id);
-          messages.push({
-            role: "function",
-            name: call.name,
-            content: JSON.stringify({
-              result: result ? toolResultText2(result) : "No result provided",
-              ...result?.isError || !result ? { isError: true } : {}
-            })
-          });
-        }
-        for (const result of results.values()) {
-          messages.push(unmatchedToolResult(result));
-        }
-      } else {
-        messages.push({
-          role: "assistant",
-          content
-        });
-      }
-      continue;
-    }
-    const toolMessage = message;
-    messages.push(unmatchedToolResult(toolMessage));
-  }
-  return messages;
-}
-function unmatchedToolResult(message) {
-  return {
-    role: "user",
-    content: `Tool result (${message.toolName}):
-${toolResultText2(message)}`
-  };
-}
-function toolResultText2(message) {
-  const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n") || "(no content)";
-  return message.isError ? `Error: ${text}` : text;
-}
-function convertFunctions(tools) {
-  return tools.map(({ name, description, parameters }) => ({
-    name,
-    description,
-    parameters: JSON.parse(JSON.stringify(parameters))
-  }));
-}
-function sanitizeSurrogates(text) {
-  return text.toWellFormed();
-}
-
-// src/stream.ts
 var DEFAULT_SYSTEM_PROMPT = "Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.";
 function emptyUsage2() {
   return {
@@ -1293,7 +1333,7 @@ function emptyUsage2() {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
   };
 }
-function payload2(model, context, options) {
+function payload2(model, context, options, inContent) {
   const env = environment(options);
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
@@ -1314,7 +1354,12 @@ function payload2(model, context, options) {
   const tools = getCurrentTools2(context.messages);
   return {
     model: model.id,
-    messages: convertMessages2(model, context, additionalSystemPrompt),
+    messages: convertMessages(
+      model,
+      context,
+      additionalSystemPrompt,
+      inContent
+    ),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     function_call: options.toolChoice ?? options.functionCall ?? (tools.length ? "auto" : "none"),
     ...tools.length ? { functions: convertFunctions(tools) } : {},
@@ -1352,7 +1397,8 @@ function streamSimpleGigaChat(model, context, options = {}) {
   const signal = options.signal ?? new AbortController().signal;
   (async () => {
     try {
-      let body = payload2(model, context, options);
+      const inContent = reasoningInContent(environment(options));
+      let body = payload2(model, context, options, inContent);
       const streaming = body.stream;
       const modified = await options.onPayload?.(body, model);
       if (modified !== void 0) {
@@ -1360,16 +1406,29 @@ function streamSimpleGigaChat(model, context, options = {}) {
           throw new Error("GigaChat onPayload must return a JSON object");
         body = modified;
       }
-      body.stream = streaming;
+      body = { ...body, stream: streaming };
       if (Array.isArray(body.messages)) {
         const messages = body.messages;
         let cleaned = messages;
         for (let i = 0; i < messages.length; i++) {
           const message = messages[i];
-          if (object(message) && Object.hasOwn(message, "functions_state_id")) {
+          if (object(message) && (Object.hasOwn(message, "functions_state_id") || inContent && (Object.hasOwn(message, "reasoning_content") || Object.hasOwn(message, "reasoning")))) {
             if (cleaned === messages) cleaned = messages.slice();
             const copy = { ...message };
             delete copy.functions_state_id;
+            if (inContent) {
+              if (copy.role === "assistant") {
+                const reasoning = [copy.reasoning_content, copy.reasoning].filter(
+                  (value) => typeof value === "string" && value.length > 0
+                ).join("\n\n");
+                if (reasoning)
+                  copy.content = `${reasoning}${typeof copy.content === "string" && copy.content ? `
+
+${copy.content}` : ""}`;
+              }
+              delete copy.reasoning_content;
+              delete copy.reasoning;
+            }
             cleaned[i] = copy;
           }
         }
@@ -1503,14 +1562,15 @@ function completionConsumer2(output, stream, model) {
       textClosed = true;
     }
   };
-  const addThinking = (delta) => {
+  const addThinking = (delta, field) => {
     closeText();
+    if (thinking && thinking.thinkingSignature !== field) closeThinking();
     if (!thinking || thinkingClosed) {
       thinking = {
         type: "thinking",
         thinking: "",
         // Pi preserves signed blocks even when they contain only whitespace.
-        thinkingSignature: "reasoning_content"
+        thinkingSignature: field
       };
       thinkingClosed = false;
       output.content.push(thinking);
@@ -1572,12 +1632,16 @@ function completionConsumer2(output, stream, model) {
       if (message.role === "function_in_progress") return;
       if (message.content != null && typeof message.content !== "string")
         throw new Error("Invalid GigaChat content");
-      if (message.reasoning_content != null && typeof message.reasoning_content !== "string")
-        throw new Error("Invalid GigaChat reasoning_content");
+      for (const field of ["reasoning_content", "reasoning"]) {
+        if (message[field] != null && typeof message[field] !== "string")
+          throw new Error(`Invalid GigaChat ${field}`);
+      }
       if (typeof message.functions_state_id === "string")
         signature = STATE_SIGNATURE_PREFIX + message.functions_state_id;
-      if (message.reasoning_content)
-        addThinking(message.reasoning_content);
+      for (const field of ["reasoning_content", "reasoning"]) {
+        const value = message[field];
+        if (typeof value === "string" && value) addThinking(value, field);
+      }
       if (message.content) addText(message.content);
       if (message.function_call != null) {
         const call = message.function_call;
@@ -1713,7 +1777,7 @@ import { createParser as createParser3 } from "eventsource-parser";
 // src/v2-messages.ts
 import { getCurrentSystemPrompt as getCurrentSystemPrompt3 } from "@earendil-works/pi-ai";
 var V2_STATE_SIGNATURE_PREFIX = "gigachat:v2:tool_state_id:";
-function convertV2Messages(model, context, additionalSystemPrompt) {
+function convertV2Messages(model, context, additionalSystemPrompt, inContent = false) {
   const messages = [];
   const history = transformMessages(
     context.messages.filter((message) => message.role !== "system"),
@@ -1742,10 +1806,10 @@ function convertV2Messages(model, context, additionalSystemPrompt) {
     }
     if (message.role === "assistant") {
       pending.clear();
-      const content = [];
+      let content = [];
       let state;
       const reasoning = message.content.filter((part) => part.type === "thinking" && !part.redacted).map((part) => part.type === "thinking" ? part.thinking : "").join("");
-      if (reasoning)
+      if (reasoning && !inContent)
         messages.push({
           role: "reasoning",
           content: [{ text: reasoning.toWellFormed() }]
@@ -1769,6 +1833,8 @@ function convertV2Messages(model, context, additionalSystemPrompt) {
         if (signature?.startsWith(V2_STATE_SIGNATURE_PREFIX))
           state = signature.slice(V2_STATE_SIGNATURE_PREFIX.length);
       }
+      if (reasoning && inContent)
+        content = prependReasoning(content, reasoning.toWellFormed());
       if (content.length || state)
         messages.push({
           role: "assistant",
@@ -1807,6 +1873,41 @@ ${toolResultText3(result)}`.toWellFormed()
     }
   }
   return messages;
+}
+function prependReasoning(content, reasoning) {
+  if (!reasoning) return content;
+  const firstText = content.findIndex((part) => typeof part?.text === "string");
+  if (firstText === -1) return [{ text: reasoning }, ...content];
+  const prefix = reasoning + (content.some((part) => part?.text) ? "\n\n" : "");
+  return content.map(
+    (part, index) => index === firstText ? { ...part, text: prefix + part.text } : part
+  );
+}
+function foldV2Reasoning(messages) {
+  const folded = [];
+  let pending;
+  for (const message of messages) {
+    if (message?.role === "reasoning" && Array.isArray(message.content)) {
+      pending = pending ? { ...pending, content: [...pending.content, ...message.content] } : message;
+      continue;
+    }
+    if (pending) {
+      if (message?.role === "assistant" && Array.isArray(message.content)) {
+        const reasoning = pending.content.filter((part) => typeof part?.text === "string").map((part) => part.text).join("");
+        folded.push({
+          ...message,
+          content: prependReasoning(message.content, reasoning)
+        });
+        pending = void 0;
+        continue;
+      }
+      folded.push({ ...pending, role: "assistant" });
+      pending = void 0;
+    }
+    folded.push(message);
+  }
+  if (pending) folded.push({ ...pending, role: "assistant" });
+  return folded;
 }
 function toolResultText3(message) {
   const text = message.content.filter((part) => part.type === "text").map((part) => part.text.toWellFormed()).join("\n") || "(no content)";
@@ -1853,7 +1954,12 @@ function payload3(model, context, options) {
   const reasoning = model.reasoning && thinkingLevel !== "off";
   const body = {
     model: model.id,
-    messages: convertV2Messages(model, context, env.GIGACHAT_SYSTEM_PROMPT),
+    messages: convertV2Messages(
+      model,
+      context,
+      env.GIGACHAT_SYSTEM_PROMPT,
+      reasoningInContent(env)
+    ),
     ...tools.length ? {
       tools: [{ functions: { specifications: convertV2Functions(tools) } }]
     } : {},
@@ -1900,14 +2006,17 @@ function streamSimpleGigaChatV2(model, context, options = {}) {
   (async () => {
     try {
       let body = payload3(model, context, options);
+      const inContent = reasoningInContent(environment(options));
       const streaming = Boolean(body.stream);
       const modified = await options.onPayload?.(body, model);
       if (modified !== void 0) {
         if (!object(modified))
           throw new Error("GigaChat onPayload must return a JSON object");
-        body = modified;
+        body = { ...modified };
       }
       body.stream = streaming;
+      if (inContent && Array.isArray(body.messages))
+        body.messages = foldV2Reasoning(body.messages);
       if ((!model.reasoning || !options.reasoning || options.reasoning === "off") && object(body.model_options)) {
         body.model_options = { ...body.model_options };
         delete body.model_options.reasoning;
@@ -2858,57 +2967,65 @@ async function discoverModels(baseUrl2, apiKey, options) {
     async (response) => catalog(await readJson(response), protocol)
   );
   options.signal.throwIfAborted();
-  const probeTransport = { ...transport, timeoutMs: 5e3 };
+  const timeouts = [1e3, 3e3, 9e3, 27e3, 6e4];
   const consumeProbe = async (response) => validateCompletion(await readJson(response), protocol);
   let completed = 0;
   options.progress?.(0, models.length);
   const probeModel = async (model) => {
     options.signal.throwIfAborted();
-    const work = async () => {
-      const init = {
-        method: "POST",
-        headers: headers2,
-        body: JSON.stringify({
-          model: model.id,
-          messages: [
-            {
-              role: "user",
-              content: protocol === "v2" ? [{ text: "Hi" }] : "Hi"
-            }
-          ],
-          ...protocol === "v2" ? { model_options: { max_tokens: 1 } } : { max_tokens: 1 },
-          stream: false
-        })
-      };
-      for (let attempt = 1; ; attempt++) {
-        try {
-          await request(
-            `${root}/chat/completions`,
-            init,
-            probeTransport,
-            consumeProbe
-          );
-          return { model, status: "available" };
-        } catch (error) {
-          options.signal.throwIfAborted();
-          if (attempt === 3)
-            return {
-              model,
-              status: "unavailable",
-              reason: `GigaChat model unavailable after 3 attempts. ${describeDiscoveryError(error)}`
-            };
+    const init = {
+      method: "POST",
+      headers: headers2,
+      body: JSON.stringify({
+        model: model.id,
+        messages: [
+          {
+            role: "user",
+            content: protocol === "v2" ? [{ text: "Hi" }] : "Hi"
+          }
+        ],
+        ...protocol === "v2" ? { model_options: { max_tokens: 1 } } : { max_tokens: 1 },
+        stream: false
+      })
+    };
+    let probe;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await request(
+          `${root}/chat/completions`,
+          init,
+          { ...transport, timeoutMs: timeouts[attempt] },
+          consumeProbe
+        );
+        probe = { model, status: "available" };
+        break;
+      } catch (error) {
+        options.signal.throwIfAborted();
+        if (attempt === timeouts.length - 1) {
+          probe = {
+            model,
+            status: "unavailable",
+            reason: `GigaChat model unavailable after 5 attempts. ${describeDiscoveryError(error)}`
+          };
+          break;
         }
       }
-    };
-    const probe = await (protocol === "openai" ? work() : serial(options.signal, work));
+    }
     options.signal.throwIfAborted();
     options.progress?.(++completed, models.length, probe);
     return probe;
   };
   const probes = [];
-  if (protocol === "openai")
-    probes.push(...await Promise.all(models.map(probeModel)));
-  else for (const model of models) probes.push(await probeModel(model));
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(5, models.length) }, async () => {
+      while (next < models.length) {
+        options.signal.throwIfAborted();
+        const index = next++;
+        probes[index] = await probeModel(models[index]);
+      }
+    })
+  );
   options.signal.throwIfAborted();
   return probes;
 }

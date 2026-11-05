@@ -22,7 +22,7 @@ const toolResult = call => ({ role: 'toolResult', toolCallId: call.id, toolName:
   content: [{ type: 'text', text: 'Synthetic result; command was not executed.' }], isError: false, timestamp: 0 });
 const assistant = (content, extra = {}) => ({ role: 'assistant', content, api: selected.api,
   provider: selected.provider, model: selected.id, stopReason: 'stop', timestamp: 0, ...extra });
-const wireThinking = text => ({ type: 'thinking', thinking: text, thinkingSignature: 'reasoning_content' });
+const wireThinking = (text, field = 'reasoning_content') => ({ type: 'thinking', thinking: text, thinkingSignature: field });
 const data = (delta, finish_reason = null) => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] }) + '\n\n';
 
 async function collect(model, context = { messages: [user('Test')] }, options = {}) {
@@ -32,14 +32,15 @@ async function collect(model, context = { messages: [user('Test')] }, options = 
   return { result: await stream.result(), events };
 }
 
-for (const streaming of [false, true]) test(`reasoning survives a tool response, JSON serialization and the next request (stream=${streaming})`, async () => {
+for (const field of ['reasoning_content', 'reasoning'])
+for (const streaming of [false, true]) test(`${field} survives a tool response, JSON serialization and the next request (stream=${streaming})`, async () => {
   await withServer(async ({ baseUrl, requests }) => {
     const model = { ...selected, baseUrl };
     const { result, events } = await collect(model, undefined, { stream: streaming });
     assert.equal(result.stopReason, 'toolUse', result.errorMessage);
     assert.equal(result.model, selected.id, 'the response alias must not break same-model replay');
     assert.deepEqual(result.content.map(block => block.type), ['thinking', 'toolCall']);
-    assert.equal(result.content[0].thinking, reasoning);
+    assert.deepEqual(result.content[0], wireThinking(reasoning, field));
     assert.deepEqual(events.filter(e => e.type.startsWith('thinking')).map(e => e.type), ['thinking_start', 'thinking_delta', 'thinking_end']);
     assert(events.findIndex(e => e.type === 'thinking_end') < events.findIndex(e => e.type === 'toolcall_start'));
     const restored = JSON.parse(JSON.stringify(result));
@@ -49,28 +50,52 @@ for (const streaming of [false, true]) test(`reasoning survives a tool response,
     assert.equal(next.result.stopReason, 'stop', next.result.errorMessage);
     const messages = requests[1].body.messages;
     const replay = messages.find(message => message.role === 'assistant');
-    assert.deepEqual(replay, { role: 'assistant', content: reasoning,
+    assert.deepEqual(replay, { role: 'assistant', content: '', [field]: reasoning,
       function_call: { name: 'bash', arguments: { command: 'cd /home ' } } });
     assert.equal(messages[messages.indexOf(replay) + 1].role, 'function');
-  }, (req, res, requests) => reply(req, res, requests.length === 1 ? fixture : completion()));
+  }, (req, res, requests) => {
+    const response = structuredClone(fixture);
+    delete response.choices[0].message.reasoning_content;
+    response.choices[0].message[field] = reasoning;
+    reply(req, res, requests.length === 1 ? response : completion());
+  });
 });
 
-for (const text of [' \nПроверка 🙂𐐀\t ', ' \n\t ']) test(`replay preserves reasoning verbatim, including whitespace: ${JSON.stringify(text)}`, () => {
-  const history = [assistant([wireThinking(text), { type: 'text', text: 'Answer' }])];
-  const before = JSON.stringify(history);
-  const [message] = convertMessages(selected, normalizeContext({ messages: history }));
-  assert.deepEqual(message, { role: 'assistant', content: `${text}\n\nAnswer` });
-  assert.equal(JSON.stringify(history), before);
+for (const inContent of [false, true])
+for (const field of ['reasoning_content', 'reasoning'])
+for (const text of [' \nПроверка 🙂𐐀\t ', ' \n\t '])
+test(`replay preserves ${field} verbatim (inContent=${inContent}): ${JSON.stringify(text)}`, () => {
+  for (const answer of ['', 'Answer']) {
+    const history = [assistant([wireThinking(text, field), { type: 'text', text: answer }])];
+    const before = structuredClone(history);
+    const [message] = convertMessages(selected, normalizeContext({ messages: history }), undefined, inContent);
+    assert.deepEqual(message, inContent
+      ? { role: 'assistant', content: text + (answer ? '\n\nAnswer' : '') }
+      : { role: 'assistant', content: answer, [field]: text });
+    assert.deepEqual(history, before);
+  }
 });
 
-test('native thinking blocks are replayed in order without requiring a provider signature', () => {
-  const [message] = convertMessages(selected, normalizeContext({ messages: [assistant([
-    { type: 'thinking', thinking: 'First\n' }, { type: 'thinking', thinking: ' Second' }, { type: 'text', text: 'Answer' },
-  ])] }));
-  assert.deepEqual(message, { role: 'assistant', content: 'First\n Second\n\nAnswer' });
+test('unsigned and unknown-signature thinking has no native fallback but remains available for content replay', () => {
+  const history = [assistant([
+    { type: 'thinking', thinking: 'Unsigned\n' },
+    { type: 'thinking', thinking: ' Unknown', thinkingSignature: 'foreign-signature' },
+    wireThinking(' Native'), wireThinking(' Other', 'reasoning'),
+    { type: 'text', text: 'Answer' },
+  ])];
+  const before = structuredClone(history);
+  const context = normalizeContext({ messages: history });
+  assert.deepEqual(convertMessages(selected, context), [
+    { role: 'assistant', content: 'Answer', reasoning_content: ' Native', reasoning: ' Other' },
+  ]);
+  assert.deepEqual(convertMessages(selected, context, undefined, true), [
+    { role: 'assistant', content: 'Unsigned\n Unknown Native Other\n\nAnswer' },
+  ]);
+  assert.deepEqual(history, before);
 });
 
-for (const streaming of [false, true]) test(`model switching drops foreign reasoning instead of mixing it with the visible answer (stream=${streaming})`, async () => {
+for (const inContent of [false, true])
+for (const streaming of [false, true]) test(`model switching drops foreign reasoning without changing the answer (stream=${streaming}, inContent=${inContent})`, async () => {
   for (const foreign of [{ model: 'other' }, { provider: 'foreign' }, { api: 'foreign-api' }]) {
     await withServer(async ({ baseUrl, requests }) => {
       const model = { ...selected, baseUrl };
@@ -78,7 +103,9 @@ for (const streaming of [false, true]) test(`model switching drops foreign reaso
         wireThinking('Prior thought. '), { type: 'text', text: 'Answer', textSignature: 'gigachat:functions_state_id:old-state' },
       ], foreign), user('Continue')] };
       const original = structuredClone(context);
-      const { result } = await collect(model, context, { stream: streaming });
+      const { result } = await collect(model, context, {
+        stream: streaming, env: { GIGACHAT_REASONING_IN_CONTENT: String(inContent) },
+      });
       assert.equal(result.stopReason, 'stop', result.errorMessage);
       assert.deepEqual(requests[0].body.messages.find(message => message.role === 'assistant'),
         { role: 'assistant', content: 'Answer' });
@@ -87,14 +114,15 @@ for (const streaming of [false, true]) test(`model switching drops foreign reaso
   }
 });
 
-test('redacted and failed reasoning is not replayed as plaintext', () => {
+for (const inContent of [false, true])
+test(`redacted and failed reasoning is not replayed (inContent=${inContent})`, () => {
   const [message] = convertMessages(selected, normalizeContext({ messages: [assistant([
     { ...wireThinking('encrypted placeholder'), redacted: true }, { type: 'text', text: 'Answer' },
-  ])] }));
+  ])] }), undefined, inContent);
   assert.deepEqual(message, { role: 'assistant', content: 'Answer' });
   for (const stopReason of ['error', 'aborted']) assert.deepEqual(convertMessages(selected, normalizeContext({
     messages: [assistant([wireThinking('incomplete')], { stopReason })],
-  })), []);
+  }), undefined, inContent), []);
 });
 
 for (const streaming of [false, true]) {
@@ -107,28 +135,30 @@ for (const streaming of [false, true]) {
       const next = await collect(model, { messages: [JSON.parse(JSON.stringify(result)), user('Continue')] }, { stream: streaming });
       assert.equal(next.result.stopReason, 'length', next.result.errorMessage);
       assert.deepEqual(requests[1].body.messages.find(m => m.role === 'assistant'),
-        { role: 'assistant', content: 'Still thinking.' });
+        { role: 'assistant', content: '', reasoning_content: 'Still thinking.' });
     }, (req, res) => reply(req, res, completion({ role: 'assistant', content: '', reasoning_content: 'Still thinking.', functions_state_id: state }, 'length')));
   });
 
-  test(`absent, null and empty reasoning keep ordinary answers unchanged (stream=${streaming})`, async () => {
+  for (const field of ['reasoning_content', 'reasoning']) {
+  test(`absent, null and empty ${field} keep ordinary answers unchanged (stream=${streaming})`, async () => {
     for (const value of [undefined, null, '']) await withServer(async ({ model }) => {
       const { result, events } = await collect(model, undefined, { stream: streaming });
       assert.equal(result.stopReason, 'stop', result.errorMessage);
       assert.deepEqual(result.content, [{ type: 'text', text: 'Answer' }]);
       assert(!events.some(e => e.type.startsWith('thinking')));
       const [message] = convertMessages(model, normalizeContext({ messages: [result] }));
-      assert.equal(message.reasoning_content, undefined);
-    }, (req, res) => reply(req, res, completion({ role: 'assistant', content: 'Answer', reasoning_content: value })));
+      assert.deepEqual(message, { role: 'assistant', content: 'Answer' });
+    }, (req, res) => reply(req, res, completion({ role: 'assistant', content: 'Answer', [field]: value })));
   });
 
-  test(`invalid reasoning types fail explicitly (stream=${streaming})`, async () => {
+  test(`invalid ${field} types fail explicitly (stream=${streaming})`, async () => {
     for (const value of [42, {}, []]) await withServer(async ({ model }) => {
       const { result } = await collect(model, undefined, { stream: streaming });
       assert.equal(result.stopReason, 'error');
-      assert.match(result.errorMessage, /reasoning_content/);
-    }, (req, res) => reply(req, res, completion({ role: 'assistant', content: 'Answer', reasoning_content: value })));
+      assert(result.errorMessage.includes(field), result.errorMessage);
+    }, (req, res) => reply(req, res, completion({ role: 'assistant', content: 'Answer', [field]: value })));
   });
+  }
 }
 
 test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alternating blocks', async () => {
@@ -143,12 +173,18 @@ test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alter
     }
     const result = await stream.result();
     assert.equal(result.stopReason, 'stop', result.errorMessage);
-    assert.deepEqual(result.content.map(block => block.type), ['thinking', 'text', 'thinking', 'text']);
+    assert.deepEqual(result.content, [
+      wireThinking(' \nПроверка 🙂𐐀\t '), { type: 'text', text: 'A' },
+      wireThinking('Second\n', 'reasoning'), wireThinking('Third'),
+      { type: 'text', text: 'B' },
+    ]);
     const [message] = convertMessages(model, normalizeContext({ messages: [result] }));
-    assert.deepEqual(message, { role: 'assistant', content: ' \nПроверка 🙂𐐀\t Second\n\n\nAB' });
+    assert.deepEqual(message, {
+      role: 'assistant', content: 'AB', reasoning_content: ' \nПроверка 🙂𐐀\t Third', reasoning: 'Second\n',
+    });
     assert.deepEqual(events.filter(e => !e.type.endsWith('_delta')).map(e => e.type), [
       'start', 'thinking_start', 'thinking_end', 'text_start', 'text_end',
-      'thinking_start', 'thinking_end', 'text_start', 'text_end', 'done',
+      'thinking_start', 'thinking_end', 'thinking_start', 'thinking_end', 'text_start', 'text_end', 'done',
     ]);
   }, async (_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -157,8 +193,29 @@ test('SSE thinking is incremental, survives fragmented UTF-8 and preserves alter
       await new Promise(resolve => setImmediate(resolve));
     }
     await Promise.race([proceed, new Promise((_, reject) => setTimeout(() => reject(new Error('No incremental thinking event')), 2000).unref())]);
-    res.end(data({ reasoning_content: '\t ' }) + data({ content: 'A' }) + data({ reasoning_content: 'Second\n' }) + data({ content: 'B' }, 'stop') + 'data: [DONE]\n\n');
+    res.end(data({ reasoning_content: '\t ' }) + data({ content: 'A' }) + data({ reasoning: 'Second\n' }) +
+      data({ reasoning_content: 'Third' }) + data({ content: 'B' }, 'stop') + 'data: [DONE]\n\n');
   });
+});
+
+for (const streaming of [false, true])
+test(`both reasoning fields retain provenance when received together (stream=${streaming})`, async () => {
+  await withServer(async ({ model }) => {
+    const { result, events } = await collect(model, undefined, { stream: streaming });
+    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.deepEqual(result.content, [
+      wireThinking('First '), wireThinking('Second ', 'reasoning'), { type: 'text', text: 'Answer' },
+    ]);
+    assert.deepEqual(events.filter(e => e.type.startsWith('thinking')).map(e => [e.type, e.contentIndex, e.delta ?? e.content]), [
+      ['thinking_start', 0, undefined], ['thinking_delta', 0, 'First '], ['thinking_end', 0, 'First '],
+      ['thinking_start', 1, undefined], ['thinking_delta', 1, 'Second '], ['thinking_end', 1, 'Second '],
+    ]);
+    assert.deepEqual(convertMessages(model, normalizeContext({ messages: [result] })), [{
+      role: 'assistant', content: 'Answer', reasoning_content: 'First ', reasoning: 'Second ',
+    }]);
+  }, (req, res) => reply(req, res, completion({
+    role: 'assistant', reasoning_content: 'First ', reasoning: 'Second ', content: 'Answer',
+  })));
 });
 
 test('cancellation keeps partial thinking for display but excludes the aborted turn from replay', async () => {

@@ -20,10 +20,12 @@ import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { createParser } from "eventsource-parser";
 import { baseUrl } from "./auth.js";
 import { environment, headers, object, request, serial } from "./http.js";
+import { reasoningInContent } from "./messages.js";
 import type { GigaChatStreamOptions } from "./stream.js";
 import {
 	convertV2Functions,
 	convertV2Messages,
+	foldV2Reasoning,
 	V2_STATE_SIGNATURE_PREFIX,
 } from "./v2-messages.js";
 
@@ -67,7 +69,12 @@ function payload(
 	const reasoning = model.reasoning && thinkingLevel !== "off";
 	const body: Record<string, unknown> = {
 		model: model.id,
-		messages: convertV2Messages(model, context, env.GIGACHAT_SYSTEM_PROMPT),
+		messages: convertV2Messages(
+			model,
+			context,
+			env.GIGACHAT_SYSTEM_PROMPT,
+			reasoningInContent(env),
+		),
 		...(tools.length
 			? {
 					tools: [{ functions: { specifications: convertV2Functions(tools) } }],
@@ -124,14 +131,17 @@ export function streamSimpleGigaChatV2(
 	(async () => {
 		try {
 			let body = payload(model, context, options);
+			const inContent = reasoningInContent(environment(options));
 			const streaming = Boolean(body.stream);
 			const modified = await options.onPayload?.(body, model);
 			if (modified !== undefined) {
 				if (!object(modified))
 					throw new Error("GigaChat onPayload must return a JSON object");
-				body = modified;
+				body = { ...modified };
 			}
 			body.stream = streaming;
+			if (inContent && Array.isArray(body.messages))
+				body.messages = foldV2Reasoning(body.messages);
 			// The off selection must not turn on server-side reasoning through overrides.
 			if (
 				(!model.reasoning ||

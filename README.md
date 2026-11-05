@@ -26,6 +26,13 @@ saved Pi connections.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Release 0.7.4
+
+- Model checks use a sliding window of up to five different models for all three protocols. Each model gets up to five attempts with response timeouts of 1, 3, 9, 27, and 60 seconds, without retry delays.
+- Restored `GIGACHAT_REASONING_IN_CONTENT` as an opt-in, defaulting to `false`. Native replay is now the default: V1/OpenAI return reasoning through the exact `reasoning_content` or `reasoning` field received from the API; V2 uses its native reasoning role.
+- Set the flag to `true` to prepend reasoning to assistant content instead, without sending a second native copy. JSON/SSE responses retain source-field identity; saved Pi history, tool calls, and generation-level controls remain separate.
+- **Compatibility:** values of the reasoning flag that were ignored since 0.6.3 are active again. Parallel model checks can encounter concurrency limits on servers that accept only one active generation.
+
 ## Release 0.7.3
 
 - Unified the OpenAI-compatible adapter into this package and the single `/gigachat` command.
@@ -113,7 +120,7 @@ under its original MIT license.
 With Pi 1.3.0 installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.7.2
+pi install npm:@dev-sergeev/pi-gigachat@0.7.4
 pi
 ```
 
@@ -341,11 +348,13 @@ library callers must supply their own model definitions.
    is used as entered, without appending any path.
 5. The extension obtains authorization, reads the catalog, removes duplicate
    Model IDs within this connection, and checks each unique model with a simple
-   non-streaming generation using a one-token output budget. V1/V2 probes are
-   sequential; OpenAI probes can run concurrently. Each model gets up to three
-   attempts, stopping on the first valid response. Every attempt has a fixed
-   five-second timeout covering both response headers and the complete body;
-   time spent waiting in the generation queue is not part of that timeout.
+   non-streaming generation using a one-token output budget. All three protocols
+   check up to five different models concurrently in a sliding window: each
+   completed model immediately frees a slot for the next. Each model gets up to
+   five sequential attempts, stopping on the first valid response, with timeouts
+   of 1, 3, 9, 27, and 60 seconds covering both response headers and the complete
+   body. These probes bypass the ordinary generation queue; normal generation
+   retains its existing scheduling.
 6. Use **Space** to select successful models, **Ctrl+A** to select all successful
    models, and **Enter** to save. Failed models remain visible with a reason but
    cannot be selected. An empty successful set is never saved.
@@ -353,12 +362,14 @@ library callers must supply their own model definitions.
    immediately, without restarting Pi or creating a named provider manually.
 
 The discovery generations can be billed, including repeat attempts. Any failed
-probe is retried immediately without backoff or `Retry-After` waits. After three
+probe is retried immediately without backoff or `Retry-After` waits. After five
 failures, the model is unavailable for selection in the current check; the
-displayed reason describes the last failure. Cancellation stops the active
-request and prevents further attempts. For sequential V1/V2 probes, thirty
-models exhausting all three timeouts require about 7.5 minutes of request time,
-excluding queue waits and catalog/authentication requests.
+displayed reason describes the last failure. Cancellation stops active requests
+and prevents further attempts or queued model checks. A model exhausting all
+five timeouts takes 100 seconds of request time. Thirty models all exhausting
+their timeouts take about 10 minutes with five concurrent checks, excluding
+catalog/authentication requests and overhead. Servers that forbid concurrent
+generations may reject probes; these failures do not prove global unavailability.
 
 A one-token output budget does not prove tool compatibility, reasoning support,
 or the server's maximum output budget. Failed checks do not replace an existing
@@ -592,24 +603,31 @@ history rules below, including when an endpoint returns it with thinking off.
 
 ### Reasoning history
 
-When an endpoint returns `message.reasoning_content` (JSON) or
-`delta.reasoning_content` (SSE), the adapter stores it in native Pi `thinking`
-blocks. This works for GLM 5.2 and other models using this response format,
-including replies with empty `content` and a `function_call`. No setting is needed
-to preserve reasoning that the endpoint already returns.
+When a V1/OpenAI endpoint returns `reasoning_content` or `reasoning` in its JSON
+message or SSE delta, the adapter stores the text in native Pi `thinking` blocks,
+including which field supplied each block. V2 stores text from its native
+`role: "reasoning"` messages. This includes replies with empty answer content or
+tool calls. No setting is needed to preserve reasoning already returned by the
+endpoint.
 
 Pi displays these blocks and saves them in its session history. `Ctrl+T` toggles
-their visibility without removing them from history. On subsequent requests to
-the same provider/API/model, the adapter prepends the complete reasoning text to
-the assistant message's `content`, preserving `function_call`. Reasoning fragments
-are joined in their original order without inserting separators between them;
-their whitespace is preserved. Tool follow-ups and resumed sessions use the same
-path. Responses labeled `glm-5.2:latest` keep the selected `glm-5.2` session
-identity, so that alias does not interrupt replay.
+their visibility without removing them from history. By default, subsequent
+requests to the same provider/API/model use **native replay**: V1/OpenAI return
+each fragment through the exact original `reasoning_content` or `reasoning`
+field; V2 uses its separate reasoning role. If both fields occur, their texts
+retain separate field identities. Fragments belonging to the same field are
+joined without added separators, preserving whitespace.
 
-For all connections and models, the adapter removes `functions_state_id` from
-every message in the final outgoing `messages` array, including payload
-overrides. This avoids API errors when replaying function state. Stored Pi
+Tool follow-ups and resumed sessions use the same path. Responses labeled
+`glm-5.2:latest` keep the selected `glm-5.2` session identity, so that alias does
+not interrupt replay. Existing blocks marked `reasoning_content` remain
+identifiable. V1/OpenAI do not guess a field for manually constructed or imported
+thinking whose source is unrecognized; such text can still be replayed in content
+mode.
+
+For V1 connections and programmatic V1 calls, the adapter removes
+`functions_state_id` from every message in the final outgoing `messages` array,
+including payload overrides. This avoids API errors when replaying function state. Stored Pi
 history and response parsing are unchanged; nested function arguments are not
 modified.
 
@@ -624,10 +642,22 @@ Preserving and replaying reasoning history is independent of the generation leve
 above. Use `GIGACHAT_EXTRA_BODY` for additional reasoning parameters supported by
 your endpoint.
 
-#### Replay in content
+#### Optional replay in content
 
-The adapter prepends saved, non-redacted thinking to each generated outgoing
-assistant message's `content` as plain text:
+`GIGACHAT_REASONING_IN_CONTENT` selects the outgoing representation for all
+connections, models, and protocols, including programmatic V1 calls:
+
+| Value | Outgoing representation |
+| --- | --- |
+| Unset or `false` | Native `reasoning_content` / `reasoning` fields for V1/OpenAI; separate reasoning-role messages for V2 |
+| `true` | Saved, non-redacted reasoning prepended to assistant content; no separate native copy |
+
+Only the exact strings `true` and `false` are accepted; other values are errors.
+Per-call `options.env` overrides the process environment. This flag does not
+enable or disable the generation of new reasoning.
+
+In content mode, reasoning fragments are joined in their original order without
+added separators, then prepended as plain text:
 
 ```text
 The original reasoning text, with its whitespace preserved.
@@ -635,31 +665,32 @@ The original reasoning text, with its whitespace preserved.
 The original assistant answer, if any.
 ```
 
-The separate `reasoning_content` field is omitted from generated messages to avoid
-sending the same reasoning twice. Two newline characters separate non-empty
-reasoning and an answer; when either part is empty, no separator is added.
-Whitespace-only reasoning is preserved. The adapter adds no XML tags and does
-not strip literal tags already present in the source text.
+Two newline characters separate non-empty reasoning and answer text; no separator
+is added when either is empty. Whitespace-only reasoning is preserved. The
+adapter adds no XML wrapper and does not strip literal tags in the source text.
+V2 folds reasoning into the corresponding assistant text part. Tool calls,
+results, and V2 call IDs/state are retained. V1's sequential expansion of multiple
+tool calls includes the reasoning only with the first call.
 
-Replies containing only reasoning and a tool call also receive this content;
-`function_call` and the corresponding tool results are preserved. For multiple
-tool calls in imported history, reasoning is included once, with the first call.
+The transformation applies only when constructing requests, including tool
+follow-ups and resumed sessions. Pi still displays and stores separate native
+thinking blocks; saved history is not rewritten. Compaction and model switches
+still follow Pi's normal rules.
 
-This transformation happens only when building requests, including tool follow-ups
-and resumed sessions. Pi still displays and stores native `thinking` blocks;
-incoming response parsing and saved history are unchanged. Compaction and model
-switches still follow Pi's normal rules. `GIGACHAT_REASONING_IN_CONTENT` has been
-removed: any existing value, including `false`, is ignored and can be deleted
-from the launch environment.
+Explicit `messages` overrides through extra body settings or payload hooks
+replace generated messages. In content mode, V1/OpenAI fold their separate
+assistant reasoning fields, and V2 folds reasoning-role messages, without
+mutating caller-owned messages. Native mode preserves the supplied native
+representation. The existing V1 removal of message-level `functions_state_id`
+still applies.
 
-Explicit overrides of `messages` via extra body settings or payload hooks can
-replace the generated messages. Their reasoning fields are not converted;
-the existing removal of `functions_state_id` still applies.
+**Upgrade note:** this flag was ignored in 0.6.3–0.7.3 and is active again in
+0.7.4. Unset/`false` no longer means unconditional content replay. Environment
+changes require restarting Pi with the updated environment; `/reload` does not
+reload `.env`.
 
-The endpoint receives reasoning as ordinary assistant text in its context. This
-uses additional input tokens on endpoints that previously ignored the separate
-field; it does not enable a server's native reasoning mode or guarantee better
-answers.
+Content replay uses ordinary assistant input tokens and does not guarantee better
+answers or enable a server's native reasoning mode.
 
 ### Context management
 

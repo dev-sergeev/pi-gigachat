@@ -27,6 +27,7 @@ import { environment, headers, object, request, serial } from "./http.js";
 import {
 	convertFunctions,
 	convertMessages,
+	reasoningInContent,
 	STATE_SIGNATURE_PREFIX,
 } from "./messages.js";
 
@@ -66,6 +67,7 @@ function payload(
 	model: Model<Api>,
 	context: TranscriptContext,
 	options: GigaChatStreamOptions,
+	inContent: boolean,
 ): Record<string, unknown> {
 	const env = environment(options);
 	const mode = env.GIGACHAT_STREAM ?? "false";
@@ -89,7 +91,12 @@ function payload(
 	const tools = getCurrentTools(context.messages);
 	return {
 		model: model.id,
-		messages: convertMessages(model, context, additionalSystemPrompt),
+		messages: convertMessages(
+			model,
+			context,
+			additionalSystemPrompt,
+			inContent,
+		),
 		max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
 		function_call:
 			options.toolChoice ??
@@ -139,7 +146,8 @@ export function streamSimpleGigaChat(
 	const signal = options.signal ?? new AbortController().signal;
 	(async () => {
 		try {
-			let body = payload(model, context, options);
+			const inContent = reasoningInContent(environment(options));
+			let body = payload(model, context, options, inContent);
 			const streaming = body.stream;
 			const modified = await options.onPayload?.(body, model);
 			if (modified !== undefined) {
@@ -148,7 +156,7 @@ export function streamSimpleGigaChat(
 				body = modified;
 			}
 			// This switch controls both the wire format and its parser.
-			body.stream = streaming;
+			body = { ...body, stream: streaming };
 			// Sanitize the final messages, including payload overrides, without
 			// mutating caller-owned history or nested function arguments.
 			if (Array.isArray(body.messages)) {
@@ -156,10 +164,30 @@ export function streamSimpleGigaChat(
 				let cleaned = messages;
 				for (let i = 0; i < messages.length; i++) {
 					const message = messages[i];
-					if (object(message) && Object.hasOwn(message, "functions_state_id")) {
+					if (
+						object(message) &&
+						(Object.hasOwn(message, "functions_state_id") ||
+							(inContent &&
+								(Object.hasOwn(message, "reasoning_content") ||
+									Object.hasOwn(message, "reasoning"))))
+					) {
 						if (cleaned === messages) cleaned = messages.slice();
 						const copy = { ...message };
 						delete copy.functions_state_id;
+						if (inContent) {
+							if (copy.role === "assistant") {
+								const reasoning = [copy.reasoning_content, copy.reasoning]
+									.filter(
+										(value): value is string =>
+											typeof value === "string" && value.length > 0,
+									)
+									.join("\n\n");
+								if (reasoning)
+									copy.content = `${reasoning}${typeof copy.content === "string" && copy.content ? `\n\n${copy.content}` : ""}`;
+							}
+							delete copy.reasoning_content;
+							delete copy.reasoning;
+						}
 						cleaned[i] = copy;
 					}
 				}
@@ -312,14 +340,18 @@ function completionConsumer(
 			textClosed = true;
 		}
 	};
-	const addThinking = (delta: string) => {
+	const addThinking = (
+		delta: string,
+		field: "reasoning_content" | "reasoning",
+	) => {
 		closeText();
+		if (thinking && thinking.thinkingSignature !== field) closeThinking();
 		if (!thinking || thinkingClosed) {
 			thinking = {
 				type: "thinking",
 				thinking: "",
 				// Pi preserves signed blocks even when they contain only whitespace.
-				thinkingSignature: "reasoning_content",
+				thinkingSignature: field,
 			};
 			thinkingClosed = false;
 			output.content.push(thinking);
@@ -384,15 +416,16 @@ function completionConsumer(
 			if (message.role === "function_in_progress") return;
 			if (message.content != null && typeof message.content !== "string")
 				throw new Error("Invalid GigaChat content");
-			if (
-				message.reasoning_content != null &&
-				typeof message.reasoning_content !== "string"
-			)
-				throw new Error("Invalid GigaChat reasoning_content");
+			for (const field of ["reasoning_content", "reasoning"] as const) {
+				if (message[field] != null && typeof message[field] !== "string")
+					throw new Error(`Invalid GigaChat ${field}`);
+			}
 			if (typeof message.functions_state_id === "string")
 				signature = STATE_SIGNATURE_PREFIX + message.functions_state_id;
-			if (message.reasoning_content)
-				addThinking(message.reasoning_content as string);
+			for (const field of ["reasoning_content", "reasoning"] as const) {
+				const value = message[field];
+				if (typeof value === "string" && value) addThinking(value, field);
+			}
 			if (message.content) addText(message.content as string);
 			if (message.function_call != null) {
 				const call = message.function_call;

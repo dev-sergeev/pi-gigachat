@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
+import { Response as UndiciResponse } from 'undici';
 import { describeDiscoveryError, discoverModels } from '../dist/discovery.js';
 import { chooseModels } from '../dist/gigachat-dialogs.js';
 
@@ -35,22 +36,18 @@ async function withServer(respond, run) {
   }
 }
 
+const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImmediate); };
+
 // The public discovery call and actual HTTP requests are the seam: probes are
 // scoped to each exact server Model ID, not catalog rows or display names.
-test('deduplicates exact Model IDs before serial one-token probes and accepts truncated empty completions', async () => {
-  let active = 0;
-  let peak = 0;
-  await withServer(async (req, res) => {
+test('deduplicates exact Model IDs before one-token probes and accepts truncated empty completions', async () => {
+  await withServer((req, res) => {
     if (req.method === 'GET') return json(res, { data: [
       { id: 'Exact', name: 'First\u001b[31m name', context_window: 8192, max_output_tokens: 256, reasoning: false },
       { id: 'Exact', name: 'Duplicate' },
       { id: 'exact', name: 'First name' },
       { id: '' }, { id: 'bad\nmodel' }, { name: 'No ID' },
     ] });
-    active++;
-    peak = Math.max(peak, active);
-    await new Promise(resolve => setTimeout(resolve, 15));
-    active--;
     json(res, completion('', 'length'));
   }, async ({ baseUrl, requests }) => {
     const progress = [];
@@ -64,8 +61,8 @@ test('deduplicates exact Model IDs before serial one-token probes and accepts tr
     assert.equal(probes[0].model.maxTokens, 256);
     assert.equal(probes[0].model.reasoning, false);
     assert.equal(probes[0].model.thinkingLevelMap, undefined);
-    assert.deepEqual(progress, [[0, 2, undefined], [1, 2, 'Exact'], [2, 2, 'exact']]);
-    assert.equal(peak, 1);
+    assert.deepEqual(progress.map(([completed, total]) => [completed, total]), [[0, 2], [1, 2], [2, 2]]);
+    assert.deepEqual(progress.slice(1).map(([, , id]) => id).sort(), ['Exact', 'exact']);
     assert.deepEqual(requests.map(req => req.url), ['/v1/models', '/v1/chat/completions', '/v1/chat/completions']);
     for (const req of requests) assert.equal(req.headers.authorization, `Bearer ${secret}`);
     assert.deepEqual(requests.slice(1).map(req => req.body), ['Exact', 'exact'].map(model => ({
@@ -106,6 +103,87 @@ for (const protocol of ['v1', 'v2', 'openai']) {
   });
 }
 
+for (const protocol of ['v1', 'v2', 'openai']) {
+  test(`${protocol} keeps five models in flight and refills each free slot without batching`, { timeout: 3000 }, async () => {
+    const ids = Array.from({ length: 7 }, (_, index) => `model-${index}`);
+    const starts = ids.map(() => [Promise.withResolvers(), Promise.withResolvers()]);
+    const reports = ids.map(() => Promise.withResolvers());
+    const attempts = ids.map(() => 0);
+    const active = new Map();
+    const progress = [];
+    let peak = 0;
+    await withServer((req, res) => {
+      if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
+      const index = ids.indexOf(req.body.model);
+      assert.ok(!active.has(index), 'attempts of the same model must never overlap');
+      active.set(index, res);
+      peak = Math.max(peak, active.size);
+      assert.ok(active.size <= 5);
+      starts[index][attempts[index]++].resolve();
+    }, async ({ baseUrl, requests }) => {
+      const release = (index, status = 200) => {
+        const res = active.get(index);
+        active.delete(index);
+        json(res, status === 200
+          ? protocol === 'v2'
+            ? { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' }
+            : completion()
+          : { error: 'temporary' }, status);
+      };
+      const pending = discoverModels(baseUrl, secret, {
+        protocol, signal: new AbortController().signal,
+        progress: (_completed, _total, probe) => {
+          if (probe) { progress.push(probe.model.id); reports[progress.length - 1].resolve(); }
+        },
+      });
+      await Promise.all(starts.slice(0, 5).map(attempts => attempts[0].promise));
+      await flush();
+      assert.equal(requests.length, 6, 'only the initial five models may start');
+      release(2, 503);
+      await starts[2][1].promise;
+      assert.equal(active.size, 5, 'a retry retains its model slot');
+      assert.equal(attempts[5], 0);
+      release(2);
+      await starts[5][0].promise;
+      assert.equal(active.size, 5, 'the sixth model starts while the other four are held');
+      release(5);
+      await starts[6][0].promise;
+      assert.equal(active.size, 5, 'the seventh model also refills immediately');
+      release(6);
+      await reports[2].promise;
+      for (const index of [0, 1, 3, 4]) release(index);
+      const probes = await pending;
+      assert.equal(peak, 5);
+      assert.deepEqual(probes.map(probe => probe.model.id), ids);
+      assert.ok(probes.every(probe => probe.status === 'available'));
+      assert.deepEqual(progress.slice(0, 3), [ids[2], ids[5], ids[6]], 'progress follows completion, not catalog order');
+      assert.deepEqual(attempts, [1, 1, 2, 1, 1, 1, 1], 'successful models never use their remaining attempts');
+    });
+  });
+
+  for (const count of [0, 2]) {
+    test(`${protocol} handles a catalog of ${count} models`, async () => {
+      const ids = Array.from({ length: count }, (_, index) => `model-${index}`);
+      await withServer((req, res) => {
+        if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
+        json(res, protocol === 'v2'
+          ? { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' }
+          : completion());
+      }, async ({ baseUrl, requests }) => {
+        const progress = [];
+        const probes = await discoverModels(baseUrl, secret, {
+          protocol, signal: new AbortController().signal,
+          progress: (completed, total) => progress.push([completed, total]),
+        });
+        assert.deepEqual(probes.map(probe => probe.model.id), ids);
+        assert.ok(probes.every(probe => probe.status === 'available'));
+        assert.equal(requests.length, count + 1);
+        assert.deepEqual(progress, Array.from({ length: count + 1 }, (_, completed) => [completed, count]));
+      });
+    });
+  }
+}
+
 test('explicit catalogs may use another trusted origin with the same connection authorization', async () => {
   await withServer((_req, res) => json(res, { data: [{ id: 'remote-catalog-model' }] }), async catalogServer => {
     await withServer((_req, res) => json(res, completion()), async generationServer => {
@@ -143,15 +221,9 @@ test('unknown protocols, invalid full catalog URLs and either insecure mTLS endp
   });
 });
 
-test('OpenAI probes retain parallel execution and accept modern multiple tool calls while rejecting malformed calls', async () => {
-  let active = 0;
-  let peak = 0;
-  await withServer(async (req, res) => {
+test('OpenAI probes accept modern multiple tool calls while rejecting malformed calls', async () => {
+  await withServer((req, res) => {
     if (req.method === 'GET') return json(res, { data: [{ id: 'one' }, { id: 'two' }, { id: 'malformed' }] });
-    active++;
-    peak = Math.max(peak, active);
-    await new Promise(resolve => setTimeout(resolve, 15));
-    active--;
     json(res, { choices: [{ finish_reason: 'tool_calls', message: {
       role: 'assistant', content: null,
       tool_calls: [
@@ -163,21 +235,14 @@ test('OpenAI probes retain parallel execution and accept modern multiple tool ca
   }, async ({ baseUrl, requests }) => {
     const probes = await discoverModels(baseUrl, secret, { protocol: 'openai', signal: new AbortController().signal });
     assert.deepEqual(probes.map(probe => probe.status), ['available', 'available', 'unavailable']);
-    assert(peak > 1, 'OpenAI-compatible servers must not inherit the V1 single-generation queue');
-    assert.equal(requests.filter(request => request.body?.model === 'malformed').length, 3);
+    assert.equal(requests.filter(request => request.body?.model === 'malformed').length, 5);
   });
 });
 
-test('V2 probes serialize and validate native messages and finish reasons rather than V1 choices', async () => {
-  let active = 0;
-  let peak = 0;
+test('V2 probes validate native messages and finish reasons rather than V1 choices', async () => {
   const ids = ['native', 'v1-envelope', 'missing-finish', 'invalid-content', 'valid-calls'];
-  await withServer(async (req, res) => {
+  await withServer((req, res) => {
     if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
-    active++;
-    peak = Math.max(peak, active);
-    await new Promise(resolve => setTimeout(resolve, 5));
-    active--;
     const responses = {
       native: { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' },
       'v1-envelope': completion(),
@@ -189,10 +254,12 @@ test('V2 probes serialize and validate native messages and finish reasons rather
       ] }], finish_reason: 'function_call' },
     };
     json(res, responses[req.body.model]);
-  }, async ({ baseUrl }) => {
+  }, async ({ baseUrl, requests }) => {
     const probes = await discoverModels(baseUrl.replace('/v1', '/v2'), secret, { protocol: 'v2', signal: new AbortController().signal });
     assert.deepEqual(probes.map(probe => probe.status), ['available', 'unavailable', 'unavailable', 'unavailable', 'available']);
-    assert.equal(peak, 1);
+    for (const probe of probes) {
+      assert.equal(requests.filter(req => req.body?.model === probe.model.id).length, probe.status === 'available' ? 1 : 5);
+    }
   });
 });
 
@@ -268,7 +335,7 @@ test('refreshing model availability preserves selected saved parameters and give
   });
 });
 
-test('keeps partial successes and exhausts three attempts for HTTP and network failures', async () => {
+test('keeps partial successes and exhausts five attempts for HTTP and network failures', async () => {
   const ids = ['good', 'denied', 'invalid', 'limited', 'server-down', 'network-down', 'last-good'];
   await withServer((req, res) => {
     if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
@@ -289,12 +356,11 @@ test('keeps partial successes and exhausts three attempts for HTTP and network f
     assert.deepEqual(probes.map(probe => probe.status), [
       'available', 'unavailable', 'unavailable', 'unavailable', 'unavailable', 'unavailable', 'available',
     ]);
-    assert.deepEqual(reported, probes);
-    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), [
-      'good', 'denied', 'denied', 'denied', 'invalid', 'invalid', 'invalid',
-      'limited', 'limited', 'limited', 'server-down', 'server-down', 'server-down',
-      'network-down', 'network-down', 'network-down', 'last-good',
-    ]);
+    assert.deepEqual(reported.map(probe => probe.model.id).sort(), [...ids].sort());
+    for (const id of ids) {
+      assert.equal(requests.filter(req => req.body?.model === id).length, id.endsWith('good') ? 1 : 5);
+    }
+    assert.ok(probes.filter(probe => probe.status === 'unavailable').every(probe => /after 5 attempts/.test(probe.reason)));
     assert.match(probes[1].reason, /403.*denied/i);
     assert.match(probes[3].reason, /429.*rate/i);
     assert.match(probes[4].reason, /503.*temporar/i);
@@ -324,8 +390,9 @@ test('a model can recover on its third attempt after different errors without re
     assert.deepEqual(probes.map(probe => [probe.model.id, probe.status]), [
       ['recovering', 'available'], ['next', 'available'],
     ]);
-    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model),
-      ['recovering', 'recovering', 'recovering', 'next']);
+    assert.deepEqual(requests.filter(req => req.body?.model === 'recovering').map(req => req.body.model),
+      ['recovering', 'recovering', 'recovering']);
+    assert.equal(requests.filter(req => req.body?.model === 'next').length, 1);
     assert.deepEqual(progress, [[0, 2, undefined], [1, 2, 'available'], [2, 2, 'available']]);
   });
 });
@@ -389,7 +456,7 @@ test('malformed completions exhaust their attempts without preventing later succ
       assert.match(probe.reason, /invalid response/i);
       assert.ok(!probe.reason.includes(secret));
     }
-    assert.equal(requests.length, 20);
+    assert.equal(requests.length, 32);
   });
 });
 
@@ -415,32 +482,49 @@ test('cancellation after catalog enumeration prevents the first paid probe', asy
   });
 });
 
-test('cancellation from partial progress preserves reported success but never probes remaining models', async () => {
-  await withServer((req, res) => {
-    if (req.method === 'GET') return json(res, { data: [{ id: 'one' }, { id: 'two' }] });
-    json(res, completion());
-  }, async ({ baseUrl, requests }) => {
+for (const protocol of ['v1', 'v2', 'openai']) {
+  test(`${protocol} cancellation from progress stops active and queued models without late reports`, { timeout: 3000 }, async () => {
+    const ids = Array.from({ length: 7 }, (_, index) => `model-${index}`);
+    const ready = Promise.withResolvers();
+    const responses = [];
     const controller = new AbortController();
     const reason = new Error('cancel after first probe');
     const reported = [];
-    await assert.rejects(discoverModels(baseUrl, secret, {
-      signal: controller.signal,
-      progress: (completed, _total, probe) => {
-        if (completed === 1) { reported.push(probe); controller.abort(reason); }
-      },
-    }), error => error === reason);
-    assert.deepEqual(reported.map(probe => [probe.model.id, probe.status]), [['one', 'available']]);
-    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), ['one']);
+    await withServer((req, res) => {
+      if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
+      responses.push({ id: req.body.model, res });
+      if (responses.length === 5) ready.resolve();
+    }, async ({ baseUrl, requests }) => {
+      const pending = discoverModels(baseUrl, secret, {
+        protocol, signal: controller.signal,
+        progress: (_completed, _total, probe) => {
+          if (probe) { reported.push(probe); controller.abort(reason); }
+        },
+      });
+      const rejected = assert.rejects(pending, error => error === reason);
+      await ready.promise;
+      const body = protocol === 'v2'
+        ? { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' }
+        : completion();
+      json(responses[0].res, body);
+      await rejected;
+      for (const { res } of responses.slice(1)) json(res, body);
+      await flush();
+      assert.deepEqual(reported.map(probe => [probe.model.id, probe.status]), [[responses[0].id, 'available']]);
+      assert.equal(requests.length, 6, 'queued models and retries must not start after cancellation');
+    });
   });
-});
+}
 
 for (const phase of ['catalog', 'probe']) {
   test(`cancelling an in-flight ${phase} propagates cancellation without an error status row`, async () => {
     const controller = new AbortController();
     const reason = new Error(`cancel during ${phase}`);
-    await withServer((req, res) => {
-      if (req.method === 'GET' && phase === 'probe') return json(res, { data: [{ id: 'one' }, { id: 'two' }] });
-      controller.abort(reason);
+    await withServer((req, res, requests) => {
+      if (req.method === 'GET' && phase === 'probe') return json(res, {
+        data: Array.from({ length: 7 }, (_, index) => ({ id: `model-${index}` })),
+      });
+      if (phase === 'catalog' || requests.length === 6) controller.abort(reason);
       // Leave the response open: abort must interrupt transport consumption.
     }, async ({ baseUrl, requests }) => {
       const reported = [];
@@ -449,55 +533,97 @@ for (const phase of ['catalog', 'probe']) {
         progress: (_completed, _total, probe) => { if (probe) reported.push(probe); },
       }), error => error === reason);
       assert.deepEqual(reported, []);
-      assert.equal(requests.length, phase === 'catalog' ? 1 : 2);
+      await flush();
+      assert.equal(requests.length, phase === 'catalog' ? 1 : 6);
     });
   });
 }
 
-test('each probe attempt times out after five seconds while reading the body, independently of generation settings', { timeout: 25000 }, async t => {
-  const original = process.env.GIGACHAT_TIMEOUT;
-  process.env.GIGACHAT_TIMEOUT = '1';
-  const started = [];
-  try {
-    await withServer((req, res) => {
-      if (req.method === 'GET') return json(res, { data: [{ id: 'slow' }, { id: 'good' }] });
-      started.push(performance.now());
-      if (req.body.model === 'good') return json(res, completion());
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.write('{"choices":[');
-      // Headers arrived, but the body never completes.
-    }, async ({ baseUrl, requests }) => {
-      const probes = await discoverModels(baseUrl, secret, { signal: t.signal });
-      assert.deepEqual(probes.map(probe => probe.status), ['unavailable', 'available']);
-      assert.match(probes[0].reason, /timed out/i);
-      assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model),
-        ['slow', 'slow', 'slow', 'good']);
-      for (let index = 1; index < started.length; index++) {
-        const elapsed = started[index] - started[index - 1];
-        assert(elapsed >= 4500 && elapsed < 6500, `Expected a fresh five-second attempt, got ${elapsed} ms`);
-      }
+for (const protocol of ['v1', 'v2', 'openai']) {
+  test(`${protocol} uses exact 1/3/9/27/60-second body deadlines with virtual time, independent of generation settings`, { timeout: 3000 }, async t => {
+    const original = process.env.GIGACHAT_TIMEOUT;
+    process.env.GIGACHAT_TIMEOUT = '1';
+    const reads = Array.from({ length: 5 }, () => Promise.withResolvers());
+    const timers = [];
+    let now = 0;
+    let reading = 0;
+    // AbortSignal.timeout uses internal timers, so virtualize that boundary directly.
+    t.mock.method(AbortSignal, 'timeout', delay => {
+      const controller = new AbortController();
+      timers.push({ delay, deadline: now + delay, controller });
+      return controller.signal;
     });
-  } finally {
-    if (original === undefined) delete process.env.GIGACHAT_TIMEOUT;
-    else process.env.GIGACHAT_TIMEOUT = original;
-  }
-});
+    const advance = milliseconds => {
+      now += milliseconds;
+      for (const timer of timers) {
+        if (timer.deadline <= now && !timer.controller.signal.aborted)
+          timer.controller.abort(new DOMException('Request deadline exceeded', 'TimeoutError'));
+      }
+    };
+    const originalJson = UndiciResponse.prototype.json;
+    t.mock.method(UndiciResponse.prototype, 'json', function () {
+      if (this.headers.has('x-test-slow')) reads[reading++].resolve();
+      return originalJson.call(this);
+    });
+    try {
+      await withServer((req, res) => {
+        if (req.method === 'GET') return json(res, { data: [{ id: 'slow' }] });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'X-Test-Slow': 'true' });
+        res.write('{"unfinished":');
+      }, async ({ baseUrl, requests }) => {
+        const pending = discoverModels(baseUrl, secret, { protocol, signal: t.signal });
+        for (const [index, delay] of [1000, 3000, 9000, 27000, 60000].entries()) {
+          await reads[index].promise;
+          assert.equal(timers.at(-1).delay, delay);
+          assert.equal(requests.length, index + 2);
+          advance(delay - 1);
+          await flush();
+          assert.equal(reading, index + 1, 'a fresh attempt must keep its entire deadline');
+          assert.equal(requests.length, index + 2, 'no retry before the deadline');
+          advance(1);
+        }
+        const probes = await pending;
+        assert.equal(probes[0].status, 'unavailable');
+        assert.match(probes[0].reason, /after 5 attempts.*timed out/i);
+        assert.deepEqual(timers.map(timer => timer.delay), [1000, 1000, 3000, 9000, 27000, 60000]);
+        assert.equal(requests.length, 6);
+        advance(3600000);
+        await flush();
+        assert.equal(requests.length, 6);
+      });
+    } finally {
+      if (original === undefined) delete process.env.GIGACHAT_TIMEOUT;
+      else process.env.GIGACHAT_TIMEOUT = original;
+    }
+  });
+}
 
-test('cancelling during a retry stops remaining attempts and models without reporting unavailability', async () => {
+test('cancelling during a retry stops remaining attempts and queued models without reporting unavailability', { timeout: 3000 }, async () => {
   const controller = new AbortController();
   const reason = new Error('cancel second attempt');
-  let attempts = 0;
+  const ready = Promise.withResolvers();
+  const responses = new Map();
   await withServer((req, res) => {
-    if (req.method === 'GET') return json(res, { data: [{ id: 'one' }, { id: 'two' }] });
-    if (++attempts === 1) return json(res, { error: 'temporary' }, 503);
-    controller.abort(reason);
+    if (req.method === 'GET') return json(res, {
+      data: Array.from({ length: 7 }, (_, index) => ({ id: `model-${index}` })),
+    });
+    if (responses.has(req.body.model)) return controller.abort(reason);
+    responses.set(req.body.model, res);
+    if (responses.size === 5) ready.resolve();
   }, async ({ baseUrl, requests }) => {
     const reported = [];
-    await assert.rejects(discoverModels(baseUrl, secret, {
+    const pending = discoverModels(baseUrl, secret, {
       signal: controller.signal,
       progress: (_completed, _total, probe) => { if (probe) reported.push(probe); },
-    }), error => error === reason);
+    });
+    const rejected = assert.rejects(pending, error => error === reason);
+    await ready.promise;
+    json(responses.get('model-0'), { error: 'temporary' }, 503);
+    await rejected;
+    await flush();
     assert.deepEqual(reported, []);
-    assert.deepEqual(requests.filter(req => req.method === 'POST').map(req => req.body.model), ['one', 'one']);
+    assert.equal(requests.length, 7);
+    assert.deepEqual(requests.filter(req => req.body?.model === 'model-0').map(req => req.body.model), ['model-0', 'model-0']);
+    assert.ok(requests.filter(req => req.body).every(req => responses.has(req.body.model)));
   });
 });

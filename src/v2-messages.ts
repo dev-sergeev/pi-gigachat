@@ -30,6 +30,7 @@ export function convertV2Messages(
 	model: Model<Api>,
 	context: TranscriptContext,
 	additionalSystemPrompt?: string,
+	inContent = false,
 ): V2Message[] {
 	const messages: V2Message[] = [];
 	const history = transformMessages(
@@ -68,13 +69,13 @@ export function convertV2Messages(
 		}
 		if (message.role === "assistant") {
 			pending.clear();
-			const content: V2Content[] = [];
+			let content: V2Content[] = [];
 			let state: string | undefined;
 			const reasoning = message.content
 				.filter((part) => part.type === "thinking" && !part.redacted)
 				.map((part) => (part.type === "thinking" ? part.thinking : ""))
 				.join("");
-			if (reasoning)
+			if (reasoning && !inContent)
 				messages.push({
 					role: "reasoning",
 					content: [{ text: reasoning.toWellFormed() }],
@@ -98,6 +99,8 @@ export function convertV2Messages(
 				if (signature?.startsWith(V2_STATE_SIGNATURE_PREFIX))
 					state = signature.slice(V2_STATE_SIGNATURE_PREFIX.length);
 			}
+			if (reasoning && inContent)
+				content = prependReasoning(content, reasoning.toWellFormed());
 			if (content.length || state)
 				messages.push({
 					role: "assistant",
@@ -136,6 +139,51 @@ export function convertV2Messages(
 		}
 	}
 	return messages;
+}
+
+function prependReasoning(
+	content: V2Content[],
+	reasoning: string,
+): V2Content[] {
+	if (!reasoning) return content;
+	const firstText = content.findIndex((part) => typeof part?.text === "string");
+	if (firstText === -1) return [{ text: reasoning }, ...content];
+	const prefix = reasoning + (content.some((part) => part?.text) ? "\n\n" : "");
+	return content.map((part, index) =>
+		index === firstText ? { ...part, text: prefix + part.text } : part,
+	);
+}
+
+export function foldV2Reasoning(messages: V2Message[]): V2Message[] {
+	const folded: V2Message[] = [];
+	let pending: V2Message | undefined;
+	for (const message of messages) {
+		if (message?.role === "reasoning" && Array.isArray(message.content)) {
+			pending = pending
+				? { ...pending, content: [...pending.content, ...message.content] }
+				: message;
+			continue;
+		}
+		if (pending) {
+			if (message?.role === "assistant" && Array.isArray(message.content)) {
+				const reasoning = pending.content
+					.filter((part) => typeof part?.text === "string")
+					.map((part) => part.text)
+					.join("");
+				folded.push({
+					...message,
+					content: prependReasoning(message.content, reasoning),
+				});
+				pending = undefined;
+				continue;
+			}
+			folded.push({ ...pending, role: "assistant" });
+			pending = undefined;
+		}
+		folded.push(message);
+	}
+	if (pending) folded.push({ ...pending, role: "assistant" });
+	return folded;
 }
 
 function toolResultText(message: ToolResultMessage): string {

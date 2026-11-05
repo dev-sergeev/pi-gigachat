@@ -31,9 +31,10 @@ for (const streaming of [false, true]) test(`${selected.id} sends reasoning leve
       assert.equal(requests.at(-1).body.stream, streaming);
       if (level !== 'off') {
         assert.equal(answer.content[0].thinking, `Thinking at ${level}`);
+        assert.equal(answer.content[0].thinkingSignature, 'reasoning_content');
         await ask(model, { messages: [user('Hi'), JSON.parse(JSON.stringify(answer)), user('Continue')] }, options);
         const replay = requests.at(-1).body.messages.find(message => message.role === 'assistant');
-        assert.deepEqual(replay, { role: 'assistant', content: `Thinking at ${level}\n\nOK` });
+        assert.deepEqual(replay, { role: 'assistant', content: 'OK', reasoning_content: `Thinking at ${level}` });
         assert.equal(requests.at(-1).body.reasoning_effort, level);
       }
     }

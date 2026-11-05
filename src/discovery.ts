@@ -6,7 +6,7 @@ import type {
 	GigaChatProtocol,
 	ModelProbe,
 } from "./connection-types.js";
-import { GigaChatHttpError, object, request, serial } from "./http.js";
+import { GigaChatHttpError, object, request } from "./http.js";
 import { GIGACHAT_CONNECTION_DEFAULTS } from "./models.js";
 import { GigaChatMtlsError } from "./mtls.js";
 import { defaultModelsUrl, thinkingLevelMapForProtocol } from "./protocols.js";
@@ -216,7 +216,7 @@ function validateV2Completion(value: unknown): void {
 		throw new DiscoveryError("INVALID_RESPONSE");
 }
 
-/** Enumerate the catalog, then check each exact ID with up to three paid probes. */
+/** Enumerate the catalog, then check each exact ID with up to five paid probes. */
 export async function discoverModels(
 	baseUrl: string,
 	apiKey: string,
@@ -262,62 +262,69 @@ export async function discoverModels(
 		async (response) => catalog(await readJson(response), protocol),
 	);
 	options.signal.throwIfAborted();
-	const probeTransport = { ...transport, timeoutMs: 5000 };
+	const timeouts = [1000, 3000, 9000, 27000, 60000];
 	const consumeProbe = async (response: Response) =>
 		validateCompletion(await readJson(response), protocol);
 	let completed = 0;
 	options.progress?.(0, models.length);
 	const probeModel = async (model: ConnectionModel): Promise<ModelProbe> => {
 		options.signal.throwIfAborted();
-		const work = async (): Promise<ModelProbe> => {
-			const init = {
-				method: "POST",
-				headers,
-				body: JSON.stringify({
-					model: model.id,
-					messages: [
-						{
-							role: "user",
-							content: protocol === "v2" ? [{ text: "Hi" }] : "Hi",
-						},
-					],
-					...(protocol === "v2"
-						? { model_options: { max_tokens: 1 } }
-						: { max_tokens: 1 }),
-					stream: false,
-				}),
-			};
-			for (let attempt = 1; ; attempt++) {
-				try {
-					await request(
-						`${root}/chat/completions`,
-						init,
-						probeTransport,
-						consumeProbe,
-					);
-					return { model, status: "available" };
-				} catch (error) {
-					options.signal.throwIfAborted();
-					if (attempt === 3)
-						return {
-							model,
-							status: "unavailable",
-							reason: `GigaChat model unavailable after 3 attempts. ${describeDiscoveryError(error)}`,
-						};
+		const init = {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				model: model.id,
+				messages: [
+					{
+						role: "user",
+						content: protocol === "v2" ? [{ text: "Hi" }] : "Hi",
+					},
+				],
+				...(protocol === "v2"
+					? { model_options: { max_tokens: 1 } }
+					: { max_tokens: 1 }),
+				stream: false,
+			}),
+		};
+		let probe: ModelProbe;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await request(
+					`${root}/chat/completions`,
+					init,
+					{ ...transport, timeoutMs: timeouts[attempt] },
+					consumeProbe,
+				);
+				probe = { model, status: "available" };
+				break;
+			} catch (error) {
+				options.signal.throwIfAborted();
+				if (attempt === timeouts.length - 1) {
+					probe = {
+						model,
+						status: "unavailable",
+						reason: `GigaChat model unavailable after 5 attempts. ${describeDiscoveryError(error)}`,
+					};
+					break;
 				}
 			}
-		};
-		const probe = await (protocol === "openai"
-			? work()
-			: serial(options.signal, work));
+		}
 		options.signal.throwIfAborted();
 		options.progress?.(++completed, models.length, probe);
 		return probe;
 	};
 	const probes: ModelProbe[] = [];
-	if (protocol === "openai")
-		probes.push(...(await Promise.all(models.map(probeModel))));
-	else for (const model of models) probes.push(await probeModel(model));
+	let next = 0;
+	// Scan probes intentionally bypass the ordinary single-generation queue.
+	await Promise.all(
+		Array.from({ length: Math.min(5, models.length) }, async () => {
+			while (next < models.length) {
+				options.signal.throwIfAborted();
+				const index = next++;
+				probes[index] = await probeModel(models[index]);
+			}
+		}),
+	);
 	options.signal.throwIfAborted();
 	return probes;
 }

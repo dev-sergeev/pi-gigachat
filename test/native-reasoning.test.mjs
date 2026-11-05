@@ -23,12 +23,14 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       await pi.prompt(`Read ${path}`);
       assert(pi.events.some(e => e.type === 'tool_execution_end' && !e.isError));
       const followup = requests[1].body.messages.find(m => m.role === 'assistant');
-      assert(!Object.hasOwn(followup, 'reasoning_content'));
+      assert.equal(followup.reasoning_content, toolThought);
+      assert(!Object.hasOwn(followup, 'reasoning'));
       assert(!Object.hasOwn(followup, 'functions_state_id'));
-      assert.equal(followup.content, toolThought);
+      assert.equal(followup.content, '');
       const messages = (await pi.command('get_messages')).data.messages;
       const assistants = messages.filter(m => m.role === 'assistant');
       assert.deepEqual(assistants.map(m => m.content[0].thinking), [toolThought, answerThought]);
+      assert.deepEqual(assistants.map(m => m.content[0].thinkingSignature), ['reasoning_content', 'reasoning']);
       const thinkingEvents = pi.events.filter(e => e.type === 'message_update' && e.assistantMessageEvent?.type?.startsWith('thinking'));
       assert.equal(thinkingEvents.filter(e => e.assistantMessageEvent.type === 'thinking_end').length, 2);
       assert.deepEqual((await pi.entries()).filter(e => e.type === 'message' && e.message.role === 'assistant').map(e => e.message.content), assistants.map(m => m.content));
@@ -43,9 +45,12 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       assert.deepEqual((await pi.command('get_messages')).data.messages.filter(m => m.role === 'assistant').map(m => m.content), assistants.map(m => m.content));
       await pi.prompt('Continue from the previous reasoning.');
       const replayed = requests.at(-1).body.messages.filter(m => m.role === 'assistant');
-      assert(replayed.every(m => !Object.hasOwn(m, 'reasoning_content')));
-      assert.equal(replayed[0].content, toolThought);
-      assert.equal(replayed[1].content, `${answerThought}\n\nThe file contains NATIVE_REASONING_FIXTURE_742.`);
+      assert.equal(replayed[0].reasoning_content, toolThought);
+      assert(!Object.hasOwn(replayed[0], 'reasoning'));
+      assert.equal(replayed[0].content, '');
+      assert.equal(replayed[1].reasoning, answerThought);
+      assert(!Object.hasOwn(replayed[1], 'reasoning_content'));
+      assert.equal(replayed[1].content, 'The file contains NATIVE_REASONING_FIXTURE_742.');
       assert(replayed.every(m => !Object.hasOwn(m, 'functions_state_id')));
       for (let i = 0; i < 3; i++) await pi.prompt(`Keep the file fact ${i}. ${'conversation '.repeat(200)}`);
       const compacted = await pi.command('compact');
@@ -66,7 +71,7 @@ for (const streaming of [false, true]) test(`native Pi displays, saves, resumes 
       called = true;
       reply(req, res, completion({ role: 'assistant', content: '', reasoning_content: toolThought,
         function_call: { name: 'read', arguments: { path } }, functions_state_id: 'native-reasoning-state' }, 'function_call'));
-    } else reply(req, res, completion({ role: 'assistant', content: 'The file contains NATIVE_REASONING_FIXTURE_742.', reasoning_content: answerThought }));
+    } else reply(req, res, completion({ role: 'assistant', content: 'The file contains NATIVE_REASONING_FIXTURE_742.', reasoning: answerThought }));
   });
 });
 
@@ -82,6 +87,8 @@ test('native model handoff drops foreign thinking but retains visible history an
       assert(previousAnswers.some(message => message.content.includes('VISIBLE_HANDOFF_FACT_742')));
       assert(previousAnswers.every(message => !message.content.includes('FOREIGN_PRIVATE_THOUGHT_742')),
         'Pi 1.3 must not turn another model\'s thinking into visible conversation');
+      assert(previousAnswers.every(message => !Object.hasOwn(message, 'reasoning_content') && !Object.hasOwn(message, 'reasoning')),
+        'Foreign reasoning must not be replayed in either native field');
       const saved = (await pi.entries()).filter(entry => entry.type === 'message' && entry.message.role === 'assistant');
       assert(saved[0].message.content.some(block => block.type === 'thinking' && block.thinking === 'FOREIGN_PRIVATE_THOUGHT_742'),
         'Dropping foreign thinking from a request must not alter saved reasoning');

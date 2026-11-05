@@ -11,6 +11,8 @@ import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages"
 interface GigaChatMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content: string;
+	reasoning_content?: string;
+	reasoning?: string;
 	tool_call_id?: string;
 	tool_calls?: {
 		id: string;
@@ -23,6 +25,7 @@ export function convertMessages(
 	model: Model<Api>,
 	context: TranscriptContext,
 	additionalSystemPrompt?: string,
+	inContent = false,
 ): GigaChatMessage[] {
 	const messages: GigaChatMessage[] = [];
 	const transformedMessages = transformMessages(
@@ -55,17 +58,33 @@ export function convertMessages(
 							.join("\n");
 			if (content) messages.push({ role: "user", content });
 		} else if (message.role === "assistant") {
-			const thinking = message.content
-				.filter((item) => item.type === "thinking" && !item.redacted)
-				.map((item) => (item.type === "thinking" ? item.thinking : ""))
-				.join("");
+			const thinking = message.content.filter(
+				(item) => item.type === "thinking" && !item.redacted,
+			);
+			const reasoning = inContent
+				? thinking
+						.map((item) => (item.type === "thinking" ? item.thinking : ""))
+						.join("")
+				: "";
 			const text = message.content
 				.filter((item) => item.type === "text")
 				.map((item) => item.text)
 				.join("");
 			const content = (
-				thinking ? `${thinking}${text ? `\n\n${text}` : ""}` : text
+				inContent && reasoning
+					? `${reasoning}${text ? `\n\n${text}` : ""}`
+					: text
 			).toWellFormed();
+			const native: { reasoning_content?: string; reasoning?: string } = {};
+			if (!inContent) {
+				for (const item of thinking) {
+					if (item.type !== "thinking") continue;
+					const field = item.thinkingSignature;
+					if (field === "reasoning_content" || field === "reasoning")
+						native[field] =
+							(native[field] ?? "") + item.thinking.toWellFormed();
+				}
+			}
 			const tool_calls = message.content
 				.filter((item) => item.type === "toolCall")
 				.map((call) => {
@@ -82,6 +101,7 @@ export function convertMessages(
 			messages.push({
 				role: "assistant",
 				content,
+				...native,
 				...(tool_calls.length ? { tool_calls } : {}),
 			});
 		} else if (message.role === "toolResult") {
