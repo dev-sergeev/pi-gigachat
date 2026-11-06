@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { Response as UndiciResponse } from 'undici';
-import { describeDiscoveryError, discoverModels } from '../dist/discovery.js';
+import { describeDiscoveryError, discoverModels, retryModel } from '../dist/discovery.js';
 import { chooseModels } from '../dist/gigachat-dialogs.js';
 
 for (const key of Object.keys(process.env)) {
@@ -324,7 +324,7 @@ test('refreshing model availability preserves selected saved parameters and give
         component.handleInput('confirm');
       }),
     } };
-    const chosen = await chooseModels(ctx, probes, saved);
+    const chosen = await chooseModels(ctx, probes, () => { throw new Error('Unexpected manual retry'); }, saved);
     assert.deepEqual(chosen, [saved[0], saved[1], probes[2].model]);
     assert.equal(chosen[0], saved[0]);
     assert.equal(chosen[1], saved[1]);

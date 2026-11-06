@@ -216,35 +216,29 @@ function validateV2Completion(value: unknown): void {
 		throw new DiscoveryError("INVALID_RESPONSE");
 }
 
-/** Enumerate the catalog, then check each exact ID with up to five paid probes. */
-export async function discoverModels(
+interface ProbeConnection {
+	root: string;
+	protocol: GigaChatProtocol;
+	headers: Headers;
+	transport: Pick<DiscoveryOptions, "signal" | "mtls"> & { maxRetries: number };
+}
+
+function probeConnection(
 	baseUrl: string,
 	apiKey: string,
-	options: DiscoveryOptions,
-): Promise<ModelProbe[]> {
+	options: Pick<DiscoveryOptions, "signal" | "protocol" | "mtls">,
+): ProbeConnection {
 	options.signal.throwIfAborted();
 	const protocol = options.protocol === undefined ? "v1" : options.protocol;
 	if (protocol !== "v1" && protocol !== "v2" && protocol !== "openai")
 		throw new DiscoveryError("INVALID_PROTOCOL");
 	let root: string;
-	let modelsUrl: string;
 	try {
 		root = normalizeBaseUrl(baseUrl);
-		modelsUrl =
-			options.modelsUrl === undefined
-				? defaultModelsUrl(root, protocol)
-				: options.modelsUrl;
-		if (!["http:", "https:"].includes(new URL(modelsUrl).protocol))
-			throw new DiscoveryError("INVALID_URL");
 	} catch {
 		throw new DiscoveryError("INVALID_URL");
 	}
-	// Reject both URLs before making even the first request with a client certificate.
-	if (
-		options.mtls &&
-		(new URL(root).protocol !== "https:" ||
-			new URL(modelsUrl).protocol !== "https:")
-	)
+	if (options.mtls && new URL(root).protocol !== "https:")
 		throw new GigaChatMtlsError(
 			"GigaChat certificate authorization requires HTTPS for generation and the model catalog.",
 		);
@@ -255,6 +249,97 @@ export async function discoverModels(
 		maxRetries: 0,
 		mtls: options.mtls,
 	};
+	return { root, protocol, headers, transport };
+}
+
+async function probeModel(
+	connection: ProbeConnection,
+	model: ConnectionModel,
+	timeouts: readonly number[],
+): Promise<ModelProbe> {
+	const { root, protocol, headers, transport } = connection;
+	const signal = transport.signal;
+	signal.throwIfAborted();
+	const init = {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			model: model.id,
+			messages: [
+				{
+					role: "user",
+					content: protocol === "v2" ? [{ text: "Hi" }] : "Hi",
+				},
+			],
+			...(protocol === "v2"
+				? { model_options: { max_tokens: 1 } }
+				: { max_tokens: 1 }),
+			stream: false,
+		}),
+	};
+	const consumeProbe = async (response: Response) =>
+		validateCompletion(await readJson(response), protocol);
+	let probe: ModelProbe;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await request(
+				`${root}/chat/completions`,
+				init,
+				{ ...transport, timeoutMs: timeouts[attempt] },
+				consumeProbe,
+			);
+			probe = { model, status: "available" };
+			break;
+		} catch (error) {
+			signal.throwIfAborted();
+			if (attempt === timeouts.length - 1) {
+				probe = {
+					model,
+					status: "unavailable",
+					reason: `GigaChat model unavailable${timeouts.length > 1 ? ` after ${timeouts.length} attempts` : ""}. ${describeDiscoveryError(error)}`,
+				};
+				break;
+			}
+		}
+	}
+	signal.throwIfAborted();
+	return probe;
+}
+
+/** One explicit paid probe, including response consumption in its ten-minute deadline. */
+export async function retryModel(
+	baseUrl: string,
+	apiKey: string,
+	model: ConnectionModel,
+	options: Pick<DiscoveryOptions, "signal" | "protocol" | "mtls">,
+): Promise<ModelProbe> {
+	return probeModel(probeConnection(baseUrl, apiKey, options), model, [600000]);
+}
+
+/** Enumerate the catalog, then check each exact ID with up to five paid probes. */
+export async function discoverModels(
+	baseUrl: string,
+	apiKey: string,
+	options: DiscoveryOptions,
+): Promise<ModelProbe[]> {
+	const connection = probeConnection(baseUrl, apiKey, options);
+	const { root, protocol, headers, transport } = connection;
+	let modelsUrl: string;
+	try {
+		modelsUrl =
+			options.modelsUrl === undefined
+				? defaultModelsUrl(root, protocol)
+				: options.modelsUrl;
+		if (!["http:", "https:"].includes(new URL(modelsUrl).protocol))
+			throw new DiscoveryError("INVALID_URL");
+	} catch {
+		throw new DiscoveryError("INVALID_URL");
+	}
+	// Reject both URLs before making even the first request with a client certificate.
+	if (options.mtls && new URL(modelsUrl).protocol !== "https:")
+		throw new GigaChatMtlsError(
+			"GigaChat certificate authorization requires HTTPS for generation and the model catalog.",
+		);
 	const models = await request(
 		modelsUrl,
 		{ method: "GET", headers },
@@ -263,56 +348,8 @@ export async function discoverModels(
 	);
 	options.signal.throwIfAborted();
 	const timeouts = [1000, 3000, 9000, 27000, 60000];
-	const consumeProbe = async (response: Response) =>
-		validateCompletion(await readJson(response), protocol);
 	let completed = 0;
 	options.progress?.(0, models.length);
-	const probeModel = async (model: ConnectionModel): Promise<ModelProbe> => {
-		options.signal.throwIfAborted();
-		const init = {
-			method: "POST",
-			headers,
-			body: JSON.stringify({
-				model: model.id,
-				messages: [
-					{
-						role: "user",
-						content: protocol === "v2" ? [{ text: "Hi" }] : "Hi",
-					},
-				],
-				...(protocol === "v2"
-					? { model_options: { max_tokens: 1 } }
-					: { max_tokens: 1 }),
-				stream: false,
-			}),
-		};
-		let probe: ModelProbe;
-		for (let attempt = 0; ; attempt++) {
-			try {
-				await request(
-					`${root}/chat/completions`,
-					init,
-					{ ...transport, timeoutMs: timeouts[attempt] },
-					consumeProbe,
-				);
-				probe = { model, status: "available" };
-				break;
-			} catch (error) {
-				options.signal.throwIfAborted();
-				if (attempt === timeouts.length - 1) {
-					probe = {
-						model,
-						status: "unavailable",
-						reason: `GigaChat model unavailable after 5 attempts. ${describeDiscoveryError(error)}`,
-					};
-					break;
-				}
-			}
-		}
-		options.signal.throwIfAborted();
-		options.progress?.(++completed, models.length, probe);
-		return probe;
-	};
 	const probes: ModelProbe[] = [];
 	let next = 0;
 	// Scan probes intentionally bypass the ordinary single-generation queue.
@@ -321,7 +358,10 @@ export async function discoverModels(
 			while (next < models.length) {
 				options.signal.throwIfAborted();
 				const index = next++;
-				probes[index] = await probeModel(models[index]);
+				const probe = await probeModel(connection, models[index], timeouts);
+				probes[index] = probe;
+				options.signal.throwIfAborted();
+				options.progress?.(++completed, models.length, probe);
 			}
 		}),
 	);

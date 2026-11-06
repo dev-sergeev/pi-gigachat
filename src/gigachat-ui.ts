@@ -20,7 +20,11 @@ import {
 	createConnectionProvider,
 	prepareConnectionCredential,
 } from "./connections.js";
-import { describeDiscoveryError, discoverModels } from "./discovery.js";
+import {
+	describeDiscoveryError,
+	discoverModels,
+	retryModel,
+} from "./discovery.js";
 import type { FormField } from "./gigachat-dialogs.js";
 import { chooseModels, runProgress, showForm } from "./gigachat-dialogs.js";
 import { importMtlsMaterials } from "./mtls.js";
@@ -358,12 +362,6 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 		if ("error" in checked) throw checked.error;
 		if (checked.value.probes.length === 0)
 			throw new FormError("Сервер не вернул модели. Подключение не сохранено.");
-		if (!checked.value.probes.some((probe) => probe.status === "available")) {
-			await chooseModels(ctx, checked.value.probes);
-			throw new FormError(
-				"Нет успешно проверенных моделей. Подключение не сохранено.",
-			);
-		}
 		const switchingToV2 =
 			draft.protocol === "v2" &&
 			(previous?.gigachatConnection.protocol ?? "v1") !== "v2";
@@ -372,7 +370,25 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				? { ...model, reasoning: false, thinkingLevelMap: undefined }
 				: model,
 		);
-		const models = await chooseModels(ctx, checked.value.probes, initialModels);
+		const credential = checked.value.credential;
+		const token =
+			credential.type === "oauth"
+				? credential.access
+				: (credential.env?.GIGACHAT_ACCESS_TOKEN ?? "");
+		const models = await chooseModels(
+			ctx,
+			checked.value.probes,
+			(model, signal) =>
+				retryModel(draft.baseUrl, token, model, {
+					signal,
+					protocol: draft.protocol,
+					mtls:
+						draft.authorization.type === "mtls"
+							? draft.authorization.materials
+							: undefined,
+				}),
+			initialModels,
+		);
 		if (!models) return undefined;
 		checked.value.credential.gigachatConnection.models = models;
 		return checked.value.credential;

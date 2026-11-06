@@ -25,6 +25,14 @@ saved Pi connections.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Release 0.7.6
+
+- Added **Ctrl+R** to retry any highlighted model in `/gigachat` model selection, during connection creation or catalog refresh. It sends one generation POST with a fixed 600-second timeout, no automatic retries, and no catalog reload, using the same connection, authorization and API protocol.
+- A separate progress screen permits only one manual check at a time. **Esc** cancels that request and restores the previous model status and selection; success marks the model available and checks its box, while failure marks it unavailable and unchecks it.
+- The list remains usable when the initial scan finds no available models, so a successful manual check can recover a model for saving. Other rows, cursor position and saved model parameters are preserved.
+- The automatic five-attempt scan remains unchanged: 1/3/9/27/60-second timeouts. Automatic and manual one-token probes can be billed and do not establish tool compatibility or reasoning support.
+- **Known security limitation:** `npm audit --omit=dev` flags high-severity advisories in the locked `undici` dependency, including [dropped TLS options in `Agent`](https://github.com/advisories/GHSA-2m5v-pch6-74hx); this feature-only patch leaves the dependency range and lock unchanged, and the audit finding does not establish exploitability in this extension.
+
 ## Release 0.7.5
 
 - Removed the Pi version-number activation check, without a warning, bypass setting, or replacement gate.
@@ -137,7 +145,7 @@ authentication, or OpenAI-compatible gateway compatibility.
 With Pi installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.7.5
+pi install npm:@dev-sergeev/pi-gigachat@0.7.6
 pi
 ```
 
@@ -373,15 +381,34 @@ library callers must supply their own model definitions.
    body. These probes bypass the ordinary generation queue; normal generation
    retains its existing scheduling.
 6. Use **Space** to select successful models, **Ctrl+A** to select all successful
-   models, and **Enter** to save. Failed models remain visible with a reason but
-   cannot be selected. An empty successful set is never saved.
+   models, and **Enter** to save. Failed models remain visible with a reason and
+   cannot be selected until a successful manual check. The list opens even if
+   every automatic check failed; an empty selection is never saved.
 7. Open the normal `/model` picker and select an added model. It is available
    immediately, without restarting Pi or creating a named provider manually.
 
-The discovery generations can be billed, including repeat attempts. Any failed
-probe is retried immediately without backoff or `Retry-After` waits. After five
-failures, the model is unavailable for selection in the current check; the
-displayed reason describes the last failure. Cancellation stops active requests
+In this model-selection list, **Ctrl+R** checks the **highlighted row**, not the
+checked set, whether that model is currently available or unavailable. This works
+when creating a connection and when refreshing an existing connection's catalog,
+for V1, V2 and OpenAI-compatible connections. Each invocation sends exactly one
+generation POST through the same connection, authorization (including mTLS) and
+protocol, with a fixed **600-second timeout covering headers and the full response
+body**, no automatic transport retries and no catalog reload.
+
+A separate progress screen allows only one manual request at a time, with no
+saving or additional checks while it is running. **Esc** there aborts only that
+request and returns to the list with its former status and checkboxes unchanged.
+Success replaces the target's status with available and checks its box; failure
+replaces it with unavailable and unchecks it. Other rows, cursor position, model
+parameters and selections are preserved. A previously selected model remains
+selected after success. **Esc** from the list still cancels the wizard. Checking
+a box here does not change Pi's active model; save and use `/model` as above.
+
+Automatic and manual discovery generations can be billed, including repeat
+attempts. The automatic scan remains unchanged: any failed automatic probe is
+retried immediately without backoff or `Retry-After` waits. After five failures,
+the model is unavailable until a later successful check; the displayed reason
+describes the last failure. Cancelling the automatic scan stops active requests
 and prevents further attempts or queued model checks. A model exhausting all
 five timeouts takes 100 seconds of request time. Thirty models all exhausting
 their timeouts take about 10 minutes with five concurrent checks, excluding
@@ -389,8 +416,9 @@ catalog/authentication requests and overhead. Servers that forbid concurrent
 generations may reject probes; these failures do not prove global unavailability.
 
 A one-token output budget does not prove tool compatibility, reasoning support,
-or the server's maximum output budget. Failed checks do not replace an existing
-connection. Probe limits are independent of `GIGACHAT_TIMEOUT` and
+or the server's maximum output budget. Existing connections are replaced only
+after models are successfully checked, selected and saved. Both
+automatic and manual probe limits are independent of `GIGACHAT_TIMEOUT` and
 `GIGACHAT_MAX_RETRIES`; ordinary generation, authentication, and catalog requests
 keep their existing policies.
 
@@ -816,7 +844,7 @@ npm pack --dry-run
 
 Tests use synthetic credentials, local HTTP fixtures and actual Pi RPC sessions.
 Before release, check the same packed package on Pi 1.3.0 and the latest stable
-Pi (1.5.0 for 0.7.5), using isolated environments with matching `pi-ai`,
+Pi (1.5.0 for 0.7.6), using isolated environments with matching `pi-ai`,
 `pi-coding-agent`, and `pi-tui` dependencies. Passing these checks does not
 guarantee compatibility with other or future versions, or with a live server.
 Publication also requires a live-server smoke check on the latest stable Pi:

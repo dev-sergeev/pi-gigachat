@@ -16,6 +16,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { ConnectionModel, ModelProbe } from "./connection-types.js";
+import { describeDiscoveryError } from "./discovery.js";
 
 export interface FormField {
 	id: string;
@@ -198,93 +199,139 @@ export async function showForm(
 	);
 }
 
-export function chooseModels(
+export async function chooseModels(
 	ctx: ExtensionContext,
 	probes: ModelProbe[],
+	retry: (model: ConnectionModel, signal: AbortSignal) => Promise<ModelProbe>,
 	initial: readonly ConnectionModel[] = [],
 ): Promise<ConnectionModel[] | undefined> {
-	return ctx.ui.custom((tui, theme, keys, done) => {
-		const savedModels = new Map(initial.map((model) => [model.id, model]));
-		const selected = new Set(initial.map((model) => model.id));
-		const items: SelectItem[] = probes.map((probe) => ({
-			value: probe.model.id,
-			label: "",
-			description:
-				probe.status === "available" ? probe.model.name : probe.reason,
-		}));
-		const list = new SelectList(items, 10, {
-			selectedPrefix: (text) => theme.fg("accent", text),
-			selectedText: (text) => theme.fg("accent", text),
-			description: (text) => theme.fg("muted", text),
-			scrollInfo: (text) => theme.fg("dim", text),
-			noMatch: (text) => theme.fg("dim", text),
-		});
-		let error = "";
-		const refresh = () => {
-			for (let i = 0; i < probes.length; i++) {
-				const probe = probes[i];
-				if (probe.status !== "available") selected.delete(probe.model.id);
-				items[i].label =
-					`${probe.status !== "available" ? "[—]" : selected.has(probe.model.id) ? "[x]" : "[ ]"} ${probe.model.id}`;
-			}
-			error = "";
-			tui.requestRender();
-		};
-		refresh();
-		return {
-			render(width) {
-				return [
-					theme.fg("border", "─".repeat(width)),
-					theme.fg("accent", "Выберите модели GigaChat"),
-					theme.fg("muted", "Выбираются только успешно проверенные модели."),
-					...list.render(width),
-					...(error ? [theme.fg("error", error)] : []),
-					theme.fg(
-						"dim",
-						"Space: отметить · Ctrl+A: все доступные · Enter: сохранить выбор · Esc: отмена",
-					),
-					theme.fg("border", "─".repeat(width)),
-				].map((line) => truncateToWidth(line, width));
-			},
-			handleInput(data) {
-				if (keys.matches(data, "tui.select.cancel")) done(undefined);
-				else if (keys.matches(data, "tui.select.confirm")) {
-					const models = probes
-						.filter(
-							(probe) =>
-								probe.status === "available" && selected.has(probe.model.id),
-						)
-						.map((probe) => savedModels.get(probe.model.id) ?? probe.model);
-					if (models.length) done(models);
-					else {
-						error = "Отметьте хотя бы одну доступную модель.";
+	const savedModels = new Map(initial.map((model) => [model.id, model]));
+	const selected = new Set(
+		probes
+			.filter(
+				(probe) =>
+					probe.status === "available" && savedModels.has(probe.model.id),
+			)
+			.map((probe) => probe.model.id),
+	);
+	let highlighted = 0;
+	for (;;) {
+		const choice = await ctx.ui.custom<
+			ConnectionModel[] | { retry: number } | undefined
+		>((tui, theme, keys, done) => {
+			const items: SelectItem[] = probes.map((probe) => ({
+				value: probe.model.id,
+				label: "",
+				description:
+					probe.status === "available" ? probe.model.name : probe.reason,
+			}));
+			const list = new SelectList(items, 10, {
+				selectedPrefix: (text) => theme.fg("accent", text),
+				selectedText: (text) => theme.fg("accent", text),
+				description: (text) => theme.fg("muted", text),
+				scrollInfo: (text) => theme.fg("dim", text),
+				noMatch: (text) => theme.fg("dim", text),
+			});
+			list.setSelectedIndex(highlighted);
+			let error = "";
+			const refresh = () => {
+				for (let i = 0; i < probes.length; i++) {
+					const probe = probes[i];
+					items[i].label =
+						`${probe.status !== "available" ? "[—]" : selected.has(probe.model.id) ? "[x]" : "[ ]"} ${probe.model.id}`;
+				}
+				error = "";
+				tui.requestRender();
+			};
+			refresh();
+			return {
+				render(width) {
+					return [
+						theme.fg("border", "─".repeat(width)),
+						theme.fg("accent", "Выберите модели GigaChat"),
+						theme.fg("muted", "Выбираются только успешно проверенные модели."),
+						...list.render(width),
+						...(error ? [theme.fg("error", error)] : []),
+						theme.fg(
+							"dim",
+							"Space: отметить · Ctrl+A: все доступные · Ctrl+R: перепроверить · Enter: сохранить · Esc: отмена",
+						),
+						theme.fg("border", "─".repeat(width)),
+					].map((line) => truncateToWidth(line, width));
+				},
+				handleInput(data) {
+					if (keys.matches(data, "tui.select.cancel")) done(undefined);
+					else if (keys.matches(data, "tui.select.confirm")) {
+						const models = probes
+							.filter(
+								(probe) =>
+									probe.status === "available" && selected.has(probe.model.id),
+							)
+							.map((probe) => savedModels.get(probe.model.id) ?? probe.model);
+						if (models.length) done(models);
+						else {
+							error = "Отметьте хотя бы одну доступную модель.";
+							tui.requestRender();
+						}
+					} else if (matchesKey(data, Key.ctrl("r"))) {
+						const item = list.getSelectedItem();
+						if (item) {
+							highlighted = items.indexOf(item);
+							done({ retry: highlighted });
+						}
+					} else if (matchesKey(data, Key.ctrl("a"))) {
+						for (const probe of probes)
+							if (probe.status === "available") selected.add(probe.model.id);
+						refresh();
+					} else if (matchesKey(data, Key.space)) {
+						const item = list.getSelectedItem();
+						if (
+							item &&
+							probes.find((probe) => probe.model.id === item.value)?.status ===
+								"available"
+						) {
+							if (selected.has(item.value)) selected.delete(item.value);
+							else selected.add(item.value);
+							refresh();
+						}
+					} else {
+						list.handleInput(data);
 						tui.requestRender();
 					}
-				} else if (matchesKey(data, Key.ctrl("a"))) {
-					for (const probe of probes)
-						if (probe.status === "available") selected.add(probe.model.id);
-					refresh();
-				} else if (matchesKey(data, Key.space)) {
-					const item = list.getSelectedItem();
-					if (
-						item &&
-						probes.find((probe) => probe.model.id === item.value)?.status ===
-							"available"
-					) {
-						if (selected.has(item.value)) selected.delete(item.value);
-						else selected.add(item.value);
-						refresh();
-					}
-				} else {
-					list.handleInput(data);
-					tui.requestRender();
-				}
+				},
+				invalidate() {
+					list.invalidate();
+				},
+			};
+		});
+		if (!choice || Array.isArray(choice)) return choice;
+		const model = probes[choice.retry].model;
+		let pending: Promise<ModelProbe> | undefined;
+		const result = await runProgress(
+			ctx,
+			`Повторная проверка · ${model.id} (до 10 минут)`,
+			async (signal) => {
+				pending = retry(model, signal);
+				return pending;
 			},
-			invalidate() {
-				list.invalidate();
-			},
-		};
-	});
+		);
+		// Finish aborting transport before another manual request can start.
+		if (!result) {
+			await pending?.catch(() => {});
+			continue;
+		}
+		const probe: ModelProbe =
+			"value" in result
+				? result.value
+				: {
+						model,
+						status: "unavailable",
+						reason: describeDiscoveryError(result.error),
+					};
+		probes[choice.retry] = probe;
+		if (probe.status === "available") selected.add(model.id);
+		else selected.delete(model.id);
+	}
 }
 
 export function runProgress<T>(

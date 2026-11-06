@@ -2932,22 +2932,18 @@ function validateV2Completion(value) {
   if (!assistant || !(value.finish_reason === "stop" || value.finish_reason === "length" || value.finish_reason === "function_call" && calls > 0))
     throw new DiscoveryError("INVALID_RESPONSE");
 }
-async function discoverModels(baseUrl2, apiKey, options) {
+function probeConnection(baseUrl2, apiKey, options) {
   options.signal.throwIfAborted();
   const protocol = options.protocol === void 0 ? "v1" : options.protocol;
   if (protocol !== "v1" && protocol !== "v2" && protocol !== "openai")
     throw new DiscoveryError("INVALID_PROTOCOL");
   let root;
-  let modelsUrl;
   try {
     root = baseUrl(baseUrl2);
-    modelsUrl = options.modelsUrl === void 0 ? defaultModelsUrl(root, protocol) : options.modelsUrl;
-    if (!["http:", "https:"].includes(new URL(modelsUrl).protocol))
-      throw new DiscoveryError("INVALID_URL");
   } catch {
     throw new DiscoveryError("INVALID_URL");
   }
-  if (options.mtls && (new URL(root).protocol !== "https:" || new URL(modelsUrl).protocol !== "https:"))
+  if (options.mtls && new URL(root).protocol !== "https:")
     throw new GigaChatMtlsError(
       "GigaChat certificate authorization requires HTTPS for generation and the model catalog."
     );
@@ -2958,6 +2954,72 @@ async function discoverModels(baseUrl2, apiKey, options) {
     maxRetries: 0,
     mtls: options.mtls
   };
+  return { root, protocol, headers: headers2, transport };
+}
+async function probeModel(connection, model, timeouts) {
+  const { root, protocol, headers: headers2, transport } = connection;
+  const signal = transport.signal;
+  signal.throwIfAborted();
+  const init = {
+    method: "POST",
+    headers: headers2,
+    body: JSON.stringify({
+      model: model.id,
+      messages: [
+        {
+          role: "user",
+          content: protocol === "v2" ? [{ text: "Hi" }] : "Hi"
+        }
+      ],
+      ...protocol === "v2" ? { model_options: { max_tokens: 1 } } : { max_tokens: 1 },
+      stream: false
+    })
+  };
+  const consumeProbe = async (response) => validateCompletion(await readJson(response), protocol);
+  let probe;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await request(
+        `${root}/chat/completions`,
+        init,
+        { ...transport, timeoutMs: timeouts[attempt] },
+        consumeProbe
+      );
+      probe = { model, status: "available" };
+      break;
+    } catch (error) {
+      signal.throwIfAborted();
+      if (attempt === timeouts.length - 1) {
+        probe = {
+          model,
+          status: "unavailable",
+          reason: `GigaChat model unavailable${timeouts.length > 1 ? ` after ${timeouts.length} attempts` : ""}. ${describeDiscoveryError(error)}`
+        };
+        break;
+      }
+    }
+  }
+  signal.throwIfAborted();
+  return probe;
+}
+async function retryModel(baseUrl2, apiKey, model, options) {
+  return probeModel(probeConnection(baseUrl2, apiKey, options), model, [6e5]);
+}
+async function discoverModels(baseUrl2, apiKey, options) {
+  const connection = probeConnection(baseUrl2, apiKey, options);
+  const { root, protocol, headers: headers2, transport } = connection;
+  let modelsUrl;
+  try {
+    modelsUrl = options.modelsUrl === void 0 ? defaultModelsUrl(root, protocol) : options.modelsUrl;
+    if (!["http:", "https:"].includes(new URL(modelsUrl).protocol))
+      throw new DiscoveryError("INVALID_URL");
+  } catch {
+    throw new DiscoveryError("INVALID_URL");
+  }
+  if (options.mtls && new URL(modelsUrl).protocol !== "https:")
+    throw new GigaChatMtlsError(
+      "GigaChat certificate authorization requires HTTPS for generation and the model catalog."
+    );
   const models = await request(
     modelsUrl,
     { method: "GET", headers: headers2 },
@@ -2966,53 +3028,8 @@ async function discoverModels(baseUrl2, apiKey, options) {
   );
   options.signal.throwIfAborted();
   const timeouts = [1e3, 3e3, 9e3, 27e3, 6e4];
-  const consumeProbe = async (response) => validateCompletion(await readJson(response), protocol);
   let completed = 0;
   options.progress?.(0, models.length);
-  const probeModel = async (model) => {
-    options.signal.throwIfAborted();
-    const init = {
-      method: "POST",
-      headers: headers2,
-      body: JSON.stringify({
-        model: model.id,
-        messages: [
-          {
-            role: "user",
-            content: protocol === "v2" ? [{ text: "Hi" }] : "Hi"
-          }
-        ],
-        ...protocol === "v2" ? { model_options: { max_tokens: 1 } } : { max_tokens: 1 },
-        stream: false
-      })
-    };
-    let probe;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await request(
-          `${root}/chat/completions`,
-          init,
-          { ...transport, timeoutMs: timeouts[attempt] },
-          consumeProbe
-        );
-        probe = { model, status: "available" };
-        break;
-      } catch (error) {
-        options.signal.throwIfAborted();
-        if (attempt === timeouts.length - 1) {
-          probe = {
-            model,
-            status: "unavailable",
-            reason: `GigaChat model unavailable after 5 attempts. ${describeDiscoveryError(error)}`
-          };
-          break;
-        }
-      }
-    }
-    options.signal.throwIfAborted();
-    options.progress?.(++completed, models.length, probe);
-    return probe;
-  };
   const probes = [];
   let next = 0;
   await Promise.all(
@@ -3020,7 +3037,10 @@ async function discoverModels(baseUrl2, apiKey, options) {
       while (next < models.length) {
         options.signal.throwIfAborted();
         const index = next++;
-        probes[index] = await probeModel(models[index]);
+        const probe = await probeModel(connection, models[index], timeouts);
+        probes[index] = probe;
+        options.signal.throwIfAborted();
+        options.progress?.(++completed, models.length, probe);
       }
     })
   );
@@ -3202,80 +3222,117 @@ async function showForm(ctx, title, fields, advanced = [], signal) {
     (tui, theme, keys, done) => new FormDialog(tui, theme, keys, title, fields, advanced, done, signal)
   );
 }
-function chooseModels(ctx, probes, initial = []) {
-  return ctx.ui.custom((tui, theme, keys, done) => {
-    const savedModels = new Map(initial.map((model) => [model.id, model]));
-    const selected = new Set(initial.map((model) => model.id));
-    const items = probes.map((probe) => ({
-      value: probe.model.id,
-      label: "",
-      description: probe.status === "available" ? probe.model.name : probe.reason
-    }));
-    const list = new SelectList(items, 10, {
-      selectedPrefix: (text) => theme.fg("accent", text),
-      selectedText: (text) => theme.fg("accent", text),
-      description: (text) => theme.fg("muted", text),
-      scrollInfo: (text) => theme.fg("dim", text),
-      noMatch: (text) => theme.fg("dim", text)
-    });
-    let error = "";
-    const refresh = () => {
-      for (let i = 0; i < probes.length; i++) {
-        const probe = probes[i];
-        if (probe.status !== "available") selected.delete(probe.model.id);
-        items[i].label = `${probe.status !== "available" ? "[\u2014]" : selected.has(probe.model.id) ? "[x]" : "[ ]"} ${probe.model.id}`;
-      }
-      error = "";
-      tui.requestRender();
-    };
-    refresh();
-    return {
-      render(width) {
-        return [
-          theme.fg("border", "\u2500".repeat(width)),
-          theme.fg("accent", "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043C\u043E\u0434\u0435\u043B\u0438 GigaChat"),
-          theme.fg("muted", "\u0412\u044B\u0431\u0438\u0440\u0430\u044E\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\u043D\u044B\u0435 \u043C\u043E\u0434\u0435\u043B\u0438."),
-          ...list.render(width),
-          ...error ? [theme.fg("error", error)] : [],
-          theme.fg(
-            "dim",
-            "Space: \u043E\u0442\u043C\u0435\u0442\u0438\u0442\u044C \xB7 Ctrl+A: \u0432\u0441\u0435 \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B\u0435 \xB7 Enter: \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u0432\u044B\u0431\u043E\u0440 \xB7 Esc: \u043E\u0442\u043C\u0435\u043D\u0430"
-          ),
-          theme.fg("border", "\u2500".repeat(width))
-        ].map((line) => truncateToWidth(line, width));
-      },
-      handleInput(data) {
-        if (keys.matches(data, "tui.select.cancel")) done(void 0);
-        else if (keys.matches(data, "tui.select.confirm")) {
-          const models = probes.filter(
-            (probe) => probe.status === "available" && selected.has(probe.model.id)
-          ).map((probe) => savedModels.get(probe.model.id) ?? probe.model);
-          if (models.length) done(models);
-          else {
-            error = "\u041E\u0442\u043C\u0435\u0442\u044C\u0442\u0435 \u0445\u043E\u0442\u044F \u0431\u044B \u043E\u0434\u043D\u0443 \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0443\u044E \u043C\u043E\u0434\u0435\u043B\u044C.";
+async function chooseModels(ctx, probes, retry, initial = []) {
+  const savedModels = new Map(initial.map((model) => [model.id, model]));
+  const selected = new Set(
+    probes.filter(
+      (probe) => probe.status === "available" && savedModels.has(probe.model.id)
+    ).map((probe) => probe.model.id)
+  );
+  let highlighted = 0;
+  for (; ; ) {
+    const choice = await ctx.ui.custom((tui, theme, keys, done) => {
+      const items = probes.map((probe2) => ({
+        value: probe2.model.id,
+        label: "",
+        description: probe2.status === "available" ? probe2.model.name : probe2.reason
+      }));
+      const list = new SelectList(items, 10, {
+        selectedPrefix: (text) => theme.fg("accent", text),
+        selectedText: (text) => theme.fg("accent", text),
+        description: (text) => theme.fg("muted", text),
+        scrollInfo: (text) => theme.fg("dim", text),
+        noMatch: (text) => theme.fg("dim", text)
+      });
+      list.setSelectedIndex(highlighted);
+      let error = "";
+      const refresh = () => {
+        for (let i = 0; i < probes.length; i++) {
+          const probe2 = probes[i];
+          items[i].label = `${probe2.status !== "available" ? "[\u2014]" : selected.has(probe2.model.id) ? "[x]" : "[ ]"} ${probe2.model.id}`;
+        }
+        error = "";
+        tui.requestRender();
+      };
+      refresh();
+      return {
+        render(width) {
+          return [
+            theme.fg("border", "\u2500".repeat(width)),
+            theme.fg("accent", "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043C\u043E\u0434\u0435\u043B\u0438 GigaChat"),
+            theme.fg("muted", "\u0412\u044B\u0431\u0438\u0440\u0430\u044E\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\u043D\u044B\u0435 \u043C\u043E\u0434\u0435\u043B\u0438."),
+            ...list.render(width),
+            ...error ? [theme.fg("error", error)] : [],
+            theme.fg(
+              "dim",
+              "Space: \u043E\u0442\u043C\u0435\u0442\u0438\u0442\u044C \xB7 Ctrl+A: \u0432\u0441\u0435 \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B\u0435 \xB7 Ctrl+R: \u043F\u0435\u0440\u0435\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \xB7 Enter: \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \xB7 Esc: \u043E\u0442\u043C\u0435\u043D\u0430"
+            ),
+            theme.fg("border", "\u2500".repeat(width))
+          ].map((line) => truncateToWidth(line, width));
+        },
+        handleInput(data) {
+          if (keys.matches(data, "tui.select.cancel")) done(void 0);
+          else if (keys.matches(data, "tui.select.confirm")) {
+            const models = probes.filter(
+              (probe2) => probe2.status === "available" && selected.has(probe2.model.id)
+            ).map((probe2) => savedModels.get(probe2.model.id) ?? probe2.model);
+            if (models.length) done(models);
+            else {
+              error = "\u041E\u0442\u043C\u0435\u0442\u044C\u0442\u0435 \u0445\u043E\u0442\u044F \u0431\u044B \u043E\u0434\u043D\u0443 \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0443\u044E \u043C\u043E\u0434\u0435\u043B\u044C.";
+              tui.requestRender();
+            }
+          } else if (matchesKey(data, Key.ctrl("r"))) {
+            const item = list.getSelectedItem();
+            if (item) {
+              highlighted = items.indexOf(item);
+              done({ retry: highlighted });
+            }
+          } else if (matchesKey(data, Key.ctrl("a"))) {
+            for (const probe2 of probes)
+              if (probe2.status === "available") selected.add(probe2.model.id);
+            refresh();
+          } else if (matchesKey(data, Key.space)) {
+            const item = list.getSelectedItem();
+            if (item && probes.find((probe2) => probe2.model.id === item.value)?.status === "available") {
+              if (selected.has(item.value)) selected.delete(item.value);
+              else selected.add(item.value);
+              refresh();
+            }
+          } else {
+            list.handleInput(data);
             tui.requestRender();
           }
-        } else if (matchesKey(data, Key.ctrl("a"))) {
-          for (const probe of probes)
-            if (probe.status === "available") selected.add(probe.model.id);
-          refresh();
-        } else if (matchesKey(data, Key.space)) {
-          const item = list.getSelectedItem();
-          if (item && probes.find((probe) => probe.model.id === item.value)?.status === "available") {
-            if (selected.has(item.value)) selected.delete(item.value);
-            else selected.add(item.value);
-            refresh();
-          }
-        } else {
-          list.handleInput(data);
-          tui.requestRender();
+        },
+        invalidate() {
+          list.invalidate();
         }
-      },
-      invalidate() {
-        list.invalidate();
+      };
+    });
+    if (!choice || Array.isArray(choice)) return choice;
+    const model = probes[choice.retry].model;
+    let pending;
+    const result = await runProgress(
+      ctx,
+      `\u041F\u043E\u0432\u0442\u043E\u0440\u043D\u0430\u044F \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \xB7 ${model.id} (\u0434\u043E 10 \u043C\u0438\u043D\u0443\u0442)`,
+      async (signal) => {
+        pending = retry(model, signal);
+        return pending;
       }
+    );
+    if (!result) {
+      await pending?.catch(() => {
+      });
+      continue;
+    }
+    const probe = "value" in result ? result.value : {
+      model,
+      status: "unavailable",
+      reason: describeDiscoveryError(result.error)
     };
-  });
+    probes[choice.retry] = probe;
+    if (probe.status === "available") selected.add(model.id);
+    else selected.delete(model.id);
+  }
 }
 function runProgress(ctx, title, work) {
   return ctx.ui.custom((tui, theme, keys, done) => {
@@ -3558,14 +3615,14 @@ async function registerGigaChatCommand(pi) {
         update(
           draft.authorization.type === "credentials" ? "\u041F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u0435 \u0432\u0440\u0435\u043C\u0435\u043D\u043D\u043E\u0433\u043E \u0442\u043E\u043A\u0435\u043D\u0430\u2026" : "\u041F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u0435 \u043A\u0430\u0442\u0430\u043B\u043E\u0433\u0430 \u043C\u043E\u0434\u0435\u043B\u0435\u0439\u2026"
         );
-        const credential = await prepareConnectionCredential(
+        const credential2 = await prepareConnectionCredential(
           draft,
           secret,
           signal,
           previous
         );
-        const token = credential.type === "oauth" ? credential.access : credential.env?.GIGACHAT_ACCESS_TOKEN ?? "";
-        const probes = await discoverModels(draft.baseUrl, token, {
+        const token2 = credential2.type === "oauth" ? credential2.access : credential2.env?.GIGACHAT_ACCESS_TOKEN ?? "";
+        const probes = await discoverModels(draft.baseUrl, token2, {
           signal,
           protocol: draft.protocol,
           modelsUrl: draft.modelsUrl,
@@ -3574,24 +3631,29 @@ async function registerGigaChatCommand(pi) {
             `\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043C\u043E\u0434\u0435\u043B\u0435\u0439: ${completed}/${total}${probe ? ` \xB7 ${probe.model.id}: ${probe.status === "available" ? "\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430" : probe.reason}` : ""}`
           )
         });
-        return { credential, probes };
+        return { credential: credential2, probes };
       }
     );
     if (!checked) return void 0;
     if ("error" in checked) throw checked.error;
     if (checked.value.probes.length === 0)
       throw new FormError("\u0421\u0435\u0440\u0432\u0435\u0440 \u043D\u0435 \u0432\u0435\u0440\u043D\u0443\u043B \u043C\u043E\u0434\u0435\u043B\u0438. \u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E.");
-    if (!checked.value.probes.some((probe) => probe.status === "available")) {
-      await chooseModels(ctx, checked.value.probes);
-      throw new FormError(
-        "\u041D\u0435\u0442 \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\u043D\u044B\u0445 \u043C\u043E\u0434\u0435\u043B\u0435\u0439. \u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E."
-      );
-    }
     const switchingToV2 = draft.protocol === "v2" && (previous?.gigachatConnection.protocol ?? "v1") !== "v2";
     const initialModels = previous?.gigachatConnection.models.map(
       (model) => switchingToV2 ? { ...model, reasoning: false, thinkingLevelMap: void 0 } : model
     );
-    const models = await chooseModels(ctx, checked.value.probes, initialModels);
+    const credential = checked.value.credential;
+    const token = credential.type === "oauth" ? credential.access : credential.env?.GIGACHAT_ACCESS_TOKEN ?? "";
+    const models = await chooseModels(
+      ctx,
+      checked.value.probes,
+      (model, signal) => retryModel(draft.baseUrl, token, model, {
+        signal,
+        protocol: draft.protocol,
+        mtls: draft.authorization.type === "mtls" ? draft.authorization.materials : void 0
+      }),
+      initialModels
+    );
     if (!models) return void 0;
     checked.value.credential.gigachatConnection.models = models;
     return checked.value.credential;
