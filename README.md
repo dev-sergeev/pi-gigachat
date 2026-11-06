@@ -1,6 +1,6 @@
 # `@dev-sergeev/pi-gigachat`
 
-GigaChat-compatible server connections for **pi 1.3.0**
+GigaChat-compatible server connections for **Pi**
 (`@earendil-works/pi-*`). Requires Node.js **22.19 or later**. Uses
 `createProvider()` and `pi.registerProvider(provider)`, with Pi's native
 authentication and session lifecycle.
@@ -8,12 +8,11 @@ authentication and session lifecycle.
 The `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and
 `@earendil-works/pi-tui` peers are supplied by Pi. Their `"*"` peer ranges follow
 Pi's package-loading convention; they do not declare compatibility with arbitrary
-host versions. Development dependencies are pinned to `1.3.0`. At activation,
-the extension checks the host-provided `VERSION` and accepts only `1.3.0`,
-before registering commands or restoring connections. Managed `pi install`
-disables peer resolution, so downloading/installing package files can still
-succeed on an unsupported host. If activation prevents startup, remove the
-package or start without extensions with `pi -ne`.
+host versions. Development dependencies remain pinned to `1.3.0`. The extension
+does not check Pi's version number or block startup because of it. This does not
+guarantee compatibility with every current or future Pi release. If a host API
+incompatibility prevents startup, remove the package or start without extensions
+with `pi -ne`.
 
 The package has no built-in models and does not change Pi's saved default
 provider or model. Use `/gigachat` to add a server connection and select models
@@ -25,6 +24,12 @@ mTLS support. The programmatic exports remain V1; protocol selection belongs to
 saved Pi connections.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
+
+## Release 0.7.5
+
+- Removed the Pi version-number activation check, without a warning, bypass setting, or replacement gate.
+- Preserved `/gigachat`, saved connections and settings, and passive activation without network requests or default-model changes.
+- Pre-release verification targets the same packed package on Pi 1.3.0 and the latest stable Pi (1.5.0 for this release); other versions are not blocked by number, but compatibility is not universally guaranteed.
 
 ## Release 0.7.4
 
@@ -117,10 +122,10 @@ under its original MIT license.
 
 ## Install in Pi
 
-With Pi 1.3.0 installed:
+With Pi installed:
 
 ```bash
-pi install npm:@dev-sergeev/pi-gigachat@0.7.4
+pi install npm:@dev-sergeev/pi-gigachat@0.7.5
 pi
 ```
 
@@ -723,9 +728,9 @@ zero because USD prices are unknown, not because usage is free.
 
 ## Programmatic use
 
-Build the checkout first with `npm run build`. In a separate Node.js application,
-install `@earendil-works/pi-ai@1.3.0` alongside this package; Pi normally provides
-that peer for extensions.
+Build the checkout first with `npm run build`. For the pinned development baseline
+in a separate Node.js application, install `@earendil-works/pi-ai@1.3.0` alongside
+this package; Pi normally provides that peer for extensions.
 
 ```ts
 import { createModels, type Model } from "@earendil-works/pi-ai";
@@ -794,7 +799,18 @@ npm audit --omit=dev
 npm pack --dry-run
 ```
 
-Tests use synthetic credentials, local HTTP fixtures and actual pi RPC sessions.
-For another Pi 1.3.0 installation, set `PI_TEST_CLI=/absolute/path/to/pi/dist/bundle/cli.js`.
+Tests use synthetic credentials, local HTTP fixtures and actual Pi RPC sessions.
+Before release, check the same packed package on Pi 1.3.0 and the latest stable
+Pi (1.5.0 for 0.7.5), using isolated environments with matching `pi-ai`,
+`pi-coding-agent`, and `pi-tui` dependencies. Passing these checks does not
+guarantee compatibility with other or future versions, or with a live server.
+Publication also requires a live-server smoke check on the latest stable Pi:
+one configured connection must complete request → tool call → tool result →
+final answer. This is not a matrix of every protocol and authorization mode;
+without this check, the release is not ready to publish.
+Set `PI_TEST_CLI=/absolute/path/to/pi/dist/bundle/cli.js` to select the RPC CLI.
+This variable alone does not redirect direct library imports: tests still resolve
+those from their own dependency environment, so pointing only the CLI at a newer
+Pi does not constitute a complete newer-runtime check.
 Secrets, local traffic captures, audit scripts and generated files are excluded
 from Git; `.env.example` is included in the package.
