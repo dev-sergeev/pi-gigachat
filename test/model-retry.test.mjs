@@ -7,7 +7,7 @@ import { Response as UndiciResponse } from 'undici';
 import { retryModel } from '../dist/discovery.js';
 import { chooseModels } from '../dist/gigachat-dialogs.js';
 import { registerGigaChatCommand } from '../dist/gigachat-ui.js';
-import { completion, json, token, withServer } from './helpers.mjs';
+import { completion, json, reply, token, withServer } from './helpers.mjs';
 
 for (const key of Object.keys(process.env)) {
   if (/^(GIGACHAT_|https?_proxy$|HTTPS?_PROXY$|ALL_PROXY$|all_proxy$)/.test(key)) delete process.env[key];
@@ -79,6 +79,86 @@ function dialogs(onScreen = () => {}, signal) {
 }
 
 for (const protocol of ['v1', 'v2', 'openai']) {
+  test(`${protocol} manual SSE retry uses one POST and terminal completion without waiting for EOF`, { timeout: 3000 }, async t => {
+    const closed = Promise.withResolvers();
+    environment(t, { GIGACHAT_STREAM: 'invalid', GIGACHAT_MAX_RETRIES: '9' });
+    await withServer(async ({ baseUrl, requests }) => {
+      const target = model('stream-only');
+      const probe = await retryModel(baseUrl, token, target, { protocol, stream: true, signal: t.signal });
+      assert.deepEqual(probe, { model: target, status: 'available' });
+      await closed.promise;
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].body.stream, true);
+      assert.equal(requests[0].headers.authorization, `Bearer ${token}`);
+    }, (_req, res) => {
+      res.on('close', closed.resolve);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      if (protocol === 'v2') res.write(`event: response.message.done\ndata: ${JSON.stringify(result(protocol))}\n\n`);
+      else res.write(`data: ${JSON.stringify({ choices: [{ delta: { role: 'assistant', content: '' }, finish_reason: 'length' }] })}\n\ndata: [DONE]\n\n`);
+    });
+  });
+
+  for (const ending of ['timeout', 'cancel']) {
+    test(`${protocol} manual SSE retry ${ending} interrupts body consumption without another paid request`, { timeout: 3000 }, async t => {
+      const reading = Promise.withResolvers();
+      const closed = Promise.withResolvers();
+      const controller = new AbortController();
+      const timers = [];
+      t.mock.method(AbortSignal, 'timeout', delay => {
+        const timer = new AbortController();
+        timers.push({ delay, controller: timer });
+        return timer.signal;
+      });
+      const originalGetReader = ReadableStream.prototype.getReader;
+      t.mock.method(ReadableStream.prototype, 'getReader', function (...args) {
+        reading.resolve();
+        return originalGetReader.apply(this, args);
+      });
+      environment(t, { GIGACHAT_TIMEOUT: '1', GIGACHAT_MAX_RETRIES: '9' });
+      await withServer(async ({ baseUrl, requests }) => {
+        const pending = retryModel(baseUrl, token, model('slow-stream'), {
+          protocol, stream: true, signal: AbortSignal.any([t.signal, controller.signal]),
+        });
+        const cancelled = new Error('cancel SSE body');
+        const rejected = ending === 'cancel' ? assert.rejects(pending, error => error === cancelled) : undefined;
+        await reading.promise;
+        assert.deepEqual(timers.map(timer => timer.delay), [600000]);
+        if (ending === 'cancel') controller.abort(cancelled);
+        else timers[0].controller.abort(new DOMException('SSE deadline', 'TimeoutError'));
+        if (rejected) await rejected;
+        else {
+          const probe = await pending;
+          assert.equal(probe.status, 'unavailable');
+          assert.match(probe.reason, /timed out/i);
+        }
+        await closed.promise;
+        assert.equal(requests.length, 1);
+      }, (_req, res) => {
+        res.on('close', closed.resolve);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(protocol === 'v2'
+          ? 'event: response.message.delta\ndata: {"messages":[{"role":"assistant","content":[{"text":"partial"}]}]}\n\n'
+          : 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+      });
+    });
+  }
+
+  test(`${protocol} manual SSE retry rejects truncation once with sanitized diagnostics and no JSON fallback`, { timeout: 3000 }, async t => {
+    await withServer(async ({ baseUrl, requests }) => {
+      const probe = await retryModel(baseUrl, token, model('truncated'), { protocol, stream: true, signal: t.signal });
+      assert.equal(probe.status, 'unavailable');
+      assert.match(probe.reason, /invalid response/i);
+      assert.ok(!probe.reason.includes('PRIVATE-BODY'));
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].body.stream, true);
+    }, (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end(protocol === 'v2'
+        ? 'event: response.message.delta\ndata: {"messages":[{"role":"assistant","content":[{"text":"PRIVATE-BODY"}]}],"finish_reason":"stop"}\n\n'
+        : 'data: {"choices":[{"delta":{"content":"PRIVATE-BODY"},"finish_reason":"stop"}]}\n\n');
+    });
+  });
+
   test(`${protocol} manual retry sends exactly one authorized POST without reloading the catalog`, { timeout: 3000 }, async t => {
     await withServer(async ({ baseUrl, requests }) => {
       const target = model('exact-ID');
@@ -291,8 +371,21 @@ test('Esc from the model list still cancels the wizard without probing', async (
   assert.equal(await pending, undefined);
 });
 
-for (const mode of ['create', 'refresh']) {
-  test(`${mode} wizard recovers and saves after every initial model probe failed`, { timeout: 5000 }, async t => {
+const protocolLabel = { v1: 'GigaChat V1', v2: 'GigaChat V2', openai: 'OpenAI-compatible' };
+function wizardReply(protocol, request, res) {
+  if (protocol !== 'v2') return reply(request, res, completion());
+  const value = { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' };
+  if (!request.body.stream) return json(res, value);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+  res.end(`event: response.message.done\ndata: ${JSON.stringify(value)}\n\n`);
+}
+
+for (const [mode, protocol, stream] of [
+  ['create', 'v1', false], ['create', 'v1', true], ['create', 'v2', true],
+  ['create', 'openai', true], ['refresh', 'v1', false], ['refresh', 'v2', true],
+]) {
+  test(`${mode} ${protocol} wizard recovers and saves after every initial model probe failed (stream=${stream})`, { timeout: 5000 }, async t => {
+    environment(t, { GIGACHAT_STREAM: stream ? 'false' : 'true' });
     const directory = await mkdtemp(join(tmpdir(), 'pi-gigachat-manual-retry-'));
     const oldDirectory = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = directory;
@@ -301,7 +394,7 @@ for (const mode of ['create', 'refresh']) {
         const entry = {
           type: 'api_key', env: { GIGACHAT_ACCESS_TOKEN: token },
           gigachatConnection: {
-            id: 'gigachat-Recover', revision: 'before', name: 'Recover', baseUrl, protocol: 'v1',
+            id: 'gigachat-Recover', revision: 'before', name: 'Recover', baseUrl, protocol, stream,
             authorization: { type: 'token' }, models: [{ ...model('recover'), maxTokens: 123, temperature: 0.3 }],
           },
         };
@@ -313,9 +406,11 @@ for (const mode of ['create', 'refresh']) {
           registerCommand: (_name, definition) => { command = definition; },
         });
         const notifications = [];
+        const steps = [];
         const controller = new AbortController();
         const ui = dialogs((component, done) => {
           const screen = text(component);
+          if (screen.includes('Адреса ·')) steps.push('endpoints');
           if (screen.includes('Добавить подключение · Токен')) done({ name: 'Recover', secret: token });
           else if (screen.includes('Адреса ·')) done({ url: baseUrl, modelsUrl: '' });
         }, AbortSignal.any([t.signal, controller.signal]));
@@ -324,6 +419,15 @@ for (const mode of ['create', 'refresh']) {
           select: async (title, options) => {
             if (title === 'GigaChat · способ авторизации') return mode === 'refresh' ? 'Управление подключениями' : 'Токен';
             if (title.startsWith('«Recover»')) return 'Обновить каталог и выбор моделей';
+            if (title === 'Протокол API') {
+              steps.push('protocol');
+              return protocolLabel[protocol];
+            }
+            if (title === 'Потоковый ответ') {
+              steps.push('stream');
+              assert.match(options[0], /Выключен.*JSON/, 'new connections default to JSON even when global streaming is enabled');
+              return options.find(option => option.includes(stream ? 'SSE' : 'JSON'));
+            }
             return options[0];
           },
         });
@@ -350,10 +454,15 @@ for (const mode of ['create', 'refresh']) {
           assert.ok(!notifications.some(([, type]) => type === 'error'), JSON.stringify(notifications));
           const stored = JSON.parse(await readFile(join(directory, 'auth.json'), 'utf8'))['gigachat-Recover'];
           assert.deepEqual(stored.gigachatConnection.models.map(value => value.id), ['recover']);
+          assert.equal(stored.gigachatConnection.stream, stream);
+          assert.equal(stored.gigachatConnection.protocol, protocol);
+          assert.deepEqual(steps, mode === 'create' ? ['protocol', 'stream', 'endpoints'] : []);
           if (mode === 'refresh') assert.deepEqual(stored.gigachatConnection.models, entry.gigachatConnection.models);
           assert.equal(requests.length, 7, 'manual recovery does not reload catalog or start extra attempts');
           assert.equal(requests.filter(request => request.url.endsWith('/models')).length, 1);
           assert.ok(requests.every(request => request.headers.authorization === `Bearer ${token}`));
+          assert.ok(requests.filter(request => request.url.endsWith('/chat/completions')).every(request => request.body.stream === stream));
+          assert.equal(requests[0].body, '', 'catalog remains a JSON GET');
         } finally {
           controller.abort();
           await pending;
@@ -361,11 +470,110 @@ for (const mode of ['create', 'refresh']) {
       }, (request, res, requests) => {
         if (request.url.endsWith('/models')) return json(res, { data: [{ id: 'recover' }] });
         const attempt = requests.filter(value => value.url.endsWith('/chat/completions')).length;
-        json(res, attempt > 5 ? completion() : { error: 'initially denied' }, attempt > 5 ? 200 : 403);
+        if (attempt <= 5) return json(res, { error: 'initially denied' }, 403);
+        wizardReply(protocol, request, res);
       });
     } finally {
       if (oldDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = oldDirectory;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const scenario of [
+  { name: 'new defaults off and cancels without a record', create: true, env: 'true', initial: false, cancel: true },
+  { name: 'saved SSE preselects on and cancel preserves bytes', saved: true, env: 'false', initial: true, cancel: true },
+  { name: 'saved JSON overrides global SSE while editing', saved: false, env: 'true', initial: false },
+  { name: 'saved SSE overrides global JSON while editing', saved: true, env: 'false', initial: true },
+  { name: 'legacy edit preselects global SSE and saves explicit on', env: 'true', initial: true },
+  { name: 'legacy edit preselects global JSON and can cancel', env: 'false', initial: false, cancel: true },
+  { name: 'legacy edit treats invalid global value as off', env: 'invalid', initial: false },
+  { name: 'failed JSON to SSE switch preserves the original record', saved: false, env: 'false', initial: false, next: true, failed: true },
+  { name: 'JSON to SSE switch rechecks before saving', saved: false, env: 'false', initial: false, next: true },
+  { name: 'SSE to JSON switch rechecks before saving', saved: true, env: 'true', initial: true, next: false },
+]) {
+  test(`response mode wizard: ${scenario.name}`, { timeout: 5000 }, async t => {
+    const directory = await mkdtemp(join(tmpdir(), 'pi-gigachat-stream-wizard-'));
+    environment(t, { PI_CODING_AGENT_DIR: directory, GIGACHAT_STREAM: scenario.env });
+    try {
+      await withServer(async ({ baseUrl, requests }) => {
+        const entry = {
+          type: 'api_key', env: { GIGACHAT_ACCESS_TOKEN: token },
+          gigachatConnection: {
+            id: 'gigachat-Mode', revision: 'unchanged', name: 'Mode', baseUrl, protocol: 'v1',
+            authorization: { type: 'token' }, models: [{ ...model('one'), name: 'Custom', maxTokens: 123, temperature: 0.3 }],
+            ...(scenario.saved === undefined ? {} : { stream: scenario.saved }),
+          },
+        };
+        const authPath = join(directory, 'auth.json');
+        const before = JSON.stringify({ 'gigachat-Mode': entry }, null, 2);
+        if (!scenario.create) await writeFile(authPath, before);
+        const providers = new Map();
+        let command;
+        await registerGigaChatCommand({
+          on() {}, registerProvider: provider => providers.set(provider.id, provider), unregisterProvider: id => providers.delete(id),
+          registerCommand: (_name, definition) => { command = definition; },
+        });
+        const steps = [];
+        const notifications = [];
+        const ui = dialogs((component, done) => {
+          const screen = text(component);
+          if (screen.includes('подключение · Токен')) done({ name: 'Mode', secret: scenario.create ? token : '' });
+          else if (screen.includes('Адреса ·')) {
+            steps.push('endpoints');
+            done({ url: baseUrl, modelsUrl: '' });
+          } else if (screen.includes('Выберите модели GigaChat')) {
+            assert.match(screen, scenario.failed ? /\[—\] one/ : /\[x\] one/);
+            component.handleInput(scenario.failed ? '\x1b' : '\r');
+          }
+        }, t.signal);
+        Object.assign(ui.ui, {
+          notify: (message, type) => notifications.push([message, type]), setStatus() {},
+          select: async (title, options) => {
+            if (title === 'GigaChat · способ авторизации') return scenario.create ? 'Токен' : 'Управление подключениями';
+            if (title.startsWith('«Mode»')) return 'Изменить подключение';
+            if (title === 'Протокол API') steps.push('protocol');
+            if (title === 'Потоковый ответ') {
+              steps.push('stream');
+              assert.match(options[0], scenario.initial ? /Включён.*SSE/ : /Выключен.*JSON/);
+              assert.match(options[1], scenario.initial ? /Выключен.*JSON/ : /Включён.*SSE/);
+              if (scenario.cancel) return undefined;
+              if (scenario.next !== undefined) return options.find(option => option.includes(scenario.next ? 'SSE' : 'JSON'));
+            }
+            return options[0];
+          },
+        });
+        await command.handler('', {
+          mode: 'tui', cwd: directory, ui: ui.ui, isIdle: () => true,
+          modelRegistry: { refresh: async () => {}, getProvider: id => providers.get(id) },
+        });
+        assert.ok(!notifications.some(([, type]) => type === 'error'), JSON.stringify(notifications));
+        assert.deepEqual(steps, scenario.cancel ? ['protocol', 'stream'] : ['protocol', 'stream', 'endpoints']);
+        if (scenario.create) {
+          await assert.rejects(readFile(authPath), { code: 'ENOENT' });
+        } else if (scenario.cancel || scenario.failed) {
+          assert.equal(await readFile(authPath, 'utf8'), before, 'cancel/failure must not replace the prior connection');
+        } else {
+          const stored = JSON.parse(await readFile(authPath, 'utf8'))['gigachat-Mode'];
+          assert.equal(stored.gigachatConnection.stream, scenario.next ?? scenario.initial);
+          assert.equal(stored.gigachatConnection.id, entry.gigachatConnection.id);
+          assert.equal(stored.gigachatConnection.name, entry.gigachatConnection.name);
+          assert.equal(stored.gigachatConnection.baseUrl, baseUrl);
+          assert.equal(stored.gigachatConnection.protocol, 'v1');
+          assert.deepEqual(stored.gigachatConnection.models, entry.gigachatConnection.models);
+          assert.deepEqual(stored.gigachatConnection.authorization, entry.gigachatConnection.authorization);
+          assert.equal(stored.env.GIGACHAT_ACCESS_TOKEN, token);
+        }
+        const changedMode = scenario.next !== undefined;
+        assert.equal(requests.length, changedMode ? (scenario.failed ? 6 : 2) : 0, 'only an effective mode change revalidates models');
+        assert.ok(requests.filter(request => request.url.endsWith('/chat/completions')).every(request => request.body.stream === scenario.next));
+      }, (request, res) => {
+        if (request.url.endsWith('/models')) return json(res, { data: [{ id: 'one' }] });
+        if (scenario.failed) return json(res, { error: 'requested mode is unavailable' }, 503);
+        wizardReply('v1', request, res);
+      });
+    } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });

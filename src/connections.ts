@@ -124,6 +124,7 @@ function validConnection(value: unknown): value is Connection {
 			value.protocol !== "v1" &&
 			value.protocol !== "v2" &&
 			value.protocol !== "openai") ||
+		(value.stream !== undefined && typeof value.stream !== "boolean") ||
 		(value.modelsUrl !== undefined && !httpUrl(value.modelsUrl)) ||
 		!object(value.authorization) ||
 		!Array.isArray(value.models)
@@ -454,6 +455,7 @@ export function createConnectionProvider(
 		if (!current || model.provider !== saved.id) throw stale();
 		return adapter(current, context, {
 			...options,
+			stream: saved.stream ?? options.stream,
 			mtls:
 				saved.authorization.type === "mtls"
 					? saved.authorization.materials
@@ -465,6 +467,9 @@ export function createConnectionProvider(
 				...options.env,
 				GIGACHAT_BASE_URL: endpoint,
 				GIGACHAT_EXTRA_BODY: "{}",
+				...(saved.stream === undefined
+					? {}
+					: { GIGACHAT_STREAM: String(saved.stream) }),
 			},
 		});
 	};

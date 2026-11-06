@@ -40,6 +40,10 @@ const AUTH_LABELS: Record<Connection["authorization"]["type"], string> = {
 	mtls: "Сертификаты (mTLS)",
 };
 const scopes = ["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"];
+const STREAM_LABELS = [
+	"Выключен — JSON, ответ целиком",
+	"Включён — SSE, ответ по частям",
+];
 const authModes = Object.keys(
 	AUTH_LABELS,
 ) as Connection["authorization"]["type"][];
@@ -345,6 +349,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				const probes = await discoverModels(draft.baseUrl, token, {
 					signal,
 					protocol: draft.protocol,
+					stream: draft.stream,
 					modelsUrl: draft.modelsUrl,
 					mtls:
 						draft.authorization.type === "mtls"
@@ -382,6 +387,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				retryModel(draft.baseUrl, token, model, {
 					signal,
 					protocol: draft.protocol,
+					stream: draft.stream,
 					mtls:
 						draft.authorization.type === "mtls"
 							? draft.authorization.materials
@@ -405,6 +411,9 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				? previous.refresh
 				: (previous?.env?.GIGACHAT_ACCESS_TOKEN ?? "");
 		let protocol: GigaChatProtocol = old?.protocol ?? "v1";
+		let stream = old
+			? (old.stream ?? process.env.GIGACHAT_STREAM === "true")
+			: false;
 		let values: Record<string, string> = {
 			name: old?.name ?? "",
 			url: old?.baseUrl ?? GIGACHAT_PROTOCOLS[protocol].baseUrl,
@@ -585,6 +594,13 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 				)
 					values.url = GIGACHAT_PROTOCOLS[nextProtocol].baseUrl;
 				protocol = nextProtocol;
+				const responseModes = stream ? [true, false] : [false, true];
+				const selectedResponse = await ctx.ui.select(
+					"Потоковый ответ",
+					responseModes.map((value) => STREAM_LABELS[Number(value)]),
+				);
+				if (!selectedResponse) return;
+				stream = selectedResponse === STREAM_LABELS[1];
 				const endpoints = await showForm(
 					ctx,
 					`Адреса · ${GIGACHAT_PROTOCOLS[protocol].label}`,
@@ -647,6 +663,7 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					name,
 					baseUrl: url,
 					protocol,
+					stream,
 					modelsUrl,
 					authorization,
 					models: old?.models ?? [],
@@ -664,6 +681,8 @@ export async function registerGigaChatCommand(pi: ExtensionAPI): Promise<void> {
 					!old ||
 					old.baseUrl !== draft.baseUrl ||
 					(old.protocol ?? "v1") !== draft.protocol ||
+					(old.stream ?? process.env.GIGACHAT_STREAM === "true") !==
+						draft.stream ||
 					old.modelsUrl !== draft.modelsUrl ||
 					!sameAuthorization ||
 					Boolean(values.secret.trim());

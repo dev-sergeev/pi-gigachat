@@ -32,6 +32,8 @@ export interface Connection {
 	baseUrl: string;
 	/** Legacy connections without a protocol use GigaChat V1. */
 	protocol?: GigaChatProtocol;
+	/** Omission preserves legacy request/environment response mode selection. */
+	stream?: boolean;
 	/** Explicit full catalog URL; omission selects the protocol default. */
 	modelsUrl?: string;
 	authorization:
@@ -55,6 +57,7 @@ export interface ModelProbe {
 export interface DiscoveryOptions {
 	signal: AbortSignal;
 	protocol?: GigaChatProtocol;
+	stream?: boolean;
 	modelsUrl?: string;
 	mtls?: MtlsMaterials;
 	progress?: (completed: number, total: number, probe?: ModelProbe) => void;

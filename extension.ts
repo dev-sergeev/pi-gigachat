@@ -2443,7 +2443,7 @@ function httpUrl(value) {
   }
 }
 function validConnection(value) {
-  if (!object(value) || !ownedId(value.id) || !nonempty(value.revision) || !nonempty(value.name) || !httpUrl(value.baseUrl) || value.protocol !== void 0 && value.protocol !== "v1" && value.protocol !== "v2" && value.protocol !== "openai" || value.modelsUrl !== void 0 && !httpUrl(value.modelsUrl) || !object(value.authorization) || !Array.isArray(value.models))
+  if (!object(value) || !ownedId(value.id) || !nonempty(value.revision) || !nonempty(value.name) || !httpUrl(value.baseUrl) || value.protocol !== void 0 && value.protocol !== "v1" && value.protocol !== "v2" && value.protocol !== "openai" || value.stream !== void 0 && typeof value.stream !== "boolean" || value.modelsUrl !== void 0 && !httpUrl(value.modelsUrl) || !object(value.authorization) || !Array.isArray(value.models))
     return false;
   if (value.authorization.type === "mtls") {
     const materials = value.authorization.materials;
@@ -2647,6 +2647,7 @@ function createConnectionProvider(connection, store, loginCredential) {
     if (!current || model.provider !== saved.id) throw stale();
     return adapter(current, context, {
       ...options,
+      stream: saved.stream ?? options.stream,
       mtls: saved.authorization.type === "mtls" ? saved.authorization.materials : void 0,
       apiKey: saved.authorization.type === "mtls" ? void 0 : options.apiKey,
       temperature: options.temperature ?? current.temperature,
@@ -2654,7 +2655,8 @@ function createConnectionProvider(connection, store, loginCredential) {
       env: {
         ...options.env,
         GIGACHAT_BASE_URL: endpoint,
-        GIGACHAT_EXTRA_BODY: "{}"
+        GIGACHAT_EXTRA_BODY: "{}",
+        ...saved.stream === void 0 ? {} : { GIGACHAT_STREAM: String(saved.stream) }
       }
     });
   };
@@ -2823,6 +2825,7 @@ var ConnectionStore = class {
 
 // src/discovery.ts
 import { stripVTControlCharacters } from "node:util";
+import { createParser as createParser4 } from "eventsource-parser";
 var DiscoveryError = class extends Error {
   constructor(code) {
     super(
@@ -2932,6 +2935,134 @@ function validateV2Completion(value) {
   if (!assistant || !(value.finish_reason === "stop" || value.finish_reason === "length" || value.finish_reason === "function_call" && calls > 0))
     throw new DiscoveryError("INVALID_RESPONSE");
 }
+async function readProbeStream(response, protocol) {
+  const invalid = () => new DiscoveryError("INVALID_RESPONSE");
+  if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body)
+    throw invalid();
+  let assistant = false;
+  let finish;
+  const toolFinish = protocol === "openai" ? "tool_calls" : "function_call";
+  const setFinish = (value) => {
+    if (value == null || value === "") return;
+    if (value !== "stop" && value !== "length" && value !== toolFinish && !(protocol === "openai" && value === "content_filter"))
+      throw invalid();
+    finish = value;
+  };
+  let done = false;
+  const calls = /* @__PURE__ */ new Map();
+  const addCall = (key, value, id, type) => {
+    if (!object(value)) throw invalid();
+    const call = calls.get(key) ?? {
+      name: false,
+      arguments: false,
+      id: false,
+      type: false
+    };
+    if (value.name !== void 0) {
+      if (typeof value.name !== "string") throw invalid();
+      call.name ||= value.name.length > 0;
+    }
+    if (value.arguments !== void 0) {
+      if (typeof value.arguments !== "string" && !(protocol !== "openai" && object(value.arguments)))
+        throw invalid();
+      call.arguments = true;
+    }
+    if (id !== void 0) {
+      if (typeof id !== "string" || !id) throw invalid();
+      call.id = true;
+    }
+    if (type !== void 0) {
+      if (type !== "function") throw invalid();
+      call.type = true;
+    }
+    calls.set(key, call);
+  };
+  const consume = (data, event) => {
+    if (done) return;
+    if (event === "error") throw invalid();
+    if (protocol !== "v2" && data === "[DONE]") {
+      done = true;
+      return;
+    }
+    const chunk = JSON.parse(data);
+    if (!object(chunk) || chunk.error !== void 0) throw invalid();
+    if (protocol === "v2") {
+      if (event !== "response.message.delta" && event !== "response.message.done")
+        throw invalid();
+      if (chunk.messages !== void 0 && !Array.isArray(chunk.messages))
+        throw invalid();
+      if (!Array.isArray(chunk.messages) && event !== "response.message.done")
+        throw invalid();
+      for (const message of Array.isArray(chunk.messages) ? chunk.messages : []) {
+        if (!object(message) || message.role !== "assistant" && message.role !== "reasoning" || !Array.isArray(message.content) && !(message.content === void 0 && message.role === "assistant" && typeof message.tool_state_id === "string" && message.tool_state_id.length > 0))
+          throw invalid();
+        assistant ||= message.role === "assistant" && Array.isArray(message.content);
+        for (const part of Array.isArray(message.content) ? message.content : []) {
+          if (!object(part)) throw invalid();
+          if (part.text !== void 0 && typeof part.text !== "string")
+            throw invalid();
+          if (part.function_call !== void 0) {
+            if (message.role !== "assistant" || !object(part.function_call) || typeof part.function_call.id !== "string" || !part.function_call.id)
+              throw invalid();
+            addCall(part.function_call.id, part.function_call);
+          } else if (typeof part.text !== "string") throw invalid();
+        }
+      }
+      setFinish(chunk.finish_reason);
+      done = event === "response.message.done";
+      return;
+    }
+    if (!Array.isArray(chunk.choices)) throw invalid();
+    if (chunk.choices.length === 0 && object(chunk.usage)) return;
+    const choice = chunk.choices[0];
+    if (!object(choice) || !object(choice.delta)) throw invalid();
+    const delta = choice.delta;
+    if (delta.role !== void 0 && delta.role !== "assistant") throw invalid();
+    if (delta.content != null && typeof delta.content !== "string" || delta.reasoning_content != null && typeof delta.reasoning_content !== "string" || delta.reasoning != null && typeof delta.reasoning !== "string")
+      throw invalid();
+    assistant ||= delta.role === "assistant" || delta.content !== void 0 || delta.reasoning_content !== void 0 || protocol === "openai" && delta.reasoning !== void 0;
+    if (protocol === "openai" && delta.tool_calls !== void 0) {
+      if (!Array.isArray(delta.tool_calls)) throw invalid();
+      for (const call of delta.tool_calls) {
+        if (!object(call) || typeof call.index !== "number" || !Number.isSafeInteger(call.index) || call.index < 0)
+          throw invalid();
+        addCall(call.index, call.function ?? {}, call.id, call.type);
+        assistant = true;
+      }
+    }
+    if (protocol === "v1" && delta.function_call !== void 0) {
+      addCall(0, delta.function_call);
+      assistant = true;
+    }
+    setFinish(choice.finish_reason);
+  };
+  const parser = createParser4({
+    onEvent: (event) => consume(event.data, event.event ?? ""),
+    onError: () => {
+      throw invalid();
+    }
+  });
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  try {
+    while (!done) {
+      const next = await reader.read();
+      if (next.done) break;
+      parser.feed(decoder.decode(next.value, { stream: true }));
+    }
+    if (!done) parser.feed(decoder.decode());
+    for (const call of calls.values()) {
+      if (!call.name || !call.arguments || protocol === "openai" && (!call.id || !call.type))
+        throw invalid();
+    }
+    if (!done || !assistant || finish === void 0 || finish === toolFinish && calls.size === 0)
+      throw invalid();
+  } finally {
+    await reader.cancel().catch(() => {
+    });
+    reader.releaseLock();
+  }
+}
 function probeConnection(baseUrl2, apiKey, options) {
   options.signal.throwIfAborted();
   const protocol = options.protocol === void 0 ? "v1" : options.protocol;
@@ -2954,10 +3085,16 @@ function probeConnection(baseUrl2, apiKey, options) {
     maxRetries: 0,
     mtls: options.mtls
   };
-  return { root, protocol, headers: headers2, transport };
+  return {
+    root,
+    protocol,
+    stream: options.stream ?? false,
+    headers: headers2,
+    transport
+  };
 }
 async function probeModel(connection, model, timeouts) {
-  const { root, protocol, headers: headers2, transport } = connection;
+  const { root, protocol, stream, headers: headers2, transport } = connection;
   const signal = transport.signal;
   signal.throwIfAborted();
   const init = {
@@ -2972,10 +3109,10 @@ async function probeModel(connection, model, timeouts) {
         }
       ],
       ...protocol === "v2" ? { model_options: { max_tokens: 1 } } : { max_tokens: 1 },
-      stream: false
+      stream
     })
   };
-  const consumeProbe = async (response) => validateCompletion(await readJson(response), protocol);
+  const consumeProbe = async (response) => stream ? readProbeStream(response, protocol) : validateCompletion(await readJson(response), protocol);
   let probe;
   for (let attempt = 0; ; attempt++) {
     try {
@@ -3397,6 +3534,10 @@ var AUTH_LABELS = {
   mtls: "\u0421\u0435\u0440\u0442\u0438\u0444\u0438\u043A\u0430\u0442\u044B (mTLS)"
 };
 var scopes2 = ["GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"];
+var STREAM_LABELS = [
+  "\u0412\u044B\u043A\u043B\u044E\u0447\u0435\u043D \u2014 JSON, \u043E\u0442\u0432\u0435\u0442 \u0446\u0435\u043B\u0438\u043A\u043E\u043C",
+  "\u0412\u043A\u043B\u044E\u0447\u0451\u043D \u2014 SSE, \u043E\u0442\u0432\u0435\u0442 \u043F\u043E \u0447\u0430\u0441\u0442\u044F\u043C"
+];
 var authModes = Object.keys(
   AUTH_LABELS
 );
@@ -3625,6 +3766,7 @@ async function registerGigaChatCommand(pi) {
         const probes = await discoverModels(draft.baseUrl, token2, {
           signal,
           protocol: draft.protocol,
+          stream: draft.stream,
           modelsUrl: draft.modelsUrl,
           mtls: draft.authorization.type === "mtls" ? draft.authorization.materials : void 0,
           progress: (completed, total, probe) => update(
@@ -3650,6 +3792,7 @@ async function registerGigaChatCommand(pi) {
       (model, signal) => retryModel(draft.baseUrl, token, model, {
         signal,
         protocol: draft.protocol,
+        stream: draft.stream,
         mtls: draft.authorization.type === "mtls" ? draft.authorization.materials : void 0
       }),
       initialModels
@@ -3662,6 +3805,7 @@ async function registerGigaChatCommand(pi) {
     const old = previous?.gigachatConnection;
     const oldSecret = previous?.type === "oauth" ? previous.refresh : previous?.env?.GIGACHAT_ACCESS_TOKEN ?? "";
     let protocol = old?.protocol ?? "v1";
+    let stream = old ? old.stream ?? process.env.GIGACHAT_STREAM === "true" : false;
     let values = {
       name: old?.name ?? "",
       url: old?.baseUrl ?? GIGACHAT_PROTOCOLS[protocol].baseUrl,
@@ -3819,6 +3963,13 @@ async function registerGigaChatCommand(pi) {
         ) === GIGACHAT_PROTOCOLS[protocol].baseUrl)
           values.url = GIGACHAT_PROTOCOLS[nextProtocol].baseUrl;
         protocol = nextProtocol;
+        const responseModes = stream ? [true, false] : [false, true];
+        const selectedResponse = await ctx.ui.select(
+          "\u041F\u043E\u0442\u043E\u043A\u043E\u0432\u044B\u0439 \u043E\u0442\u0432\u0435\u0442",
+          responseModes.map((value) => STREAM_LABELS[Number(value)])
+        );
+        if (!selectedResponse) return;
+        stream = selectedResponse === STREAM_LABELS[1];
         const endpoints = await showForm(
           ctx,
           `\u0410\u0434\u0440\u0435\u0441\u0430 \xB7 ${GIGACHAT_PROTOCOLS[protocol].label}`,
@@ -3876,12 +4027,13 @@ async function registerGigaChatCommand(pi) {
           name,
           baseUrl: url,
           protocol,
+          stream,
           modelsUrl,
           authorization,
           models: old?.models ?? []
         };
         const sameAuthorization = old?.authorization.type === authorization.type && (authorization.type === "token" || (authorization.type === "mtls" ? old.authorization.type === "mtls" && old.authorization.materials === authorization.materials : old.authorization.type === "credentials" && old.authorization.tokenUrl === authorization.tokenUrl && old.authorization.scope === authorization.scope));
-        const changedEndpointOrSecret = !old || old.baseUrl !== draft.baseUrl || (old.protocol ?? "v1") !== draft.protocol || old.modelsUrl !== draft.modelsUrl || !sameAuthorization || Boolean(values.secret.trim());
+        const changedEndpointOrSecret = !old || old.baseUrl !== draft.baseUrl || (old.protocol ?? "v1") !== draft.protocol || (old.stream ?? process.env.GIGACHAT_STREAM === "true") !== draft.stream || old.modelsUrl !== draft.modelsUrl || !sameAuthorization || Boolean(values.secret.trim());
         let credential;
         if (previous && !changedEndpointOrSecret && !renamed)
           credential = { ...previous, gigachatConnection: draft };

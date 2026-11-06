@@ -25,6 +25,13 @@ saved Pi connections.
 This repository continues [ai-forever/pi-gigachat](https://github.com/ai-forever/pi-gigachat)
 under its original MIT license.
 
+## Release 0.7.7
+
+- Added **Потоковый ответ** immediately after API protocol selection in `/gigachat`, for both new and edited connections. New connections default to a complete JSON response; SSE can be enabled explicitly for all selected models of that connection.
+- A saved response mode overrides `GIGACHAT_STREAM` and per-request stream options. Existing connections without the setting retain their previous behavior until edited.
+- Automatic model checks, catalog refresh and **Ctrl+R** use the selected response mode without JSON/SSE fallback. Changing the mode rechecks models before replacing the saved connection.
+- The existing `undici` audit finding documented in 0.7.6 remains; this patch does not change transport dependencies.
+
 ## Release 0.7.6
 
 - Added **Ctrl+R** to retry any highlighted model in `/gigachat` model selection, during connection creation or catalog refresh. It sends one generation POST with a fixed 600-second timeout, no automatic retries, and no catalog reload, using the same connection, authorization and API protocol.
@@ -223,7 +230,7 @@ replace a saved connection's credentials.
 | --- | --- | --- |
 | `GIGACHAT_ACCESS_TOKEN` | Unset | Current bearer token; cannot renew itself |
 | `GIGACHAT_BASE_URL` | `https://api.giga.chat/v1` | API root, including `/v1` |
-| `GIGACHAT_STREAM` | `false` | Exactly `true` for SSE or `false` for a complete JSON response |
+| `GIGACHAT_STREAM` | `false` | Exactly `true` for SSE or `false` for JSON; explicit saved connection mode takes precedence |
 | `GIGACHAT_EXTRA_BODY` | `{}` | JSON object shallow-merged into every chat request |
 | `GIGACHAT_SYSTEM_PROMPT` | Built-in single-tool instruction | Replaces the default provider block; an empty value disables the block |
 | `GIGACHAT_TIMEOUT` | `300` | HTTP timeout in seconds per attempt, excluding retry waits |
@@ -246,8 +253,11 @@ including `response_format`. Changes apply to **tool follow-ups and summaries to
 Overriding `model`, `messages` or `functions` replaces the corresponding pi data.
 Malformed JSON or a non-object value fails before a chat request is sent.
 
-`stream` is controlled by `GIGACHAT_STREAM` and is not overridden by the extra
-JSON or payload hooks, so the request format always matches its response parser.
+For a saved connection with an explicit response mode, that choice controls
+`stream`, overriding request options and `GIGACHAT_STREAM`. Connections without
+the setting retain the previous request-option → environment → `false` priority.
+Extra JSON and payload hooks cannot override the effective wire mode, so the
+request format always matches its response parser.
 Sampling settings are otherwise left to the model unless explicitly supplied.
 
 ### Retries
@@ -367,24 +377,30 @@ library callers must supply their own model definitions.
 3. Choose **Протокол API**: **GigaChat V1**, **GigaChat V2**, or
    **OpenAI-compatible**. V1 is preselected for a new connection; editing
    preselects the connection's saved protocol.
-4. Enter the generation API root and, optionally, a full model-catalog URL.
+4. Choose **Потоковый ответ**: enabled for incremental SSE or disabled for a
+   complete JSON response. New connections preselect disabled; editing preselects
+   the saved mode, or `GIGACHAT_STREAM` (otherwise disabled) for an old connection
+   without the setting. The choice applies to every selected model and is saved
+   explicitly.
+5. Enter the generation API root and, optionally, a full model-catalog URL.
    Leave the catalog field empty for the selected protocol's default below.
    Generation appends `/chat/completions` to its root; an explicit catalog URL
    is used as entered, without appending any path.
-5. The extension obtains authorization, reads the catalog, removes duplicate
+6. The extension obtains authorization, reads the catalog, removes duplicate
    Model IDs within this connection, and checks each unique model with a simple
-   non-streaming generation using a one-token output budget. All three protocols
-   check up to five different models concurrently in a sliding window: each
+   generation in the selected response mode using a one-token output budget.
+   All three protocols check up to five different models concurrently in a
+   sliding window: each
    completed model immediately frees a slot for the next. Each model gets up to
    five sequential attempts, stopping on the first valid response, with timeouts
    of 1, 3, 9, 27, and 60 seconds covering both response headers and the complete
    body. These probes bypass the ordinary generation queue; normal generation
    retains its existing scheduling.
-6. Use **Space** to select successful models, **Ctrl+A** to select all successful
+7. Use **Space** to select successful models, **Ctrl+A** to select all successful
    models, and **Enter** to save. Failed models remain visible with a reason and
    cannot be selected until a successful manual check. The list opens even if
    every automatic check failed; an empty selection is never saved.
-7. Open the normal `/model` picker and select an added model. It is available
+8. Open the normal `/model` picker and select an added model. It is available
    immediately, without restarting Pi or creating a named provider manually.
 
 In this model-selection list, **Ctrl+R** checks the **highlighted row**, not the
@@ -392,7 +408,8 @@ checked set, whether that model is currently available or unavailable. This work
 when creating a connection and when refreshing an existing connection's catalog,
 for V1, V2 and OpenAI-compatible connections. Each invocation sends exactly one
 generation POST through the same connection, authorization (including mTLS) and
-protocol, with a fixed **600-second timeout covering headers and the full response
+protocol and response mode, with a fixed **600-second timeout covering headers
+and the full response
 body**, no automatic transport retries and no catalog reload.
 
 A separate progress screen allows only one manual request at a time, with no
@@ -421,6 +438,10 @@ after models are successfully checked, selected and saved. Both
 automatic and manual probe limits are independent of `GIGACHAT_TIMEOUT` and
 `GIGACHAT_MAX_RETRIES`; ordinary generation, authentication, and catalog requests
 keep their existing policies.
+
+Changing the response mode rechecks models before saving; a failed check or
+cancellation leaves the previous saved connection intact. Checks never silently
+fall back to the other response mode. The catalog itself is still fetched as JSON.
 
 Each connection has one name and authorization configuration shared by its
 selected models. New connection names and changed names must match
@@ -844,7 +865,7 @@ npm pack --dry-run
 
 Tests use synthetic credentials, local HTTP fixtures and actual Pi RPC sessions.
 Before release, check the same packed package on Pi 1.3.0 and the latest stable
-Pi (1.5.0 for 0.7.6), using isolated environments with matching `pi-ai`,
+Pi (1.5.0 for 0.7.7), using isolated environments with matching `pi-ai`,
 `pi-coding-agent`, and `pi-tui` dependencies. Passing these checks does not
 guarantee compatibility with other or future versions, or with a live server.
 Publication also requires a live-server smoke check on the latest stable Pi:

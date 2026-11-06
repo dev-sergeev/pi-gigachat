@@ -37,6 +37,133 @@ async function withServer(respond, run) {
 }
 
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImmediate); };
+const streamEvent = (protocol, value, terminal = false) => protocol === 'v2'
+  ? `event: response.message.${terminal ? 'done' : 'delta'}\ndata: ${JSON.stringify(value)}\n\n`
+  : `data: ${typeof value === 'string' ? value : JSON.stringify(value)}\n\n`;
+const textStream = protocol => protocol === 'v2'
+  ? streamEvent(protocol, { messages: [{ role: 'assistant', content: [{ text: 'Привет 👋' }] }] }) +
+    streamEvent(protocol, { finish_reason: 'length' }, true)
+  : streamEvent(protocol, { choices: [{ delta: { role: 'assistant', content: 'Привет 👋' }, finish_reason: null }] }) +
+    streamEvent(protocol, { choices: [{ delta: {}, finish_reason: 'length' }] }) +
+    streamEvent(protocol, '[DONE]');
+
+for (const protocol of ['v1', 'v2', 'openai']) {
+  for (const stream of [false, true]) {
+    test(`${protocol} discovery uses selected ${stream ? 'SSE' : 'JSON'} mode regardless of global stream setting`, { timeout: 3000 }, async t => {
+      const previous = process.env.GIGACHAT_STREAM;
+      process.env.GIGACHAT_STREAM = stream ? 'invalid' : 'true';
+      t.after(() => {
+        if (previous === undefined) delete process.env.GIGACHAT_STREAM;
+        else process.env.GIGACHAT_STREAM = previous;
+      });
+      await withServer((req, res) => {
+        if (req.method === 'GET') return json(res, { data: [{ id: 'only-selected-mode' }] });
+        assert.equal(req.body.stream, stream);
+        if (!stream) return json(res, protocol === 'v2'
+          ? { messages: [{ role: 'assistant', content: [{ text: '' }] }], finish_reason: 'length' }
+          : completion('', 'length'));
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+        const bytes = Buffer.from(': keepalive\n\n' + textStream(protocol));
+        const cut = bytes.indexOf(Buffer.from('👋')) + 1;
+        res.write(bytes.subarray(0, cut));
+        setImmediate(() => res.end(bytes.subarray(cut)));
+      }, async ({ baseUrl, requests }) => {
+        const probes = await discoverModels(baseUrl, secret, { protocol, stream, signal: t.signal });
+        assert.deepEqual(probes.map(probe => probe.status), ['available']);
+        assert.equal(requests.length, 2);
+        assert.equal(requests[0].method, 'GET', 'catalog always consumes JSON');
+        assert.equal(requests[1].body.stream, stream);
+        assert.equal(requests[1].headers.authorization, `Bearer ${secret}`);
+      });
+    });
+  }
+
+  test(`${protocol} discovery rejects invalid or incomplete SSE after five same-mode attempts without exposing bodies`, { timeout: 5000 }, async t => {
+    const partial = protocol === 'v2'
+      ? streamEvent(protocol, { messages: [{ role: 'assistant', content: [{ text: 'PRIVATE-BODY' }] }] })
+      : streamEvent(protocol, { choices: [{ delta: { content: 'PRIVATE-BODY' }, finish_reason: 'stop' }] });
+    const terminal = protocol === 'v2'
+      ? streamEvent(protocol, { finish_reason: 'stop' }, true)
+      : streamEvent(protocol, '[DONE]');
+    const malformed = {
+      truncated: partial,
+      empty: terminal,
+      malformed: 'data: PRIVATE-BODY\n\n',
+      error: partial + 'event: error\ndata: {"error":"PRIVATE-BODY"}\n\n' + terminal,
+      wrongShape: streamEvent(protocol, { choices: [{ delta: { content: 7 }, finish_reason: 'stop' }] }, true) + terminal,
+      invalidFinish: protocol === 'v2'
+        ? streamEvent(protocol, { messages: [{ role: 'assistant', content: [{ text: 'PRIVATE-BODY' }] }], finish_reason: 7 }) + terminal
+        : streamEvent(protocol, { choices: [{ delta: { content: 'PRIVATE-BODY' }, finish_reason: 7 }] }) +
+          streamEvent(protocol, { choices: [{ delta: {}, finish_reason: 'stop' }] }) + terminal,
+      invalidCall: protocol === 'v2'
+        ? streamEvent(protocol, { messages: [{ role: 'assistant', content: [{ function_call: { id: 'call', name: 7, arguments: '' } }] }], finish_reason: 'function_call' }, true)
+        : streamEvent(protocol, { choices: [{ delta: protocol === 'openai'
+          ? { tool_calls: [{ index: 'bad', id: 'call', type: 'function', function: { name: 'lookup', arguments: '' } }] }
+          : { function_call: { name: 7, arguments: '' } }, finish_reason: protocol === 'openai' ? 'tool_calls' : 'function_call' }] }) + terminal,
+      missingFinish: protocol === 'v2'
+        ? streamEvent(protocol, { messages: [{ role: 'assistant', content: [{ text: 'PRIVATE-BODY' }] }] }, true)
+        : streamEvent(protocol, { choices: [{ delta: { content: 'PRIVATE-BODY' } }] }) + terminal,
+      json: null,
+    };
+    if (protocol === 'v1') malformed.invalidReasoning =
+      streamEvent(protocol, { choices: [{ delta: { content: 'OK', reasoning: 7 }, finish_reason: 'stop' }] }) + terminal;
+    await withServer((req, res) => {
+      if (req.method === 'GET') return json(res, { data: Object.keys(malformed).map(id => ({ id })) });
+      if (req.body.model === 'json') return json(res, protocol === 'v2'
+        ? { messages: [{ role: 'assistant', content: [{ text: 'PRIVATE-BODY' }] }], finish_reason: 'stop' }
+        : completion('PRIVATE-BODY'));
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      if (req.body.model === 'error') {
+        res.write(malformed.error);
+        return; // Invalid streams must release the reader even when the server stays open.
+      }
+      res.end(malformed[req.body.model]);
+    }, async ({ baseUrl, requests }) => {
+      const probes = await discoverModels(baseUrl, secret, { protocol, stream: true, signal: t.signal });
+      for (const probe of probes) {
+        assert.equal(probe.status, 'unavailable', probe.model.id);
+        assert.match(probe.reason, /after 5 attempts.*invalid response/i);
+        assert.ok(!probe.reason.includes('PRIVATE-BODY'));
+        const attempts = requests.filter(req => req.body?.model === probe.model.id);
+        assert.equal(attempts.length, 5);
+        assert.ok(attempts.every(req => req.body.stream === true));
+      }
+    });
+  });
+
+  test(`${protocol} discovery accepts fragmented function calls and releases a terminal SSE response that stays open`, { timeout: 3000 }, async t => {
+    const closed = Promise.withResolvers();
+    await withServer((req, res) => {
+      if (req.method === 'GET') return json(res, { data: [{ id: 'function' }] });
+      res.on('close', closed.resolve);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      if (protocol === 'v2') {
+        res.write(streamEvent(protocol, { messages: [{ role: 'assistant', content: [
+          { function_call: { id: 'call', name: 'lookup', arguments: '{"x":' } },
+        ] }] }));
+        res.write(streamEvent(protocol, { messages: [{ role: 'assistant', content: [
+          { function_call: { id: 'call', arguments: '1}' } },
+        ] }] }));
+        res.write(streamEvent(protocol, { finish_reason: 'function_call' }, true));
+      } else {
+        const first = protocol === 'openai'
+          ? { tool_calls: [{ index: 0, id: 'call', type: 'function', function: { name: 'lookup', arguments: '{"x":' } }] }
+          : { function_call: { name: 'lookup', arguments: '{"x":' } };
+        const second = protocol === 'openai'
+          ? { tool_calls: [{ index: 0, function: { arguments: '1}' } }] }
+          : { function_call: { arguments: '1}' } };
+        res.write(streamEvent(protocol, { choices: [{ delta: first }] }));
+        res.write(streamEvent(protocol, { choices: [{ delta: second, finish_reason: protocol === 'openai' ? 'tool_calls' : 'function_call' }] }));
+        res.write(streamEvent(protocol, '[DONE]'));
+      }
+    }, async ({ baseUrl, requests }) => {
+      const probes = await discoverModels(baseUrl, secret, { protocol, stream: true, signal: t.signal });
+      assert.equal(probes[0].status, 'available');
+      await closed.promise;
+      assert.equal(requests.length, 2);
+    });
+  });
+}
 
 // The public discovery call and actual HTTP requests are the seam: probes are
 // scoped to each exact server Model ID, not catalog rows or display names.
@@ -104,7 +231,7 @@ for (const protocol of ['v1', 'v2', 'openai']) {
 }
 
 for (const protocol of ['v1', 'v2', 'openai']) {
-  test(`${protocol} keeps five models in flight and refills each free slot without batching`, { timeout: 3000 }, async () => {
+  test(`${protocol} SSE keeps five models in flight and refills each free slot without batching`, { timeout: 3000 }, async () => {
     const ids = Array.from({ length: 7 }, (_, index) => `model-${index}`);
     const starts = ids.map(() => [Promise.withResolvers(), Promise.withResolvers()]);
     const reports = ids.map(() => Promise.withResolvers());
@@ -124,14 +251,15 @@ for (const protocol of ['v1', 'v2', 'openai']) {
       const release = (index, status = 200) => {
         const res = active.get(index);
         active.delete(index);
-        json(res, status === 200
-          ? protocol === 'v2'
-            ? { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' }
-            : completion()
-          : { error: 'temporary' }, status);
+        if (status === 200) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.end(textStream(protocol));
+          return;
+        }
+        json(res, { error: 'temporary' }, status);
       };
       const pending = discoverModels(baseUrl, secret, {
-        protocol, signal: new AbortController().signal,
+        protocol, stream: true, signal: new AbortController().signal,
         progress: (_completed, _total, probe) => {
           if (probe) { progress.push(probe.model.id); reports[progress.length - 1].resolve(); }
         },
@@ -483,7 +611,7 @@ test('cancellation after catalog enumeration prevents the first paid probe', asy
 });
 
 for (const protocol of ['v1', 'v2', 'openai']) {
-  test(`${protocol} cancellation from progress stops active and queued models without late reports`, { timeout: 3000 }, async () => {
+  test(`${protocol} SSE cancellation from progress stops active and queued models without late reports`, { timeout: 3000 }, async () => {
     const ids = Array.from({ length: 7 }, (_, index) => `model-${index}`);
     const ready = Promise.withResolvers();
     const responses = [];
@@ -493,22 +621,21 @@ for (const protocol of ['v1', 'v2', 'openai']) {
     await withServer((req, res) => {
       if (req.method === 'GET') return json(res, { data: ids.map(id => ({ id })) });
       responses.push({ id: req.body.model, res });
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(': active stream\n\n');
       if (responses.length === 5) ready.resolve();
     }, async ({ baseUrl, requests }) => {
       const pending = discoverModels(baseUrl, secret, {
-        protocol, signal: controller.signal,
+        protocol, stream: true, signal: controller.signal,
         progress: (_completed, _total, probe) => {
           if (probe) { reported.push(probe); controller.abort(reason); }
         },
       });
       const rejected = assert.rejects(pending, error => error === reason);
       await ready.promise;
-      const body = protocol === 'v2'
-        ? { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' }
-        : completion();
-      json(responses[0].res, body);
+      responses[0].res.end(textStream(protocol));
       await rejected;
-      for (const { res } of responses.slice(1)) json(res, body);
+      for (const { res } of responses.slice(1)) res.end(textStream(protocol));
       await flush();
       assert.deepEqual(reported.map(probe => [probe.model.id, probe.status]), [[responses[0].id, 'available']]);
       assert.equal(requests.length, 6, 'queued models and retries must not start after cancellation');
@@ -539,8 +666,10 @@ for (const phase of ['catalog', 'probe']) {
   });
 }
 
-for (const protocol of ['v1', 'v2', 'openai']) {
-  test(`${protocol} uses exact 1/3/9/27/60-second body deadlines with virtual time, independent of generation settings`, { timeout: 3000 }, async t => {
+for (const [protocol, stream] of ['v1', 'v2', 'openai'].flatMap(
+  protocol => [false, true].map(stream => [protocol, stream]),
+)) {
+  test(`${protocol} ${stream ? 'SSE' : 'JSON'} uses exact 1/3/9/27/60-second body deadlines with virtual time, independent of generation settings`, { timeout: 3000 }, async t => {
     const original = process.env.GIGACHAT_TIMEOUT;
     process.env.GIGACHAT_TIMEOUT = '1';
     const reads = Array.from({ length: 5 }, () => Promise.withResolvers());
@@ -560,18 +689,30 @@ for (const protocol of ['v1', 'v2', 'openai']) {
           timer.controller.abort(new DOMException('Request deadline exceeded', 'TimeoutError'));
       }
     };
-    const originalJson = UndiciResponse.prototype.json;
-    t.mock.method(UndiciResponse.prototype, 'json', function () {
-      if (this.headers.has('x-test-slow')) reads[reading++].resolve();
-      return originalJson.call(this);
-    });
+    if (stream) {
+      const body = Object.getOwnPropertyDescriptor(UndiciResponse.prototype, 'body').get;
+      const seen = new WeakSet();
+      t.mock.getter(UndiciResponse.prototype, 'body', function () {
+        if (this.headers.has('x-test-slow') && !seen.has(this)) {
+          seen.add(this);
+          reads[reading++].resolve();
+        }
+        return body.call(this);
+      });
+    } else {
+      const originalJson = UndiciResponse.prototype.json;
+      t.mock.method(UndiciResponse.prototype, 'json', function () {
+        if (this.headers.has('x-test-slow')) reads[reading++].resolve();
+        return originalJson.call(this);
+      });
+    }
     try {
       await withServer((req, res) => {
         if (req.method === 'GET') return json(res, { data: [{ id: 'slow' }] });
-        res.writeHead(200, { 'Content-Type': 'application/json', 'X-Test-Slow': 'true' });
-        res.write('{"unfinished":');
+        res.writeHead(200, { 'Content-Type': stream ? 'text/event-stream' : 'application/json', 'X-Test-Slow': 'true' });
+        res.write(stream ? ': unfinished stream\n\n' : '{"unfinished":');
       }, async ({ baseUrl, requests }) => {
-        const pending = discoverModels(baseUrl, secret, { protocol, signal: t.signal });
+        const pending = discoverModels(baseUrl, secret, { protocol, stream, signal: t.signal });
         for (const [index, delay] of [1000, 3000, 9000, 27000, 60000].entries()) {
           await reads[index].promise;
           assert.equal(timers.at(-1).delay, delay);

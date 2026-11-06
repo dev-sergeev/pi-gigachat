@@ -1,4 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
+import { createParser } from "eventsource-parser";
 import { baseUrl as normalizeBaseUrl } from "./auth.js";
 import type {
 	ConnectionModel,
@@ -216,9 +217,207 @@ function validateV2Completion(value: unknown): void {
 		throw new DiscoveryError("INVALID_RESPONSE");
 }
 
+async function readProbeStream(
+	response: Response,
+	protocol: GigaChatProtocol,
+): Promise<void> {
+	const invalid = () => new DiscoveryError("INVALID_RESPONSE");
+	if (
+		!response.headers.get("content-type")?.includes("text/event-stream") ||
+		!response.body
+	)
+		throw invalid();
+	let assistant = false;
+	let finish: unknown;
+	const toolFinish = protocol === "openai" ? "tool_calls" : "function_call";
+	const setFinish = (value: unknown) => {
+		if (value == null || value === "") return;
+		if (
+			value !== "stop" &&
+			value !== "length" &&
+			value !== toolFinish &&
+			!(protocol === "openai" && value === "content_filter")
+		)
+			throw invalid();
+		finish = value;
+	};
+	let done = false;
+	// Probes validate fragments without retaining generated text or arguments.
+	const calls = new Map<
+		string | number,
+		{ name: boolean; arguments: boolean; id: boolean; type: boolean }
+	>();
+	const addCall = (
+		key: string | number,
+		value: unknown,
+		id?: unknown,
+		type?: unknown,
+	) => {
+		if (!object(value)) throw invalid();
+		const call = calls.get(key) ?? {
+			name: false,
+			arguments: false,
+			id: false,
+			type: false,
+		};
+		if (value.name !== undefined) {
+			if (typeof value.name !== "string") throw invalid();
+			call.name ||= value.name.length > 0;
+		}
+		if (value.arguments !== undefined) {
+			if (
+				typeof value.arguments !== "string" &&
+				!(protocol !== "openai" && object(value.arguments))
+			)
+				throw invalid();
+			call.arguments = true;
+		}
+		if (id !== undefined) {
+			if (typeof id !== "string" || !id) throw invalid();
+			call.id = true;
+		}
+		if (type !== undefined) {
+			if (type !== "function") throw invalid();
+			call.type = true;
+		}
+		calls.set(key, call);
+	};
+	const consume = (data: string, event: string) => {
+		if (done) return;
+		if (event === "error") throw invalid();
+		if (protocol !== "v2" && data === "[DONE]") {
+			done = true;
+			return;
+		}
+		const chunk: unknown = JSON.parse(data);
+		if (!object(chunk) || chunk.error !== undefined) throw invalid();
+		if (protocol === "v2") {
+			if (
+				event !== "response.message.delta" &&
+				event !== "response.message.done"
+			)
+				throw invalid();
+			if (chunk.messages !== undefined && !Array.isArray(chunk.messages))
+				throw invalid();
+			if (!Array.isArray(chunk.messages) && event !== "response.message.done")
+				throw invalid();
+			for (const message of Array.isArray(chunk.messages)
+				? chunk.messages
+				: []) {
+				if (
+					!object(message) ||
+					(message.role !== "assistant" && message.role !== "reasoning") ||
+					(!Array.isArray(message.content) &&
+						!(
+							message.content === undefined &&
+							message.role === "assistant" &&
+							typeof message.tool_state_id === "string" &&
+							message.tool_state_id.length > 0
+						))
+				)
+					throw invalid();
+				assistant ||=
+					message.role === "assistant" && Array.isArray(message.content);
+				for (const part of Array.isArray(message.content)
+					? message.content
+					: []) {
+					if (!object(part)) throw invalid();
+					if (part.text !== undefined && typeof part.text !== "string")
+						throw invalid();
+					if (part.function_call !== undefined) {
+						if (
+							message.role !== "assistant" ||
+							!object(part.function_call) ||
+							typeof part.function_call.id !== "string" ||
+							!part.function_call.id
+						)
+							throw invalid();
+						addCall(part.function_call.id, part.function_call);
+					} else if (typeof part.text !== "string") throw invalid();
+				}
+			}
+			setFinish(chunk.finish_reason);
+			done = event === "response.message.done";
+			return;
+		}
+		if (!Array.isArray(chunk.choices)) throw invalid();
+		if (chunk.choices.length === 0 && object(chunk.usage)) return;
+		const choice = chunk.choices[0];
+		if (!object(choice) || !object(choice.delta)) throw invalid();
+		const delta = choice.delta;
+		if (delta.role !== undefined && delta.role !== "assistant") throw invalid();
+		if (
+			(delta.content != null && typeof delta.content !== "string") ||
+			(delta.reasoning_content != null &&
+				typeof delta.reasoning_content !== "string") ||
+			(delta.reasoning != null && typeof delta.reasoning !== "string")
+		)
+			throw invalid();
+		assistant ||=
+			delta.role === "assistant" ||
+			delta.content !== undefined ||
+			delta.reasoning_content !== undefined ||
+			(protocol === "openai" && delta.reasoning !== undefined);
+		if (protocol === "openai" && delta.tool_calls !== undefined) {
+			if (!Array.isArray(delta.tool_calls)) throw invalid();
+			for (const call of delta.tool_calls) {
+				if (
+					!object(call) ||
+					typeof call.index !== "number" ||
+					!Number.isSafeInteger(call.index) ||
+					call.index < 0
+				)
+					throw invalid();
+				addCall(call.index, call.function ?? {}, call.id, call.type);
+				assistant = true;
+			}
+		}
+		if (protocol === "v1" && delta.function_call !== undefined) {
+			addCall(0, delta.function_call);
+			assistant = true;
+		}
+		setFinish(choice.finish_reason);
+	};
+	const parser = createParser({
+		onEvent: (event) => consume(event.data, event.event ?? ""),
+		onError: () => {
+			throw invalid();
+		},
+	});
+	const decoder = new TextDecoder();
+	const reader = response.body.getReader();
+	try {
+		while (!done) {
+			const next = await reader.read();
+			if (next.done) break;
+			parser.feed(decoder.decode(next.value, { stream: true }));
+		}
+		if (!done) parser.feed(decoder.decode());
+		for (const call of calls.values()) {
+			if (
+				!call.name ||
+				!call.arguments ||
+				(protocol === "openai" && (!call.id || !call.type))
+			)
+				throw invalid();
+		}
+		if (
+			!done ||
+			!assistant ||
+			finish === undefined ||
+			(finish === toolFinish && calls.size === 0)
+		)
+			throw invalid();
+	} finally {
+		await reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+}
+
 interface ProbeConnection {
 	root: string;
 	protocol: GigaChatProtocol;
+	stream: boolean;
 	headers: Headers;
 	transport: Pick<DiscoveryOptions, "signal" | "mtls"> & { maxRetries: number };
 }
@@ -226,7 +425,7 @@ interface ProbeConnection {
 function probeConnection(
 	baseUrl: string,
 	apiKey: string,
-	options: Pick<DiscoveryOptions, "signal" | "protocol" | "mtls">,
+	options: Pick<DiscoveryOptions, "signal" | "protocol" | "mtls" | "stream">,
 ): ProbeConnection {
 	options.signal.throwIfAborted();
 	const protocol = options.protocol === undefined ? "v1" : options.protocol;
@@ -249,7 +448,13 @@ function probeConnection(
 		maxRetries: 0,
 		mtls: options.mtls,
 	};
-	return { root, protocol, headers, transport };
+	return {
+		root,
+		protocol,
+		stream: options.stream ?? false,
+		headers,
+		transport,
+	};
 }
 
 async function probeModel(
@@ -257,7 +462,7 @@ async function probeModel(
 	model: ConnectionModel,
 	timeouts: readonly number[],
 ): Promise<ModelProbe> {
-	const { root, protocol, headers, transport } = connection;
+	const { root, protocol, stream, headers, transport } = connection;
 	const signal = transport.signal;
 	signal.throwIfAborted();
 	const init = {
@@ -274,11 +479,13 @@ async function probeModel(
 			...(protocol === "v2"
 				? { model_options: { max_tokens: 1 } }
 				: { max_tokens: 1 }),
-			stream: false,
+			stream,
 		}),
 	};
 	const consumeProbe = async (response: Response) =>
-		validateCompletion(await readJson(response), protocol);
+		stream
+			? readProbeStream(response, protocol)
+			: validateCompletion(await readJson(response), protocol);
 	let probe: ModelProbe;
 	for (let attempt = 0; ; attempt++) {
 		try {
@@ -311,7 +518,7 @@ export async function retryModel(
 	baseUrl: string,
 	apiKey: string,
 	model: ConnectionModel,
-	options: Pick<DiscoveryOptions, "signal" | "protocol" | "mtls">,
+	options: Pick<DiscoveryOptions, "signal" | "protocol" | "mtls" | "stream">,
 ): Promise<ModelProbe> {
 	return probeModel(probeConnection(baseUrl, apiKey, options), model, [600000]);
 }

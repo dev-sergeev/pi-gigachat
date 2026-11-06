@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { ConnectionStore, createConnectionProvider, prepareConnectionCredential } from '../dist/connections.js';
-import { completion, json, user, withServer } from './helpers.mjs';
+import { completion, json, reply, user, withServer } from './helpers.mjs';
 
 const context = { messages: [user('Hello')] };
 const signal = () => new AbortController().signal;
@@ -83,8 +83,93 @@ test('legacy connections remain V1 without rewriting storage and normalize only 
     assert.equal((await store.list())[0].gigachatConnection.id, legacy.id);
   }));
 });
+for (const protocol of ['v1', 'v2', 'openai']) {
+  test(`saved ${protocol} response modes survive restart and override request and ambient settings for every selected model`, async () => {
+    await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
+      const store = new ConnectionStore(authPath);
+      const entries = [false, true].map(stream => connection(`${protocol}-${stream}`, baseUrl, {
+        protocol, stream,
+        models: ['first-model', 'second-model'].map(id => ({
+          id, name: id, contextWindow: 32000, maxTokens: 1000, reasoning: false,
+        })),
+      }));
+      for (const entry of entries)
+        await store.save(await prepareConnectionCredential(entry, `token-${entry.stream}`, signal()), interaction());
+      const restored = (await new ConnectionStore(authPath).list()).map(record => record.gigachatConnection);
+      assert.deepEqual(restored, entries);
+      const models = await runtime(authPath, restored);
+      const ambient = process.env.GIGACHAT_STREAM;
+      process.env.GIGACHAT_STREAM = 'invalid-global-mode';
+      try {
+        for (const entry of restored) for (const selected of entry.models) for (const method of ['stream', 'streamSimple']) {
+          const result = await models[method](models.getModel(entry.id, selected.id), context, {
+            stream: !entry.stream, maxRetries: 0,
+            ...(method === 'streamSimple' ? { env: { GIGACHAT_STREAM: 'invalid-request-mode' } } : {}),
+          }).result();
+          successful(result);
+          assert.equal(result.content.filter(part => part.type === 'text').map(part => part.text).join(''), 'OK');
+          assert.equal(requests.at(-1).body.stream, entry.stream);
+          assert.equal(requests.at(-1).body.model, selected.id);
+          assert.equal(requests.at(-1).headers.authorization, `Bearer token-${entry.stream}`);
+          assert.equal(process.env.GIGACHAT_STREAM, 'invalid-global-mode', 'Connection mode must not mutate process.env');
+        }
+        assert.equal(requests.length, 8);
+      } finally {
+        if (ambient === undefined) delete process.env.GIGACHAT_STREAM;
+        else process.env.GIGACHAT_STREAM = ambient;
+      }
+    }, (request, res) => {
+      if (protocol !== 'v2') return reply(request, res, completion());
+      const result = { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' };
+      if (!request.body.stream) return json(res, result);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end(`event: response.message.done\ndata: ${JSON.stringify(result)}\n\n`);
+    }));
+  });
 
-test('invalid protocols, explicit catalogs and insecure mTLS endpoints cannot replace a saved connection', async () => {
+  test(`legacy ${protocol} response mode keeps request, environment and default precedence without normalizing storage`, async () => {
+    await withStorage(async authPath => withServer(async ({ baseUrl, requests }) => {
+      const entry = connection(`legacy-stream-${protocol}`, baseUrl, { protocol });
+      const store = new ConnectionStore(authPath);
+      await store.save(await prepareConnectionCredential(entry, 'legacy-stream-token', signal()), interaction());
+      const before = await readFile(authPath, 'utf8');
+      const restored = (await new ConnectionStore(authPath).list())[0].gigachatConnection;
+      assert.equal(Object.hasOwn(restored, 'stream'), false);
+      const models = await runtime(authPath, [restored]);
+      const ambient = process.env.GIGACHAT_STREAM;
+      try {
+        for (const [globalMode, options, expected] of [
+          [undefined, {}, false],
+          ['true', {}, true],
+          ['false', { env: { GIGACHAT_STREAM: 'true' } }, true],
+          ['true', { env: { GIGACHAT_STREAM: 'false' } }, false],
+          ['false', { stream: true, env: { GIGACHAT_STREAM: 'false' } }, true],
+          ['true', { stream: false, env: { GIGACHAT_STREAM: 'true' } }, false],
+        ]) {
+          if (globalMode === undefined) delete process.env.GIGACHAT_STREAM;
+          else process.env.GIGACHAT_STREAM = globalMode;
+          successful(await send(models, restored, 'shared-model', { ...options, maxRetries: 0 }));
+          assert.equal(requests.at(-1).body.stream, expected);
+        }
+        assert.equal(await readFile(authPath, 'utf8'), before);
+        await store.save(await prepareConnectionCredential({ ...restored, revision: 'still-legacy' },
+          'legacy-stream-token', signal()), interaction(), entry.id);
+        assert.equal(Object.hasOwn((await store.list())[0].gigachatConnection, 'stream'), false);
+      } finally {
+        if (ambient === undefined) delete process.env.GIGACHAT_STREAM;
+        else process.env.GIGACHAT_STREAM = ambient;
+      }
+    }, (request, res) => {
+      if (protocol !== 'v2') return reply(request, res, completion());
+      const result = { messages: [{ role: 'assistant', content: [{ text: 'OK' }] }], finish_reason: 'stop' };
+      if (!request.body.stream) return json(res, result);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end(`event: response.message.done\ndata: ${JSON.stringify(result)}\n\n`);
+    }));
+  });
+}
+
+test('invalid protocols, response modes, explicit catalogs and insecure mTLS endpoints cannot replace a saved connection', async () => {
   await withStorage(async authPath => {
     const original = connection('valid', 'https://example.invalid/v1');
     const store = new ConnectionStore(authPath);
@@ -94,6 +179,7 @@ test('invalid protocols, explicit catalogs and insecure mTLS endpoints cannot re
     const materials = { ca: 'synthetic-ca', cert: 'synthetic-cert', key: 'synthetic-key' };
     for (const invalid of [
       { protocol: 'unknown' },
+      ...[null, 'true', 'false', 0, 1, {}, []].map(stream => ({ stream })),
       { modelsUrl: 'file:///models' },
       { modelsUrl: '' },
       { authorization: { type: 'mtls', materials }, modelsUrl: 'http://catalog.invalid/models' },
@@ -101,6 +187,7 @@ test('invalid protocols, explicit catalogs and insecure mTLS endpoints cannot re
     ]) {
       const changed = { ...original, revision: 'invalid-edit', ...invalid };
       await assert.rejects(prepareConnectionCredential(changed, 'replacement-token', signal(), credential));
+      assert.throws(() => createConnectionProvider(changed, store));
       await assert.rejects(store.save({ ...credential, gigachatConnection: changed }, interaction(), original.id));
       assert.equal(await readFile(authPath, 'utf8'), before);
     }
@@ -523,7 +610,10 @@ test('malformed native storage fails visibly and cannot be silently overwritten'
     assert.deepEqual(await store.list(), []);
     const entry = connection('malformed', 'https://example.invalid/v1');
     const credential = await prepareConnectionCredential(entry, 'literal-token', signal());
-    for (const corrupt of ['{', '[]', JSON.stringify({ [entry.id]: { ...credential, gigachatConnection: { ...entry, revision: '' } } })]) {
+    for (const corrupt of ['{', '[]',
+      JSON.stringify({ [entry.id]: { ...credential, gigachatConnection: { ...entry, revision: '' } } }),
+      JSON.stringify({ [entry.id]: { ...credential, gigachatConnection: { ...entry, stream: 'false' } } }),
+    ]) {
       await writeFile(authPath, corrupt);
       await assert.rejects(store.list(), error => error.code === 'GIGACHAT_STORAGE_ERROR');
       await assert.rejects(store.save(credential, interaction()), error => error.code === 'GIGACHAT_STORAGE_ERROR');
