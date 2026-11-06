@@ -29,7 +29,19 @@ under its original MIT license.
 
 - Removed the Pi version-number activation check, without a warning, bypass setting, or replacement gate.
 - Preserved `/gigachat`, saved connections and settings, and passive activation without network requests or default-model changes.
+- Fixed V2 terminal assistant metadata containing only `tool_state_id`: it updates the saved state without discarding streamed content or rejecting an otherwise valid completion.
 - Pre-release verification targets the same packed package on Pi 1.3.0 and the latest stable Pi (1.5.0 for this release); other versions are not blocked by number, but compatibility is not universally guaranteed.
+
+Live checks through Pi 1.5.0's model runtime covered V1 JSON/SSE generation and
+V2 JSON/SSE round trips with two correlated calls to the same tool. A V1
+connection also completed the native Pi 1.5.0 CLI tool cycle, history reuse,
+manual compaction, and restart/resume.
+
+Release validation limits: an observed GigaChat-3-Ultra V2 run with `medium`
+reasoning and a 2048-token output budget produced only thinking and ended with
+`length`, without an answer. This is not a general conclusion about the model's
+capabilities. The release smoke check does not establish live mTLS, corporate
+authentication, or OpenAI-compatible gateway compatibility.
 
 ## Release 0.7.4
 
@@ -558,16 +570,19 @@ per-request `env.GIGACHAT_BASE_URL` can override that address.
 
 ## Certificates and proxy
 
-For token and authorization-key connections requiring the Russian Trusted Root CA, follow the official
+An apparent authentication failure can mask missing trust for the Russian
+Trusted Root CA. For token and authorization-key connections requiring it, use
+the trusted CA bundle from the official
 [certificate instructions](https://developers.sber.ru/docs/ru/gigachat/certificates)
-and add this before launching pi:
+and set this before starting Node/Pi:
 
 ```dotenv
 NODE_EXTRA_CA_CERTS=/absolute/path/to/trusted-ca-bundle.pem
 ```
 
-The launch command above sets it before Node starts. TLS verification remains
-enabled. Optional `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables route both
+Node reads this setting at startup; adding it after Pi starts is too late.
+Keep TLS verification enabled, even if an example suggests disabling it.
+Optional `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables route both
 OAuth and chat traffic, including SSE. Include the proxy CA in the trusted bundle if it intercepts TLS.
 For an HTTPS proxy, Node must trust the proxy's own CA separately from the
 imported mTLS CA bundle.

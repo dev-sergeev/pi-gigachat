@@ -132,6 +132,50 @@ test(`native V2 preserves reasoning-only length and off omits reasoning (stream=
   });
 });
 
+test('native V2 completes text with a state-only assistant done and replays the saved state', async () => {
+  await withServer(async ({ baseUrl, requests }) => withNative(baseUrl, async (runtime, model) => {
+    const context = { messages: [user('Add 17 and 25')] };
+    const stream = runtime.streamSimple(model, context, { stream: true, maxRetries: 0 });
+    const events = [];
+    for await (const event of stream) events.push(event.type);
+    const result = await stream.result();
+    assert.equal(result.stopReason, 'stop', result.errorMessage);
+    assert.deepEqual(result.content, [{ type: 'text', text: '42', textSignature: V2_STATE_SIGNATURE_PREFIX + state }]);
+    assert.deepEqual(events, ['start', 'text_start', 'text_delta', 'text_end', 'done']);
+    const history = JSON.parse(JSON.stringify([...context.messages, result, user('Continue')]));
+    const saved = structuredClone(history);
+    const followup = await runtime.completeSimple(model, { messages: history }, { stream: false, maxRetries: 0 });
+    assert.equal(followup.stopReason, 'stop', followup.errorMessage);
+    assert.deepEqual(requests[1].body.messages.find(message => message.role === 'assistant'),
+      { role: 'assistant', content: [{ text: '42' }], tool_state_id: state });
+    assert.deepEqual(history, saved, 'Replay must not mutate saved text or state');
+  }), (request, res) => {
+    if (!request.body.stream) return json(res, { messages: [message('assistant', [{ text: 'Continued' }])], finish_reason: 'stop', usage });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end(event('response.message.delta', { messages: [message('assistant', [{ text: '42' }])] }) +
+      event('response.message.done', { messages: [{ role: 'assistant', tool_state_id: state }], finish_reason: 'stop', usage }));
+  });
+});
+
+for (const [name, malformed] of [
+  ['ordinary missing content', { role: 'assistant' }],
+  ['empty state', { role: 'assistant', tool_state_id: '' }],
+  ['non-string state', { role: 'assistant', tool_state_id: 42 }],
+  ['null content', { role: 'assistant', tool_state_id: state, content: null }],
+  ['non-array content', { role: 'assistant', tool_state_id: state, content: {} }],
+  ['reasoning missing content', { role: 'reasoning', tool_state_id: state }],
+])
+test(`native V2 rejects ${name} in an SSE completion`, async () => {
+  await withServer(async ({ baseUrl }) => withNative(baseUrl, async (runtime, model) => {
+    const result = await runtime.completeSimple(model, { messages: [user('Hello')] }, { stream: true, maxRetries: 0 });
+    assert.equal(result.stopReason, 'error');
+    assert.match(result.errorMessage, /Invalid GigaChat V2 message/);
+  }), (_request, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end(event('response.message.done', { messages: [malformed], finish_reason: 'stop', usage }));
+  });
+});
+
 test('native V2 rejects an SSE response without its named completion marker', async () => {
   await withServer(async ({ baseUrl }) => withNative(baseUrl, async (runtime, model) => {
     const result = await runtime.completeSimple(model, { messages: [user('Hello')] }, { stream: true, maxRetries: 0 });

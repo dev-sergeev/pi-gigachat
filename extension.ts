@@ -2194,7 +2194,7 @@ function completionConsumer3(output, stream, model) {
         throw new Error("Invalid GigaChat V2 completion: missing messages");
       if (Array.isArray(chunk.messages))
         for (const [messageIndex, message] of chunk.messages.entries()) {
-          if (!object(message) || !Array.isArray(message.content))
+          if (!object(message) || !Array.isArray(message.content) && (message.content !== void 0 || message.role !== "assistant" || typeof message.tool_state_id !== "string" || message.tool_state_id.length === 0))
             throw new Error("Invalid GigaChat V2 message");
           if (message.role !== "assistant" && message.role !== "reasoning")
             throw new Error(
@@ -2202,72 +2202,73 @@ function completionConsumer3(output, stream, model) {
             );
           const messageKey = `${message.role}:${typeof message.message_id === "string" ? message.message_id : messageIndex}`;
           const signature = typeof message.tool_state_id === "string" ? V2_STATE_SIGNATURE_PREFIX + message.tool_state_id : void 0;
-          for (const [partIndex, part] of message.content.entries()) {
-            if (!object(part)) throw new Error("Invalid GigaChat V2 content");
-            const key = `${messageKey}:${partIndex}`;
-            if (part.text !== void 0) {
-              if (typeof part.text !== "string")
-                throw new Error("Invalid GigaChat V2 text");
-              const kind = message.role === "reasoning" ? "thinking" : "text";
-              const state = content.get(key) ?? create(
-                key,
-                kind === "thinking" ? {
-                  type: "thinking",
-                  thinking: "",
-                  thinkingSignature: "gigachat:v2:reasoning"
-                } : { type: "text", text: "" }
-              );
-              if (state.block.type !== kind)
-                throw new Error("Inconsistent GigaChat V2 content type");
-              appendText(state, part.text, snapshot);
-              if (signature && state.block.type === "text")
-                state.block.textSignature = signature;
+          if (Array.isArray(message.content))
+            for (const [partIndex, part] of message.content.entries()) {
+              if (!object(part)) throw new Error("Invalid GigaChat V2 content");
+              const key = `${messageKey}:${partIndex}`;
+              if (part.text !== void 0) {
+                if (typeof part.text !== "string")
+                  throw new Error("Invalid GigaChat V2 text");
+                const kind = message.role === "reasoning" ? "thinking" : "text";
+                const state = content.get(key) ?? create(
+                  key,
+                  kind === "thinking" ? {
+                    type: "thinking",
+                    thinking: "",
+                    thinkingSignature: "gigachat:v2:reasoning"
+                  } : { type: "text", text: "" }
+                );
+                if (state.block.type !== kind)
+                  throw new Error("Inconsistent GigaChat V2 content type");
+                appendText(state, part.text, snapshot);
+                if (signature && state.block.type === "text")
+                  state.block.textSignature = signature;
+              }
+              if (part.function_call !== void 0) {
+                if (message.role !== "assistant" || !object(part.function_call))
+                  throw new Error("Invalid GigaChat V2 function_call");
+                const call = part.function_call;
+                if (call.id !== void 0 && typeof call.id !== "string")
+                  throw new Error("Invalid GigaChat V2 function_call id");
+                const id = typeof call.id === "string" ? call.id : void 0;
+                let state = id ? tools.get(id) : content.get(key);
+                if (!state) {
+                  if (!id)
+                    throw new Error(
+                      "Invalid GigaChat V2 function_call: missing id"
+                    );
+                  state = create(key, {
+                    type: "toolCall",
+                    id,
+                    name: "",
+                    arguments: {}
+                  });
+                  tools.set(id, state);
+                }
+                const tool = state.block;
+                if (tool.type !== "toolCall")
+                  throw new Error("Inconsistent GigaChat V2 function position");
+                if (call.name !== void 0) {
+                  if (typeof call.name !== "string" || tool.name && tool.name !== call.name)
+                    throw new Error("Invalid GigaChat V2 function_call name");
+                  tool.name = call.name;
+                }
+                if (call.arguments !== void 0) {
+                  if (typeof call.arguments !== "string" && !object(call.arguments))
+                    throw new Error("Invalid GigaChat V2 function arguments");
+                  const delta = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments);
+                  state.argumentsJson = typeof call.arguments === "string" && !snapshot ? state.argumentsJson + delta : delta;
+                  tool.arguments = parseStreamingJson3(state.argumentsJson);
+                  stream.push({
+                    type: "toolcall_delta",
+                    contentIndex: state.index,
+                    delta,
+                    partial: output
+                  });
+                }
+                if (signature) tool.thoughtSignature = signature;
+              }
             }
-            if (part.function_call !== void 0) {
-              if (message.role !== "assistant" || !object(part.function_call))
-                throw new Error("Invalid GigaChat V2 function_call");
-              const call = part.function_call;
-              if (call.id !== void 0 && typeof call.id !== "string")
-                throw new Error("Invalid GigaChat V2 function_call id");
-              const id = typeof call.id === "string" ? call.id : void 0;
-              let state = id ? tools.get(id) : content.get(key);
-              if (!state) {
-                if (!id)
-                  throw new Error(
-                    "Invalid GigaChat V2 function_call: missing id"
-                  );
-                state = create(key, {
-                  type: "toolCall",
-                  id,
-                  name: "",
-                  arguments: {}
-                });
-                tools.set(id, state);
-              }
-              const tool = state.block;
-              if (tool.type !== "toolCall")
-                throw new Error("Inconsistent GigaChat V2 function position");
-              if (call.name !== void 0) {
-                if (typeof call.name !== "string" || tool.name && tool.name !== call.name)
-                  throw new Error("Invalid GigaChat V2 function_call name");
-                tool.name = call.name;
-              }
-              if (call.arguments !== void 0) {
-                if (typeof call.arguments !== "string" && !object(call.arguments))
-                  throw new Error("Invalid GigaChat V2 function arguments");
-                const delta = typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments);
-                state.argumentsJson = typeof call.arguments === "string" && !snapshot ? state.argumentsJson + delta : delta;
-                tool.arguments = parseStreamingJson3(state.argumentsJson);
-                stream.push({
-                  type: "toolcall_delta",
-                  contentIndex: state.index,
-                  delta,
-                  partial: output
-                });
-              }
-              if (signature) tool.thoughtSignature = signature;
-            }
-          }
           if (signature)
             for (const [key, state] of content) {
               if (!key.startsWith(`${messageKey}:`)) continue;
