@@ -359,7 +359,10 @@ export function createConnectionProvider(
 			api,
 			provider: saved.id,
 			baseUrl: endpoint,
-			input: ["text"],
+			input:
+				protocol === "v1" && model.id === "GigaChat-2-Pro"
+					? ["text", "image"]
+					: ["text"],
 			// Unknown USD prices; zero is not a free-tier claim.
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		}),

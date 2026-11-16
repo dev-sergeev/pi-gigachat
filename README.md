@@ -778,16 +778,21 @@ HTTP 413 is marked as context overflow so pi can compact and retry. Requests in
 one adapter instance are serialized for the personal account concurrency limit;
 separate processes still share the account's limits.
 
-Connection models advertise text input. Context and output budgets come from
-server metadata or saved user parameters. When metadata is missing, newly added
-models use a 262,144-token context and a 64,000-token output budget. These values
-are configuration defaults, not a guarantee of the server's actual limits.
+For saved GigaChat V1 connections, GigaChat-2-Pro advertises text and image
+input. Other connection models advertise text input. Context and output budgets
+come from server metadata or saved user parameters. When metadata is missing,
+newly added models use a 262,144-token context and a 64,000-token output budget.
+These values are configuration defaults, not a guarantee of the server's actual
+limits.
 
 Pi's `maxTokens` is capped at the selected model's configured output budget.
 An explicit `max_tokens` in the extra JSON overrides that cap, subject to
 the API's limits. pi rejects truncated summaries, but model-generated summaries
-can still omit details. Images in history become omission markers; media upload,
-API v2, embeddings and batch processing are not implemented. Cost metadata is
+can still omit details. For GigaChat-2-Pro on V1, PNG and JPEG images in user
+messages are uploaded to GigaChat and attached to the corresponding messages.
+One image is supported per user message. Images returned by tools are not
+currently uploaded.
+Embeddings and batch processing are not implemented. Cost metadata is
 zero because USD prices are unknown, not because usage is free.
 
 ## Programmatic use

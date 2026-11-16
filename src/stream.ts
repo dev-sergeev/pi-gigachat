@@ -3,6 +3,7 @@ import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEventStream,
+	ImageContent,
 	Model,
 	ModelThinkingLevel,
 	SimpleStreamOptions,
@@ -21,6 +22,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { createParser } from "eventsource-parser";
+import { FormData, Request as UndiciRequest } from "undici";
 import { baseUrl } from "./auth.js";
 import type { MtlsMaterials } from "./connection-types.js";
 import { environment, headers, object, request, serial } from "./http.js";
@@ -63,11 +65,100 @@ export type GigaChatStreamOptions = Omit<SimpleStreamOptions, "reasoning"> & {
 	functionCall?: "auto" | "none" | { name: string };
 };
 
+function findUserImages(context: TranscriptContext): ImageContent[] {
+	const images: ImageContent[] = [];
+
+	for (const message of context.messages) {
+		if (message.role !== "user") {
+			continue;
+		}
+
+		if (!Array.isArray(message.content)) {
+			continue;
+		}
+
+		const attachedImages = message.content.filter(
+			(block) => block.type === "image",
+		);
+
+		if (attachedImages.length > 1) {
+			throw new Error("GigaChat V1 accepts one image per message");
+		}
+
+		images.push(...attachedImages);
+	}
+
+	return images;
+}
+
+function createImageForm(image: ImageContent): FormData {
+	if (image.mimeType !== "image/png" && image.mimeType !== "image/jpeg") {
+		throw new Error(`Unsupported image type: ${image.mimeType}`);
+	}
+
+	const bytes = Buffer.from(image.data, "base64");
+	const file = new Blob([bytes], { type: image.mimeType });
+	const filename = image.mimeType === "image/png" ? "image.png" : "image.jpg";
+
+	const form = new FormData();
+	form.append("purpose", "general");
+	form.append("file", file, filename);
+
+	return form;
+}
+
+async function uploadImage(
+	image: ImageContent,
+	model: Model<Api>,
+	options: GigaChatStreamOptions,
+): Promise<string> {
+	const form = createImageForm(image);
+
+	const uploadHeaders = headers(
+		{
+			Accept: "application/json",
+			...(!options.mtls && {
+				Authorization: `Bearer ${options.apiKey}`,
+			}),
+		},
+		model.headers,
+		options.headers,
+	);
+
+	const url = `${baseUrl(options.env?.GIGACHAT_BASE_URL || model.baseUrl)}/files`;
+	const encoded = new UndiciRequest(url, { method: "POST", body: form });
+	const contentType = encoded.headers.get("content-type");
+	if (!contentType) throw new Error("Missing multipart Content-Type");
+	uploadHeaders.set("Content-Type", contentType);
+	const body = await encoded.arrayBuffer();
+
+	const result: unknown = await request(
+		url,
+		{
+			method: "POST",
+			headers: uploadHeaders,
+			body,
+		},
+		{
+			...options,
+			maxRetries: 0,
+		},
+		(response) => response.json(),
+	);
+
+	if (!object(result) || typeof result.id !== "string" || !result.id) {
+		throw new Error("Invalid GigaChat upload response: missing file ID");
+	}
+
+	return result.id;
+}
+
 function payload(
 	model: Model<Api>,
 	context: TranscriptContext,
 	options: GigaChatStreamOptions,
 	inContent: boolean,
+	imagesIds: ReadonlyMap<ImageContent, string>,
 ): Record<string, unknown> {
 	const env = environment(options);
 	const mode = env.GIGACHAT_STREAM ?? "false";
@@ -96,6 +187,7 @@ function payload(
 			context,
 			additionalSystemPrompt,
 			inContent,
+			imagesIds,
 		),
 		max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
 		function_call:
@@ -146,8 +238,22 @@ export function streamSimpleGigaChat(
 	const signal = options.signal ?? new AbortController().signal;
 	(async () => {
 		try {
+			const images = model.input.includes("image")
+				? findUserImages(context)
+				: [];
+			const imagesIds = new Map<ImageContent, string>();
+			if (model.input.includes("image")) {
+				for (const image of images) {
+					const fileId = await uploadImage(image, model, {
+						...options,
+						signal,
+					});
+
+					imagesIds.set(image, fileId);
+				}
+			}
 			const inContent = reasoningInContent(environment(options));
-			let body = payload(model, context, options, inContent);
+			let body = payload(model, context, options, inContent, imagesIds);
 			const streaming = body.stream;
 			const modified = await options.onPayload?.(body, model);
 			if (modified !== undefined) {

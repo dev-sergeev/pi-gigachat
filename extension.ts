@@ -605,7 +605,7 @@ function reasoningInContent(env) {
     throw new Error("GIGACHAT_REASONING_IN_CONTENT must be true or false");
   return mode === "true";
 }
-function convertMessages(model, context, additionalSystemPrompt, inContent = false) {
+function convertMessages(model, context, additionalSystemPrompt, inContent = false, imagesIds) {
   const messages = [];
   const transformedMessages = transformMessages(
     context.messages.filter((message) => message.role !== "system"),
@@ -631,8 +631,25 @@ function convertMessages(model, context, additionalSystemPrompt, inContent = fal
         });
       } else {
         const text = message.content.filter((item) => item.type === "text").map((item) => sanitizeSurrogates(item.text)).join("\n");
-        if (text.length > 0) {
-          messages.push({ role: "user", content: text });
+        const attachments = [];
+        for (const item of message.content) {
+          if (item.type === "image") {
+            const fileId = imagesIds?.get(item);
+            if (!fileId) {
+              throw new Error("Image was not uploaded to GigaChat");
+            }
+            attachments.push(fileId);
+          }
+        }
+        if (attachments.length > 1) {
+          throw new Error("GigaChat V1 accepts one image per message");
+        }
+        if (text.length > 0 || attachments.length > 0) {
+          messages.push({
+            role: "user",
+            content: text,
+            ...attachments.length > 0 ? { attachments } : {}
+          });
         }
       }
       continue;
@@ -1319,6 +1336,7 @@ import {
   parseToolCallArguments as parseToolCallArguments2
 } from "@earendil-works/pi-ai";
 import { createParser as createParser2 } from "eventsource-parser";
+import { FormData, Request as UndiciRequest } from "undici";
 var DEFAULT_SYSTEM_PROMPT = "Call at most one tool per assistant message. Do not make multiple or parallel tool calls. Wait for the tool result before calling another tool.";
 function emptyUsage2() {
   return {
@@ -1330,7 +1348,74 @@ function emptyUsage2() {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
   };
 }
-function payload2(model, context, options, inContent) {
+function findUserImages(context) {
+  const images = [];
+  for (const message of context.messages) {
+    if (message.role !== "user") {
+      continue;
+    }
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    const attachedImages = message.content.filter(
+      (block) => block.type === "image"
+    );
+    if (attachedImages.length > 1) {
+      throw new Error("GigaChat V1 accepts one image per message");
+    }
+    images.push(...attachedImages);
+  }
+  return images;
+}
+function createImageForm(image) {
+  if (image.mimeType !== "image/png" && image.mimeType !== "image/jpeg") {
+    throw new Error(`Unsupported image type: ${image.mimeType}`);
+  }
+  const bytes = Buffer.from(image.data, "base64");
+  const file = new Blob([bytes], { type: image.mimeType });
+  const filename = image.mimeType === "image/png" ? "image.png" : "image.jpg";
+  const form = new FormData();
+  form.append("purpose", "general");
+  form.append("file", file, filename);
+  return form;
+}
+async function uploadImage(image, model, options) {
+  const form = createImageForm(image);
+  const uploadHeaders = headers(
+    {
+      Accept: "application/json",
+      ...!options.mtls && {
+        Authorization: `Bearer ${options.apiKey}`
+      }
+    },
+    model.headers,
+    options.headers
+  );
+  const url = `${baseUrl(options.env?.GIGACHAT_BASE_URL || model.baseUrl)}/files`;
+  const encoded = new UndiciRequest(url, { method: "POST", body: form });
+  const contentType = encoded.headers.get("content-type");
+  if (!contentType) throw new Error("Missing multipart Content-Type");
+  uploadHeaders.set("Content-Type", contentType);
+  const body = await encoded.arrayBuffer();
+  const result = await request(
+    url,
+    {
+      method: "POST",
+      headers: uploadHeaders,
+      body
+    },
+    {
+      ...options,
+      maxRetries: 0
+    },
+    (response) => response.json()
+  );
+  if (!object(result) || typeof result.id !== "string" || !result.id) {
+    throw new Error("Invalid GigaChat upload response: missing file ID");
+  }
+  return result.id;
+}
+function payload2(model, context, options, inContent, imagesIds) {
   const env = environment(options);
   const mode = env.GIGACHAT_STREAM ?? "false";
   if (mode !== "true" && mode !== "false")
@@ -1355,7 +1440,8 @@ function payload2(model, context, options, inContent) {
       model,
       context,
       additionalSystemPrompt,
-      inContent
+      inContent,
+      imagesIds
     ),
     max_tokens: Math.floor(Math.min(maxTokens, model.maxTokens)),
     function_call: options.toolChoice ?? options.functionCall ?? (tools.length ? "auto" : "none"),
@@ -1394,8 +1480,19 @@ function streamSimpleGigaChat(model, context, options = {}) {
   const signal = options.signal ?? new AbortController().signal;
   (async () => {
     try {
+      const images = model.input.includes("image") ? findUserImages(context) : [];
+      const imagesIds = /* @__PURE__ */ new Map();
+      if (model.input.includes("image")) {
+        for (const image of images) {
+          const fileId = await uploadImage(image, model, {
+            ...options,
+            signal
+          });
+          imagesIds.set(image, fileId);
+        }
+      }
       const inContent = reasoningInContent(environment(options));
-      let body = payload2(model, context, options, inContent);
+      let body = payload2(model, context, options, inContent, imagesIds);
       const streaming = body.stream;
       const modified = await options.onPayload?.(body, model);
       if (modified !== void 0) {
@@ -2569,7 +2666,7 @@ function createConnectionProvider(connection, store, loginCredential) {
       api,
       provider: saved.id,
       baseUrl: endpoint,
-      input: ["text"],
+      input: protocol === "v1" && model.id === "GigaChat-2-Pro" ? ["text", "image"] : ["text"],
       // Unknown USD prices; zero is not a free-tier claim.
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
     })
