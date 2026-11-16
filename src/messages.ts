@@ -1,5 +1,6 @@
 import type {
 	Api,
+	ImageContent,
 	Model,
 	ThinkingContent,
 	Tool,
@@ -24,6 +25,7 @@ export function reasoningInContent(
 interface GigaChatMessage {
 	role: "system" | "user" | "assistant" | "function";
 	content: string;
+	attachments?: string[];
 	reasoning_content?: string;
 	reasoning?: string;
 	name?: string;
@@ -35,6 +37,7 @@ export function convertMessages(
 	context: TranscriptContext,
 	additionalSystemPrompt?: string,
 	inContent = false,
+	imagesIds?: ReadonlyMap<ImageContent, string>,
 ): GigaChatMessage[] {
 	const messages: GigaChatMessage[] = [];
 	const transformedMessages = transformMessages(
@@ -69,8 +72,30 @@ export function convertMessages(
 					.map((item) => sanitizeSurrogates(item.text))
 					.join("\n");
 
-				if (text.length > 0) {
-					messages.push({ role: "user", content: text });
+				const attachments: string[] = [];
+
+				for (const item of message.content) {
+					if (item.type === "image") {
+						const fileId = imagesIds?.get(item);
+
+						if (!fileId) {
+							throw new Error("Image was not uploaded to GigaChat");
+						}
+
+						attachments.push(fileId);
+					}
+				}
+
+				if (attachments.length > 1) {
+					throw new Error("GigaChat V1 accepts one image per message");
+				}
+
+				if (text.length > 0 || attachments.length > 0) {
+					messages.push({
+						role: "user",
+						content: text,
+						...(attachments.length > 0 ? { attachments } : {}),
+					});
 				}
 			}
 			continue;
